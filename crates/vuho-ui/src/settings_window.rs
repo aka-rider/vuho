@@ -18,6 +18,7 @@ use gpui::{
 use vuho_settings::HotkeySetting;
 
 use crate::app_state::VuhoState;
+use crate::app_status::HotkeyState;
 use crate::hotkey_presets::to_hotkey_config;
 
 /// Settings window dimensions.
@@ -152,6 +153,7 @@ impl SettingsView {
         let store = state.settings.clone();
         let hotkey = state.hotkey.clone();
         let cmd_tx = state.cmd_tx.clone();
+        let status = state.status.clone();
 
         if let Err(e) = store.update(|s| s.hotkey = preset) {
             log::warn!("settings_window: failed to save hotkey setting: {e}");
@@ -162,12 +164,19 @@ impl SettingsView {
             listener.stop();
             listener.start(&cmd_tx, to_hotkey_config(preset))
         };
-        if start_result.is_err() {
+        let new_hotkey_state = if start_result.is_err() {
             cx.spawn(|_this, _cx: &mut gpui::AsyncApp| async move {
                 crate::permissions::prompt_accessibility();
             })
             .detach();
-        }
+            HotkeyState::Failed(preset)
+        } else {
+            HotkeyState::Active(preset)
+        };
+        status.update(cx, |model, cx| {
+            model.hotkey = new_hotkey_state;
+            cx.notify();
+        });
         cx.notify();
     }
 

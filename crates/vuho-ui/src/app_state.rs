@@ -10,11 +10,12 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use crossbeam_channel::Sender;
-use gpui::{Global, WindowHandle};
+use gpui::{Entity, Global, WindowHandle};
 use vuho_domain::{DictationCommand, ModelStatus};
 use vuho_os_integration::HotkeyListener;
 use vuho_settings::SettingsStore;
 
+use crate::app_status::StatusModel;
 use crate::settings_window::SettingsView;
 use crate::wiring::ProvisionCommand;
 
@@ -22,15 +23,31 @@ use crate::wiring::ProvisionCommand;
 /// delegate, the provisioning thread) into the GPUI foreground task that
 /// owns window creation and the status-bar item.
 pub(crate) enum UiCommand {
-    /// Open (or re-activate) the settings window.
+    /// Open (or re-activate) the settings window. No longer sent by the
+    /// status-bar menu as of the WP4 click-split (see [`UiCommand::OpenPanel`])
+    /// — kept, along with its `spawn_ui_drain` handler, for whatever
+    /// reaches it next (the later unified-panel package, most likely).
+    #[allow(
+        dead_code,
+        reason = "not currently sent — see the variant's doc comment"
+    )]
     OpenSettings,
-    /// Open (or re-activate) the readiness window (ADR-020) — production
-    /// mode's equivalent of the pre-`wire_production` gate's
-    /// `GateCommand::ReopenOrFront`, reached from the status-bar menu's
-    /// "Setup…" item instead of "Permissions…" (see `status_bar.rs`'s
-    /// `DelegateMode` doc comment for why the two can't share one command
-    /// type).
+    /// Open (or re-activate) the readiness window (ADR-020). Same story as
+    /// [`UiCommand::OpenSettings`]: the status-bar menu's "Setup…" item that
+    /// used to send this was removed by the WP4 click-split.
+    #[allow(
+        dead_code,
+        reason = "not currently sent — see the variant's doc comment"
+    )]
     OpenReadiness,
+    /// A plain left click on the tray icon, or its menu's "Open Vuho" item
+    /// (WP4 click-split — see `status_bar.rs`'s module doc comment).
+    /// Reaches the GPUI foreground task since the status-bar delegate has no
+    /// `App` access of its own, same as `OpenSettings`/`OpenReadiness`.
+    // TODO(ui-rehaul): route to the unified panel once it exists — for now
+    // `spawn_ui_drain` opens the settings window, the closest existing
+    // approximation.
+    OpenPanel,
     /// A `vuho_model_fetch::ModelStatus` update from the provisioning
     /// thread — missing/downloading/verifying/failed model state. Drives
     /// both the status-bar toggle title and the readiness window's model
@@ -74,6 +91,10 @@ pub(crate) struct VuhoState {
     /// on a dead handle returns `Err`, which it treats as "not currently
     /// open" and falls through to opening (and storing) a fresh one.
     pub settings_window: Option<WindowHandle<SettingsView>>,
+    /// The single source of truth for app state (UI rehaul) — settings
+    /// window and status-bar wiring both write to this; `wiring::wire_production`
+    /// registers the observer that keeps `status_bar::sync` reflecting it.
+    pub status: Entity<StatusModel>,
 }
 
 impl Global for VuhoState {}

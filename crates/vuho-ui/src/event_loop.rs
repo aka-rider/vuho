@@ -10,9 +10,41 @@ use vuho_domain::{DictationEvent, ErrorKind};
 
 #[cfg(not(feature = "demo"))]
 use crate::readiness;
-#[cfg(not(feature = "demo"))]
-use crate::status_bar;
 use crate::{overlay, permissions, window_config};
+
+/// A handle to the production `StatusModel` entity — `()` under
+/// `--features demo`, which has no `StatusModel` at all (no menu bar, no
+/// settings). One cfg-gated type, rather than cfg-gating every
+/// `spawn_event_drain`/`apply_events` call site individually: those
+/// functions are shared between production and demo, so they take this by
+/// value/reference unconditionally and [`set_recording`] is the sole place
+/// that branches on which build it actually is.
+#[cfg(not(feature = "demo"))]
+pub(crate) type StatusHandle = gpui::Entity<crate::app_status::StatusModel>;
+#[cfg(feature = "demo")]
+pub(crate) type StatusHandle = ();
+
+/// Reflect a session's recording state in the `StatusModel` (production) —
+/// a no-op under `--features demo`, which has no model to update. The sole
+/// `#[cfg]` branch point for `apply_events`' three call sites, instead of
+/// gating each individually.
+#[cfg(not(feature = "demo"))]
+fn set_recording(status: &StatusHandle, recording: bool, cx: &mut gpui::AsyncApp) {
+    let _ = status.update(cx, |model, cx| {
+        model.recording = recording;
+        cx.notify();
+    });
+}
+
+// `StatusHandle` is `()` under this feature — a real 0-byte type, so
+// pass-by-reference genuinely is pointlessly indirect here; taking it by
+// value instead would require the production arm above (a pointer-sized
+// `Entity<StatusModel>`) to diverge on parameter-passing convention between
+// the two `#[cfg]` arms of one shared signature, which is worse than one
+// pedantic lint suppression.
+#[cfg(feature = "demo")]
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn set_recording(_status: &StatusHandle, _recording: bool, _cx: &mut gpui::AsyncApp) {}
 
 /// Poll interval for both the demo and production event drains (~60 Hz).
 pub(crate) const DRAIN_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(16);
@@ -113,12 +145,18 @@ fn track_session(event: &DictationEvent, session_active: &mut bool) -> bool {
 /// be detected and neither applied to the model nor allowed to schedule a
 /// hide that would cut off a newer session's live overlay (see
 /// [`track_session`]).
+// `status: &StatusHandle` is a genuine pointer-sized `Entity<StatusModel>`
+// under production; only the demo build's `StatusHandle = ()` makes a
+// by-reference 0-byte type here, so the pedantic pass-by-ref lint only ever
+// fires under `--features demo` (see `set_recording`'s matching allow).
+#[allow(clippy::trivially_copy_pass_by_ref)]
 pub(crate) fn apply_events(
     overlay: WindowHandle<overlay::OverlayModel>,
     events: Vec<DictationEvent>,
     cx: &mut gpui::AsyncApp,
     mut hide_at: Option<Instant>,
     session_active: &mut bool,
+    status: &StatusHandle,
 ) -> Option<Instant> {
     let mut show = false;
     let mut skip = vec![false; events.len()];
@@ -133,15 +171,13 @@ pub(crate) fn apply_events(
                 log::info!("menu: Start Listening → Stop Listening (session started)");
                 show = true;
                 hide_at = None;
-                #[cfg(not(feature = "demo"))]
-                status_bar::set_recording(true);
+                set_recording(status, true, cx);
             }
             DictationEvent::SessionCompleted { injection, .. } => {
                 log::info!(
                     "menu: Stop Listening → Start Listening (session completed, injection={injection:?})"
                 );
-                #[cfg(not(feature = "demo"))]
-                status_bar::set_recording(false);
+                set_recording(status, false, cx);
                 hide_at = hide_at_for_injection(injection, Instant::now());
             }
             DictationEvent::Error {
@@ -153,8 +189,7 @@ pub(crate) fn apply_events(
                     "menu: Stop Listening → Start Listening (error={kind:?} recoverable={recoverable})"
                 );
                 log::error!("vuho: ERROR: {message}");
-                #[cfg(not(feature = "demo"))]
-                status_bar::set_recording(false);
+                set_recording(status, false, cx);
                 // Show on error too, not just on SessionStarted: the pipeline
                 // now emits SessionStarted only once the stream is actually
                 // live, so a failed start reaches the UI with the overlay still
@@ -212,6 +247,7 @@ pub(crate) fn maybe_hide(
 pub(crate) fn spawn_event_drain(
     overlay: WindowHandle<overlay::OverlayModel>,
     event_rx: crossbeam_channel::Receiver<DictationEvent>,
+    status: StatusHandle,
     cx: &mut App,
 ) {
     cx.spawn(move |cx: &mut gpui::AsyncApp| {
@@ -227,7 +263,14 @@ pub(crate) fn spawn_event_drain(
                     return;
                 };
                 if !events.is_empty() {
-                    hide_at = apply_events(overlay, events, &mut cx, hide_at, &mut session_active);
+                    hide_at = apply_events(
+                        overlay,
+                        events,
+                        &mut cx,
+                        hide_at,
+                        &mut session_active,
+                        &status,
+                    );
                 }
                 maybe_hide(overlay, &mut hide_at, &mut cx);
                 cx.background_executor().timer(DRAIN_POLL_INTERVAL).await;
@@ -244,10 +287,11 @@ pub(crate) fn spawn_event_drain(
 #[cfg(not(feature = "demo"))]
 pub(crate) fn spawn_ui_drain(
     ui_rx: crossbeam_channel::Receiver<crate::app_state::UiCommand>,
+    status: StatusHandle,
     cx: &mut App,
 ) {
     cx.spawn(move |cx: &mut gpui::AsyncApp| {
-        let cx = cx.clone();
+        let mut cx = cx.clone();
         async move {
             loop {
                 let Some(commands) = drain_pending(&ui_rx) else {
@@ -256,27 +300,35 @@ pub(crate) fn spawn_ui_drain(
                 };
                 for command in commands {
                     match command {
-                        crate::app_state::UiCommand::OpenSettings => {
+                        crate::app_state::UiCommand::OpenSettings
+                        // TODO(ui-rehaul): route to the unified panel — for
+                        // now this is the closest existing approximation.
+                        | crate::app_state::UiCommand::OpenPanel => {
                             let _ = cx.update(crate::settings_window::open_settings_window);
                         }
                         crate::app_state::UiCommand::OpenReadiness => {
                             let _ = cx.update(readiness::reopen_or_front_production_window);
                         }
-                        crate::app_state::UiCommand::ModelStatus(status) => {
-                            // Runs on the main thread, which is what
-                            // `set_model_status` requires (its state lives
-                            // in a thread_local).
-                            status_bar::set_model_status(&status);
-                            let _ = cx.update(|cx| readiness::handle_model_status(status, cx));
+                        crate::app_state::UiCommand::ModelStatus(model_status) => {
+                            let _ = status.update(&mut cx, |model, cx| {
+                                model.model = Some(model_status.clone());
+                                cx.notify();
+                            });
+                            let _ =
+                                cx.update(|cx| readiness::handle_model_status(model_status, cx));
                         }
-                        // Runs on the main thread, which is what `set_warmup`
-                        // requires (its state lives in a thread_local).
                         crate::app_state::UiCommand::EngineReady(Ok(())) => {
-                            status_bar::set_warmup(status_bar::WarmupState::Ready);
+                            let _ = status.update(&mut cx, |model, cx| {
+                                model.engine = crate::app_status::EngineState::Ready;
+                                cx.notify();
+                            });
                         }
                         crate::app_state::UiCommand::EngineReady(Err(e)) => {
                             log::error!("vuho: engine warmup failed: {e}");
-                            status_bar::set_warmup(status_bar::WarmupState::EngineFailed);
+                            let _ = status.update(&mut cx, |model, cx| {
+                                model.engine = crate::app_status::EngineState::Failed(e.clone());
+                                cx.notify();
+                            });
                         }
                     }
                 }
