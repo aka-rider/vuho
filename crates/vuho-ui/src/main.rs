@@ -39,6 +39,7 @@ mod readiness;
 mod settings_window;
 #[cfg(not(feature = "demo"))]
 mod status_bar;
+mod theme;
 mod window_config;
 #[cfg(not(feature = "demo"))]
 mod wiring;
