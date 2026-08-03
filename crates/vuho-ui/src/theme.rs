@@ -1,24 +1,26 @@
 //! The single visual-language chokepoint for the `vuho-ui` crate
 //! (CONSTITUTION rule 26): every color, radius, and type-scale value shared
-//! across the overlay, settings window, and readiness window lives here, so
-//! restyling the app means editing this file, not hunting down scattered
-//! literals.
+//! across the panel's Hud (`overlay.rs`) and Full (`panel.rs`,
+//! `settings_tab.rs`, `controls.rs`) presentations lives here, so restyling
+//! the app means editing this file, not hunting down scattered literals.
 //!
 //! Values are derived from — not invented over — the UI's existing look:
 //! `overlay.rs`'s opacity-first white text scale (`TEXT_*`), the action-blue
-//! and relaunch-green already used for buttons in `readiness.rs`
-//! (`ACCENT`/`OK_GREEN`), and the overlay's recording-LED red (`ERROR_RED`).
-//! `WARN_AMBER` is the one genuinely new semantic color, reserved for a
-//! warning status this crate doesn't yet render.
+//! and relaunch-green already used for buttons (`ACCENT`/`OK_GREEN`), and
+//! the overlay's recording-LED red (`ERROR_RED`). `WARN_AMBER` is the one
+//! genuinely new semantic color, reserved for a warning status.
 //!
-//! This WP (theme.rs + the overlay restyle that consumes it) only wires up
-//! `overlay.rs`; `settings_window.rs`/`readiness.rs` are restyled by other,
-//! parallel work packages against these same frozen names. Until they land,
-//! several items below (`ACCENT`, `OK_GREEN`, `WARN_AMBER`, most `FILL_*`,
-//! `RADIUS_CARD`, `RADIUS_CONTROL`, `TEXT_XS`, `TEXT_MD`, `section_card`,
-//! `section_label`, `progress_bar`) have no call site yet — hence the
-//! crate-wide `dead_code` allow below, rather than trimming the API those
-//! other work packages are already coded against.
+//! This module is compiled under both `--features demo` and production —
+//! `overlay.rs`'s Hud chrome, which needs it, is compiled in both — but
+//! every item consumed only by production-only modules
+//! (`settings_tab.rs`/`controls.rs`/`panel.rs`'s Full-presentation code, all
+//! `#[cfg(not(feature = "demo"))]`) is therefore genuinely dead code under a
+//! demo build. A demo-scoped `#[cfg_attr(feature = "demo", allow(dead_code))]`
+//! per item would just enumerate the same list a second time, so this stays
+//! one file-level allow rather than roughly a dozen identical item-level
+//! ones. `TEXT_XS` (11px captions) is the one item with no call site in
+//! *either* build yet — kept for whichever future control needs a caption
+//! smaller than `TEXT_SM`, covered by the same allow.
 #![allow(dead_code)]
 
 use gpui::{div, prelude::*, px, Div, Hsla, SharedString};
@@ -137,7 +139,7 @@ pub(crate) const RADIUS_CHIP: f32 = 4.0;
 
 // ── Type scale (px) ─────────────────────────────────────────────────────────
 
-/// Captions.
+/// Captions. No call site yet — see the module doc comment.
 pub(crate) const TEXT_XS: f32 = 11.0;
 /// Secondary text / section labels.
 pub(crate) const TEXT_SM: f32 = 12.0;
@@ -154,8 +156,7 @@ pub(crate) fn section_card() -> Div {
     div().p_3().rounded(px(RADIUS_CARD)).bg(FILL_CARD)
 }
 
-/// A small section header above a control — [`TEXT_SM`], [`TEXT_TERTIARY`],
-/// matching `settings_window.rs`'s existing section labels.
+/// A small section header above a control — [`TEXT_SM`], [`TEXT_TERTIARY`].
 pub(crate) fn section_label(text: impl Into<SharedString>) -> Div {
     div()
         .text_size(px(TEXT_SM))

@@ -1,28 +1,38 @@
-//! Production wiring: session + command bridge + hotkey + menu bar +
-//! settings + drain. Split out of `main.rs` (WP10) — everything here is
+//! Production wiring: session + command bridge + hotkey + menu bar + drain.
+//! Split out of `main.rs` (WP10) — everything here is
 //! `#[cfg(not(feature = "demo"))]`, mirroring the module it came from.
+//!
+//! WP6 (ARCHITECTURE.md ADR-021): `main.rs` now owns creating the settings
+//! store, the `StatusModel`/`SettingsTab` entities, and the panel itself
+//! (all needed before `wire_production` runs, to decide whether the
+//! permissions/relaunch-blocked path short-circuits it entirely) — this
+//! module receives them already built and wires the rest: the dictation
+//! session, the provisioning state machine, the hotkey listener, and the
+//! status-bar item.
 
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::Arc;
 
 use crossbeam_channel::{unbounded, Receiver, Sender};
-use gpui::{App, AppContext as _};
+use gpui::{App, Entity, WindowHandle};
 use vuho_domain::{DictationCommand, DictationEvent, ModelStatus};
 use vuho_settings::SettingsStore;
 
-use crate::app_state::{UiCommand, VuhoState};
-use crate::app_status::{EngineState, HotkeyState, StatusModel};
+use crate::app_state::UiCommand;
+use crate::app_status::{HotkeyState, StatusModel};
 use crate::event_loop::{spawn_event_drain, spawn_ui_drain};
-use crate::{hotkey_presets, overlay, permissions, settings_window, status_bar};
+use crate::panel::PanelRoot;
+use crate::settings_tab::SettingsTab;
+use crate::{hotkey_presets, permissions, status_bar};
 
 // ── Provisioning state machine (ADR-020) ───────────────────────────────────
 
-/// Command the readiness window's Download button (or a "Retry" click on a
+/// Command the Settings tab's Download button (or a "Retry" click on a
 /// `Failed` row — same command, same transition) sends to the provisioning
-/// thread. The `Sender` half lives in [`VuhoState`] (CONSTITUTION rule 20 —
-/// own both ends); the `Receiver` half moves into [`spawn_warmup_and_bridge`]'s
-/// thread alongside `cmd_rx`.
+/// thread. `main.rs` owns both ends (CONSTITUTION rule 20): the `Sender`
+/// half goes straight into `SettingsTab::new`, the `Receiver` half into
+/// [`spawn_warmup_and_bridge`]'s thread alongside `cmd_rx`.
 pub(crate) enum ProvisionCommand {
     /// Start a download. Also what "Retry" sends — a failed download and a
     /// fresh one are the same transition (`NeedsModel` → `Downloading`).
@@ -52,7 +62,7 @@ pub(crate) enum ProvisionCommand {
 /// itself.
 enum Phase {
     /// No usable model yet, or a download attempt failed. `status` carries
-    /// exactly what the readiness window/status bar show — always
+    /// exactly what the Settings tab/status bar show — always
     /// [`ModelStatus::Missing`] or [`ModelStatus::Failed`] — and is the
     /// same value [`on_provision_command`]'s `Download` (also "Retry")
     /// transition re-fetches size from the lock for.
@@ -61,9 +71,9 @@ enum Phase {
     /// `Downloading`/`Verifying`, straight from that thread's progress
     /// channel, forwarded into a `Phase` by [`run_provisioning_loop`]'s
     /// `progress_rx` arm. `Dictation` commands are still discarded; another
-    /// `Download` command is ignored — the readiness window swaps the
+    /// `Download` command is ignored — the Settings tab swaps the
     /// Download button for disabled "In progress…" text as soon as this
-    /// variant is entered (see `readiness::model_action_button`), and
+    /// variant is entered (see `settings_tab::SettingsTab::render_speech_model_section`), and
     /// because `provision_rx` is drained one message at a time by this
     /// single thread, there is no window where a second click could race
     /// the first transition — the transition itself, not a later render,
@@ -73,7 +83,7 @@ enum Phase {
     /// `ParakeetEngine::load` itself failed (corrupt/incompatible files,
     /// permission error, out of memory, …) — a fact `Missing`/`Failed`
     /// can't express, since the model bytes are actually fine. `message` is
-    /// shown the same way a download `Failed` is (readiness window Failed
+    /// shown the same way a download `Failed` is (Settings tab Failed
     /// row, "Retry" button — see [`phase_status`]), but Retry from this
     /// phase re-attempts the engine load only (`on_provision_command`'s
     /// `EngineFailed` arm) — never a redundant re-download, which
@@ -116,11 +126,28 @@ enum DownloadOutcome {
 }
 
 /// Wire the real pipeline: session + command bridge + hotkey + menu bar +
-/// settings + drain.
+/// drain, around the panel/settings/status entities `main.rs` already
+/// built.
 ///
 /// Kept short (CONSTITUTION rule 28) by delegating hotkey startup to
 /// [`start_hotkey`].
-pub(crate) fn wire_production(overlay: gpui::WindowHandle<overlay::OverlayModel>, cx: &mut App) {
+///
+/// No `provision_tx` parameter: unlike the old `VuhoState`-global design,
+/// `main.rs` hands the Download/Retry button's sender directly to
+/// [`SettingsTab::new`] when it builds `settings_tab`, so this function has
+/// no need to see it — only `provision_rx`, which the provisioning thread
+/// owns.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn wire_production(
+    panel: WindowHandle<PanelRoot>,
+    settings: &Arc<SettingsStore>,
+    ui_tx: Sender<UiCommand>,
+    ui_rx: Receiver<UiCommand>,
+    provision_rx: Receiver<ProvisionCommand>,
+    status: Entity<StatusModel>,
+    settings_tab: &Entity<SettingsTab>,
+    cx: &mut App,
+) {
     // TIS is main-thread-only (uncatchable SIGTRAP off-main): install the
     // keyboard-language watcher here, on the main thread, so the pipeline
     // thread reads its cache instead of ever touching TIS itself.
@@ -128,21 +155,12 @@ pub(crate) fn wire_production(overlay: gpui::WindowHandle<overlay::OverlayModel>
         objc2::MainThreadMarker::new().expect("wire_production runs on the main thread"),
     );
 
-    // Single owner of the settings file for the process (CONSTITUTION rule 1).
-    let settings = Arc::new(SettingsStore::load_or_default());
-
     let (event_tx, event_rx) = unbounded::<DictationEvent>();
     // Clone before passing to session so the bridge thread also owns a sender.
     // Without this, `event_tx` is moved into the session and dropped at the
     // end of `wire_production`, killing the pipeline thread instantly.
     let event_tx_bridge = event_tx.clone();
     let (cmd_tx, cmd_rx) = unbounded::<DictationCommand>();
-    let (ui_tx, ui_rx) = unbounded::<UiCommand>();
-    // The readiness window's Download/Retry button reaches the provisioning
-    // thread through this channel; `provision_tx` lives in `VuhoState`
-    // (CONSTITUTION rule 20 — own both ends), `provision_rx` moves into the
-    // thread below alongside `cmd_rx`.
-    let (provision_tx, provision_rx) = unbounded::<ProvisionCommand>();
 
     // Request microphone permission proactively on the main thread.
     // macOS TCC dialogs only appear reliably from the main run-loop;
@@ -153,35 +171,12 @@ pub(crate) fn wire_production(overlay: gpui::WindowHandle<overlay::OverlayModel>
     // Menu-bar status item (click-split button + toggle/Open/Quit menu)
     // shares the command channel and gets its own channel to reach the GPUI
     // foreground task that owns window creation (the status item has no
-    // GPUI handle).
-    status_bar::install(cmd_tx.clone(), ui_tx.clone());
-
-    // TODO(ui-rehaul): creation moves to main() when the permission gate
-    // merges into the panel — for now `wire_production` is the only place
-    // that ever needs one, since the gate path (`readiness`'s preflight
-    // check) short-circuits before this function runs at all.
-    //
-    // Initial `hotkey` is `Active(preset)`, corrected to `Failed` by
-    // `start_hotkey` below if the listener actually fails to start — a
-    // transient over-optimistic read for however long `start_hotkey` takes.
-    let status = cx.new(|_| StatusModel {
-        model: None,
-        engine: EngineState::Loading,
-        recording: false,
-        hotkey: HotkeyState::Active(settings.get().hotkey),
-        permissions_missing: Vec::new(),
-        launch_blocked: false,
-        settings_load_warning: None,
-    });
-    // The tray must show `Loading model…` immediately, not just on the
-    // first future change — `cx.observe` alone only fires on a later
-    // `notify()`, so the freshly installed (title-less) toggle item needs
-    // one explicit sync before that.
+    // GPUI handle). The only other `install` call site (`main.rs`'s
+    // permissions/relaunch-blocked path, `cmd_tx: None`) `return`s before
+    // ever reaching `wire_production`, so this is always the sole call for
+    // a given process.
+    status_bar::install(Some(cmd_tx.clone()), ui_tx.clone());
     status_bar::sync(&status.read(cx).composite());
-    cx.observe(&status, |status, cx| {
-        status_bar::sync(&status.read(cx).composite());
-    })
-    .detach();
 
     spawn_warmup_and_bridge(
         cmd_rx,
@@ -192,32 +187,13 @@ pub(crate) fn wire_production(overlay: gpui::WindowHandle<overlay::OverlayModel>
         settings.clone(),
     );
 
-    let hotkey = start_hotkey(&cmd_tx, &settings, &status, cx);
-
-    // Registered once for the process lifetime: the settings window and the
-    // hotkey-preset live-rebind both reach through this global.
-    cx.set_global(VuhoState {
-        settings,
-        hotkey: Rc::new(RefCell::new(hotkey)),
-        cmd_tx,
-        provision_tx,
-        settings_window: None,
-        status: status.clone(),
+    let hotkey = start_hotkey(&cmd_tx, settings, &status, cx);
+    settings_tab.update(cx, |tab, _cx| {
+        tab.connect_hotkey(Rc::new(RefCell::new(hotkey)), cmd_tx);
     });
 
-    // Keyboard shortcut to open settings — reliable backup to the
-    // status-bar menu's objc2 delegate path (GPUI-native, always works).
-    cx.bind_keys([gpui::KeyBinding::new(
-        "cmd-shift-s",
-        crate::actions::OpenSettings,
-        None,
-    )]);
-    cx.on_action(|_action: &crate::actions::OpenSettings, cx: &mut App| {
-        settings_window::open_settings_window(cx);
-    });
-
-    spawn_event_drain(overlay, event_rx, status.clone(), cx);
-    spawn_ui_drain(ui_rx, status, cx);
+    spawn_event_drain(panel, event_rx, status.clone(), cx);
+    spawn_ui_drain(panel, ui_rx, status, cx);
 }
 
 /// Check microphone permission status at app startup.
@@ -552,7 +528,7 @@ enum ProvisionOutcome {
 /// [`Phase::NeedsModel`] (returning the new [`Phase::Downloading`], whose
 /// status is set synchronously to `Downloading { received_bytes: 0, .. }`
 /// rather than waiting for the download thread's first progress tick — A3:
-/// the readiness window's button reflects the click immediately, not one
+/// the Settings tab's button reflects the click immediately, not one
 /// network round-trip later); retry a blocking engine load from
 /// [`Phase::EngineFailed`] (B4 — no redundant re-download, which can't fix
 /// an out-of-band-provisioned model anyway); ignore it while already
@@ -740,7 +716,7 @@ fn spawn_download_thread() -> (Receiver<DownloadOutcome>, Receiver<ModelStatus>)
 ///
 /// On failure (Accessibility not granted), prompts for the grant; the menu
 /// bar still works and the hotkey binds after a relaunch (or after the user
-/// grants access and re-selects a preset in the settings window).
+/// grants access and re-selects a preset in the panel's Settings tab).
 ///
 /// The prompt is deferred via `cx.spawn` rather than called inline: this
 /// whole function runs synchronously inside GPUI's top-level `Application::run`
@@ -894,8 +870,8 @@ mod tests {
     }
 
     /// Pull the `ModelStatus` out of a `UiCommand`, discarding anything
-    /// else (`EngineReady`, `OpenSettings`, …) — what these tests care
-    /// about is exactly the one command [`send_phase_status`] produces.
+    /// else (`EngineReady`, `OpenPanel`, …) — what these tests care about
+    /// is exactly the one command [`send_phase_status`] produces.
     fn model_status(cmd: UiCommand) -> Option<ModelStatus> {
         match cmd {
             UiCommand::ModelStatus(status) => Some(status),
@@ -965,7 +941,7 @@ mod tests {
 
     /// Direct regression for B1: `initial_phase`/`load_after_download` used
     /// to match `ModelStatus::Ready` in a branch that sent nothing at all —
-    /// `Ready` was consumed, never forwarded, so the readiness window never
+    /// `Ready` was consumed, never forwarded, so the Settings tab never
     /// closed after a successful provision. Here `run_provisioning_loop`
     /// is handed a `Phase::Ready` directly (bypassing the real model/engine
     /// entirely — this loop's status broadcasting is what's under test, not
@@ -1040,7 +1016,7 @@ mod tests {
                 message: "the engine blew up".to_owned()
             }],
             "B4: a Ready-but-engine-failed phase must surface a Failed \
-             status (readiness window Failed row + Retry) rather than \
+             status (Settings tab Failed row + Retry) rather than \
              leaving the UI with nothing sent for it at all"
         );
     }

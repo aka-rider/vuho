@@ -88,13 +88,10 @@ pub(crate) fn order_out(window: &mut Window) {
 /// Toggle click-through (objc2 `setIgnoresMouseEvents:`).
 ///
 /// `apply_window_config` sets this to `true` unconditionally at window
-/// creation for the overlay; callers that need to accept mouse input for
-/// part of the panel's lifetime (e.g. the tabbed presentation) flip it off
-/// and back on again through this function.
-// Not yet called: wired up by the panel-mode integration WP that consumes
-// this function alongside make_key_and_order_front/set_frame (rule 29:
-// narrow #[allow], not a file-wide blanket).
-#[allow(dead_code)]
+/// creation for the panel; `panel.rs`'s presentation-surgery chokepoint
+/// flips it off for the Full presentation (which accepts clicks, e.g. the
+/// tab strip and Settings controls) and back on for the Hud presentation
+/// (click-through, like the old overlay).
 pub(crate) fn set_click_through(window: &mut Window, on: bool) {
     let Some(ns_window) = get_ns_window(window) else {
         return;
@@ -114,9 +111,10 @@ pub(crate) fn set_click_through(window: &mut Window, on: bool) {
 /// non-activating (`NSWindowStyleMaskNonactivatingPanel`, set by GPUI for
 /// `WindowKind::PopUp`) — `makeKeyAndOrderFront:` gives it key status
 /// without activating the application.
-// Not yet called: wired up by the panel-mode integration WP (see
-// set_click_through's note).
-#[allow(dead_code)]
+///
+/// `panel.rs`'s presentation-surgery chokepoint calls this for the Full
+/// presentation only — the Hud presentation stays non-key (click-through,
+/// no keyboard focus stolen from whatever app the user is dictating into).
 pub(crate) fn make_key_and_order_front(window: &mut Window) {
     let Some(ns_window) = get_ns_window(window) else {
         return;
@@ -137,9 +135,10 @@ pub(crate) fn make_key_and_order_front(window: &mut Window) {
 /// (`[[ns_window screen] frame]`, falling back to `[NSScreen mainScreen]`
 /// if the window isn't currently on any screen), so a `bounds()` call
 /// immediately after this one reads back the same value that was set.
-// Not yet called: wired up by the panel-mode integration WP (see
-// set_click_through's note).
-#[allow(dead_code)]
+///
+/// `panel.rs`'s presentation-surgery chokepoint is the one caller: it
+/// re-frames the panel between the Hud's bottom-center bounds and the Full
+/// presentation's centered bounds on every presentation change.
 pub(crate) fn set_frame(window: &mut Window, bounds: Bounds<Pixels>) {
     let Some(ns_window) = get_ns_window(window) else {
         return;

@@ -1,32 +1,28 @@
-//! macOS menu-bar status item (ADR-006 / GAP 2, ADR-016 gate-mode extension,
-//! ADR-020 model-status extension, UI-rehaul WP4 click-split/`StatusModel`
-//! wiring).
+//! macOS menu-bar status item (ADR-006 / GAP 2, ADR-020 model-status
+//! extension, UI-rehaul WP4 click-split/`StatusModel` wiring, WP6 single-
+//! panel integration).
 //!
 //! The app is `LSUIElement` (no Dock icon, accessory activation policy), so the
-//! status item is the only always-available way to quit — and, once the app is
-//! past the permission gate, to toggle dictation without the `CapsLock` hotkey.
+//! status item is the only always-available way to quit — and, once a
+//! dictation session can exist, to toggle it without the `CapsLock` hotkey.
 //!
-//! The status item must exist in **both** of the app's two modes:
-//! - Gate mode ([`install_gate`]): shown while `readiness`'s permission-gate
-//!   entry path blocks startup on a missing TCC grant. There is no
-//!   dictation session yet, so the menu is just "Permissions…" (re-fronts
-//!   the gate window) and "Quit Vuho". Unchanged by WP4 — it dies in a
-//!   later package.
-//! - Production mode ([`install`]): a click-split button (plain left click
-//!   opens the panel, right-click/control-click pops a menu) with a
-//!   Start/Stop toggle · "Open Vuho" · Quit menu, driven by [`sync`] from
-//!   the caller's `StatusModel` `Entity`.
-//!
-//! One [`StatusDelegate`] class serves both modes (its ivars hold a
-//! [`DelegateMode`] enum) so the button configuration, menu-item construction,
-//! and the `quit:` action are written exactly once (CONSTITUTION rule 26) —
-//! only the menu each mode *assembles*, and how each mode's button reacts to a
-//! click, differ.
+//! [`install`] serves **both** of the app's two startup states with one menu
+//! shape — a click-split button (plain left click opens the panel,
+//! right-click/control-click pops a menu) with a Start/Stop toggle ·
+//! "Open Vuho" · Quit menu, driven by [`sync`] from the caller's
+//! `StatusModel` `Entity`:
+//! - **Permissions/relaunch blocked** (`main.rs`'s gate path): `install`
+//!   is called with `cmd_tx: None` — there is no dictation session yet, so
+//!   the toggle item is a no-op (and, via `sync`, disabled — see
+//!   `CompositeStatus::toggle_enabled`); "Open Vuho" still opens the panel
+//!   on its Settings tab, where the permission rows / relaunch button live.
+//! - **Production** (`wiring::wire_production`): `install` is called with
+//!   `cmd_tx: Some(..)` — the toggle sends real `DictationCommand`s.
 //!
 //! Built with typed objc2-app-kit bindings (like `vuho-os-integration`'s
 //! `NSPasteboard` usage). `NSStatusItem`/`NSMenu`/`NSMenuItem` are `MainThreadOnly`,
-//! so every call threads a [`MainThreadMarker`]; `install`/`install_gate` must run
-//! on the main thread (they are — always called from inside the GPUI `run` closure).
+//! so every call threads a [`MainThreadMarker`]; `install` must run on the
+//! main thread (it is — always called from inside the GPUI `run` closure).
 //!
 //! All retained `AppKit` objects live in main-thread `thread_local`s, which keeps
 //! them alive for the process lifetime and lets [`sync`] mutate the menu label
@@ -58,7 +54,6 @@ use vuho_domain::DictationCommand;
 
 use crate::app_state::UiCommand;
 use crate::app_status::CompositeStatus;
-use crate::readiness::GateCommand;
 
 // ── TrayIcon (the one data-driven icon mapping — CONSTITUTION rule 26) ────
 
@@ -137,27 +132,17 @@ fn apply_icon(button: &NSStatusBarButton, icon: TrayIcon) {
     button.setTitle(&NSString::from_str("𝗏"));
 }
 
-// ── Delegate (one class, two modes) ────────────────────────────────────────
+// ── Delegate ─────────────────────────────────────────────────────────────
 
-/// What a [`StatusDelegate`] instance can do when its menu items fire.
-enum DelegateMode {
-    /// Full dictation menu: `cmd_tx` mirrors the hotkey's `DictationCommand`
-    /// stream, `ui_tx` reaches the GPUI foreground task for window creation.
-    Production {
-        cmd_tx: Sender<DictationCommand>,
-        ui_tx: Sender<UiCommand>,
-    },
-    /// Gate mode: no session exists yet, so the only action is re-fronting
-    /// (or, per Fix 5, reopening) the permission gate window. `gate_tx`
-    /// reaches `readiness::spawn_gate_command_drain`, the GPUI
-    /// foreground task that owns gate-window creation — this delegate, like
-    /// `Production`'s `ui_tx`, has no `App` access of its own.
-    Gate { gate_tx: Sender<GateCommand> },
-}
-
-/// Instance variables for the status-item delegate.
+/// Instance variables for the status-item delegate. `cmd_tx` is `None`
+/// while every dictation command would be meaningless — the
+/// permissions/relaunch-blocked startup path (`main.rs`) — in which case
+/// `toggle_listening:` is a no-op (the toggle item is also disabled via
+/// `sync`'s `CompositeStatus::toggle_enabled`, so this is a defensive
+/// second line, not the primary guard).
 struct DelegateIvars {
-    mode: DelegateMode,
+    cmd_tx: Option<Sender<DictationCommand>>,
+    ui_tx: Sender<UiCommand>,
 }
 
 define_class!(
@@ -183,7 +168,7 @@ define_class!(
     impl StatusDelegate {
         #[unsafe(method(toggleListening:))]
         fn toggle_listening(&self, _sender: Option<&AnyObject>) {
-            if let DelegateMode::Production { cmd_tx, .. } = &self.ivars().mode {
+            if let Some(cmd_tx) = &self.ivars().cmd_tx {
                 log::info!("status_bar: menu toggle → Toggle");
                 // Best-effort: the bridge/session may already be gone on shutdown.
                 let _ = cmd_tx.send(DictationCommand::Toggle);
@@ -192,10 +177,8 @@ define_class!(
 
         #[unsafe(method(openPanel:))]
         fn open_panel(&self, _sender: Option<&AnyObject>) {
-            if let DelegateMode::Production { ui_tx, .. } = &self.ivars().mode {
-                // Best-effort: the GPUI drain task may already be gone on shutdown.
-                let _ = ui_tx.send(UiCommand::OpenPanel);
-            }
+            // Best-effort: the GPUI drain task may already be gone on shutdown.
+            let _ = self.ivars().ui_tx.send(UiCommand::OpenPanel);
         }
 
         /// Fired by the click-split button config `install` sets up
@@ -207,9 +190,6 @@ define_class!(
         /// `openPanel:`.
         #[unsafe(method(statusItemClicked:))]
         fn status_item_clicked(&self, _sender: Option<&AnyObject>) {
-            let DelegateMode::Production { ui_tx, .. } = &self.ivars().mode else {
-                return;
-            };
             let Some(mtm) = MainThreadMarker::new() else {
                 return;
             };
@@ -224,19 +204,7 @@ define_class!(
                 pop_menu();
             } else {
                 // Best-effort: the GPUI drain task may already be gone on shutdown.
-                let _ = ui_tx.send(UiCommand::OpenPanel);
-            }
-        }
-
-        #[unsafe(method(showPermissions:))]
-        fn show_permissions(&self, _sender: Option<&AnyObject>) {
-            if let DelegateMode::Gate { gate_tx } = &self.ivars().mode {
-                // Reopens the gate window first if the user closed it,
-                // then fronts it (Fix 5) — handled on the GPUI foreground
-                // drain (`readiness::spawn_gate_command_drain`) since this
-                // AppKit callback has no `App` access of its own.
-                // Best-effort: the drain may already be gone on shutdown.
-                let _ = gate_tx.send(GateCommand::ReopenOrFront);
+                let _ = self.ivars().ui_tx.send(UiCommand::OpenPanel);
             }
         }
 
@@ -250,8 +218,8 @@ define_class!(
 );
 
 impl StatusDelegate {
-    fn new(mode: DelegateMode) -> Retained<Self> {
-        let this = Self::alloc().set_ivars(DelegateIvars { mode });
+    fn new(cmd_tx: Option<Sender<DictationCommand>>, ui_tx: Sender<UiCommand>) -> Retained<Self> {
+        let this = Self::alloc().set_ivars(DelegateIvars { cmd_tx, ui_tx });
         // SAFETY: `this` is a freshly allocated, ivar-initialized
         // `StatusDelegate` from `alloc().set_ivars(..)` — calling
         // `[super init]` on it exactly once is the standard, required
@@ -263,9 +231,7 @@ impl StatusDelegate {
 
 // ── Shared item/menu construction ──────────────────────────────────────────
 
-/// Retained `AppKit` objects for a status item, held for the app lifetime.
-/// Shared shape for both gate-mode and production installs; `toggle_item` is
-/// `None` in gate mode (its single "Permissions…" item never changes title).
+/// Retained `AppKit` objects for the status item, held for the app lifetime.
 /// `last_icon` starts `None` (nothing applied via [`sync`] yet, distinct
 /// from whatever static default [`configure_status_button`] painted at
 /// install time) and is only ever read/written from the main thread.
@@ -273,7 +239,7 @@ struct StatusState {
     item: Retained<NSStatusItem>,
     button: Retained<NSStatusBarButton>,
     menu: Retained<NSMenu>,
-    toggle_item: Option<Retained<NSMenuItem>>,
+    toggle_item: Retained<NSMenuItem>,
     // Retained for the process lifetime only — `setTarget:` (used by the
     // production click-split) does not itself retain its target, so this is
     // what keeps the delegate alive; never read again after construction.
@@ -282,54 +248,38 @@ struct StatusState {
 }
 
 thread_local! {
-    /// Main-thread-only storage for whichever status item is currently
-    /// installed (gate-mode xor production — `main.rs` installs exactly one
-    /// per process, never both). Populated by [`install`]/[`install_gate`],
+    /// Main-thread-only storage for the currently-installed status item —
+    /// `main.rs` installs exactly one per process. Populated by [`install`],
     /// read by [`sync`]/[`pop_menu`]/`statusItemClicked:`; all run on the
     /// GPUI main thread.
     static STATE: RefCell<Option<StatusState>> = const { RefCell::new(None) };
-}
-
-/// Create the status item + button icon + delegate; the caller builds and
-/// attaches the mode-specific menu. Common to [`install`] and [`install_gate`]
-/// (CONSTITUTION rule 26 — one construction path, not two). `None` if the
-/// status item has no button (should not happen in practice, but
-/// `NSStatusItem::button` is itself `Option`-typed).
-fn new_status_item(
-    mode: DelegateMode,
-    mtm: MainThreadMarker,
-) -> Option<(
-    Retained<NSStatusItem>,
-    Retained<NSStatusBarButton>,
-    Retained<StatusDelegate>,
-)> {
-    let delegate = StatusDelegate::new(mode);
-    let bar = NSStatusBar::systemStatusBar();
-    let item = bar.statusItemWithLength(NSVariableStatusItemLength);
-    let button = configure_status_button(&item, mtm)?;
-    Some((item, button, delegate))
 }
 
 /// Install the menu-bar status item with a click-split button (plain left
 /// click opens the panel, right-click/control-click pops the menu) and a
 /// Start/Stop toggle · "Open Vuho" · Quit menu.
 ///
-/// Must be called on the main thread (from the GPUI `run` closure). The
-/// toggle sends [`DictationCommand::Toggle`] on `cmd_tx` — the same channel
-/// the `CapsLock` hotkey uses; both "Open Vuho" and a plain click send
+/// Must be called on the main thread (from the GPUI `run` closure), exactly
+/// once per process — both `main.rs` entry paths (permissions/relaunch
+/// blocked, and production) call this, never [`install`] a second time.
+/// `cmd_tx` is `None` on the blocked path (no dictation session exists yet —
+/// the toggle no-ops, see [`DelegateIvars`]) and `Some(..)` in production,
+/// where it sends [`DictationCommand::Toggle`] — the same channel the
+/// `CapsLock` hotkey uses. Both "Open Vuho" and a plain click send
 /// [`UiCommand::OpenPanel`] on `ui_tx`, drained by the GPUI foreground task
 /// that owns window creation. Nothing here reflects live app state — call
-/// [`sync`] once right after installing, then again on every
-/// `StatusModel` change (see `wiring::wire_production`).
-pub(crate) fn install(cmd_tx: Sender<DictationCommand>, ui_tx: Sender<UiCommand>) {
+/// [`sync`] once right after installing, then again on every `StatusModel`
+/// change.
+pub(crate) fn install(cmd_tx: Option<Sender<DictationCommand>>, ui_tx: Sender<UiCommand>) {
     let Some(mtm) = MainThreadMarker::new() else {
         log::error!("status_bar::install must be called on the main thread");
         return;
     };
 
-    let Some((item, button, delegate)) =
-        new_status_item(DelegateMode::Production { cmd_tx, ui_tx }, mtm)
-    else {
+    let delegate = StatusDelegate::new(cmd_tx, ui_tx);
+    let bar = NSStatusBar::systemStatusBar();
+    let item = bar.statusItemWithLength(NSVariableStatusItemLength);
+    let Some(button) = configure_status_button(&item, mtm) else {
         log::error!("status_bar::install: status item has no button");
         return;
     };
@@ -357,40 +307,7 @@ pub(crate) fn install(cmd_tx: Sender<DictationCommand>, ui_tx: Sender<UiCommand>
             item,
             button,
             menu,
-            toggle_item: Some(toggle_item),
-            _delegate: delegate,
-            last_icon: Cell::new(None),
-        });
-    });
-}
-
-/// Install the gate-mode status item: "Permissions…" (reopens/re-fronts the
-/// gate window, see [`crate::readiness::reopen_or_front_gate_window`])
-/// · separator · "Quit Vuho". Called instead of [`install`] while
-/// `readiness::missing_permissions()` is non-empty, so the app is never
-/// silently running with no menu-bar affordance at all (Fix 2). Unchanged by
-/// WP4: the button keeps `AppKit`'s classic "attach the menu, let it auto-pop"
-/// behavior — there is no panel to click-split to yet in gate mode.
-pub(crate) fn install_gate(gate_tx: Sender<GateCommand>) {
-    let Some(mtm) = MainThreadMarker::new() else {
-        log::error!("status_bar::install_gate must be called on the main thread");
-        return;
-    };
-
-    let Some((item, button, delegate)) = new_status_item(DelegateMode::Gate { gate_tx }, mtm)
-    else {
-        log::error!("status_bar::install_gate: status item has no button");
-        return;
-    };
-    let menu = build_gate_menu(&delegate, mtm);
-    item.setMenu(Some(&menu));
-
-    STATE.with(|s| {
-        *s.borrow_mut() = Some(StatusState {
-            item,
-            button,
-            menu,
-            toggle_item: None,
+            toggle_item,
             _delegate: delegate,
             last_icon: Cell::new(None),
         });
@@ -425,12 +342,10 @@ fn pop_menu() {
 }
 
 /// Set the status-item button's initial icon: an SF Symbol template image,
-/// with a plain-text fallback if the symbol is unavailable. Shared by both
-/// modes — the waveform icon is how the user recognizes Vuho is running at
-/// all, gate or production. Production overwrites this within moments via
-/// its first [`sync`] call; gate mode never calls `sync`, so this stays put
-/// for gate mode's whole lifetime. Returns the button so callers can build
-/// the rest of [`StatusState`] around it.
+/// with a plain-text fallback if the symbol is unavailable — the waveform
+/// icon is how the user recognizes Vuho is running at all, before `install`'s
+/// caller ever calls [`sync`]. Returns the button so callers can build the
+/// rest of [`StatusState`] around it.
 fn configure_status_button(
     item: &NSStatusItem,
     mtm: MainThreadMarker,
@@ -521,35 +436,12 @@ fn build_menu(
     (menu, toggle_item)
 }
 
-/// Build the gate-mode "Permissions…" · separator · "Quit Vuho" menu.
-fn build_gate_menu(delegate: &Retained<StatusDelegate>, mtm: MainThreadMarker) -> Retained<NSMenu> {
-    let menu = NSMenu::new(mtm);
-    menu.setAutoenablesItems(false);
-    let delegate_target: &AnyObject = delegate;
-
-    make_menu_item(
-        mtm,
-        &menu,
-        "Permissions…",
-        sel!(showPermissions:),
-        "",
-        delegate_target,
-    );
-
-    menu.addItem(&NSMenuItem::separatorItem(mtm));
-
-    make_menu_item(mtm, &menu, "Quit Vuho", sel!(quit:), "q", delegate_target);
-
-    menu
-}
-
 /// The **only** tray mutator: reflect one [`CompositeStatus`] in the toggle
 /// item's title/enabled state and the button's icon (via [`TrayIcon`]).
 ///
 /// Called from the GPUI foreground task (main thread) — same thread as
-/// [`install`], so it sees the populated `thread_local`. A no-op in gate
-/// mode (no `toggle_item`, and no observer ever calls this there) or before
-/// any install has run.
+/// [`install`], so it sees the populated `thread_local`. A no-op before any
+/// install has run.
 pub(crate) fn sync(status: &CompositeStatus) {
     let Some((toggle_item, button, cached_icon)) = STATE.with(|s| {
         s.borrow().as_ref().map(|state| {
@@ -563,10 +455,8 @@ pub(crate) fn sync(status: &CompositeStatus) {
         return;
     };
 
-    if let Some(toggle_item) = &toggle_item {
-        toggle_item.setTitle(&NSString::from_str(&status.menu_title()));
-        toggle_item.setEnabled(status.toggle_enabled());
-    }
+    toggle_item.setTitle(&NSString::from_str(&status.menu_title()));
+    toggle_item.setEnabled(status.toggle_enabled());
 
     let icon = TrayIcon::from_composite(status);
     if cached_icon != Some(icon) {

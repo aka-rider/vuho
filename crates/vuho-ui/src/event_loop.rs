@@ -1,16 +1,20 @@
-//! Event drains: pipeline (or demo) events → overlay, and status-bar
-//! `UiCommand`s → GPUI window calls. Split out of `main.rs` (WP10) — this
-//! module owns the poll-and-apply loops and the pure hide/stale-detection
-//! logic they depend on.
+//! Event drains: pipeline (or demo) events → the panel's overlay entity, and
+//! status-bar `UiCommand`s → panel transitions. Split out of `main.rs`
+//! (WP10) — this module owns the poll-and-apply loops and the pure
+//! hide/stale-detection logic they depend on. Retargeted from
+//! `WindowHandle<OverlayModel>` to `WindowHandle<PanelRoot>` in WP6
+//! (ARCHITECTURE.md ADR-021): events forward into `panel.overlay`, and what
+//! used to be direct `window_config::order_front`/`order_out` calls are now
+//! `panel::on_session_started`/`panel::hide_if_hud` — the presentation-aware
+//! transitions that keep the Hud/Full split intact.
 
 use std::time::Instant;
 
 use gpui::{App, WindowHandle};
 use vuho_domain::{DictationEvent, ErrorKind};
 
-#[cfg(not(feature = "demo"))]
-use crate::readiness;
-use crate::{overlay, permissions, window_config};
+use crate::panel::{self, PanelRoot};
+use crate::{overlay, permissions};
 
 /// A handle to the production `StatusModel` entity — `()` under
 /// `--features demo`, which has no `StatusModel` at all (no menu bar, no
@@ -136,9 +140,12 @@ fn track_session(event: &DictationEvent, session_active: &mut bool) -> bool {
     }
 }
 
-/// Apply one drained batch to the overlay: show on `SessionStarted`, forward
-/// non-stale events to the model, prompt for mic access on a mic-permission
-/// error, and (re)schedule the hide timer. Returns the updated hide deadline.
+/// Apply one drained batch to the panel's overlay entity: forward non-stale
+/// events to the model, prompt for mic access on a mic-permission error, and
+/// (re)schedule the hide timer — then, once every event in the batch has
+/// been forwarded, apply the one panel-level transition the batch implies
+/// (`panel::on_session_started` when `show` — `SessionStarted`, or a
+/// show-worthy `Error` — was seen). Returns the updated hide deadline.
 ///
 /// `session_active` persists across calls (like `hide_at`) so a stale
 /// `SessionCompleted` — one with no session currently being tracked — can
@@ -151,7 +158,7 @@ fn track_session(event: &DictationEvent, session_active: &mut bool) -> bool {
 // fires under `--features demo` (see `set_recording`'s matching allow).
 #[allow(clippy::trivially_copy_pass_by_ref)]
 pub(crate) fn apply_events(
-    overlay: WindowHandle<overlay::OverlayModel>,
+    panel: WindowHandle<PanelRoot>,
     events: Vec<DictationEvent>,
     cx: &mut gpui::AsyncApp,
     mut hide_at: Option<Instant>,
@@ -209,43 +216,51 @@ pub(crate) fn apply_events(
             DictationEvent::PartialTranscript { .. } | DictationEvent::Activity { .. } => {}
         }
     }
-    let _ = overlay.update(cx, |model, window, cx| {
-        if show {
-            window_config::order_front(window);
-        }
-        for (ev, skip) in events.into_iter().zip(skip) {
-            if skip {
-                continue;
+    let _ = panel.update(cx, |root, _window, cx| {
+        root.overlay.update(cx, |model, cx| {
+            for (ev, skip) in events.into_iter().zip(skip) {
+                if skip {
+                    continue;
+                }
+                model.handle_event(ev);
             }
-            model.handle_event(ev);
-        }
-        cx.notify();
+            cx.notify();
+        });
     });
+    if show {
+        // `on_session_started` takes `&mut App`; this function's own `cx` is
+        // `&mut AsyncApp` (a distinct type, no implicit coercion between
+        // them) — `AsyncApp::update` is the bridge, handing the closure a
+        // real `&mut App` for the duration of the call.
+        let _ = cx.update(|cx| panel::on_session_started(panel, cx));
+    }
     hide_at
 }
 
-/// Hide the overlay once the outcome-display deadline has passed.
+/// Hide the panel (if it's presenting the Hud) once the outcome-display
+/// deadline has passed.
 pub(crate) fn maybe_hide(
-    overlay: WindowHandle<overlay::OverlayModel>,
+    panel: WindowHandle<PanelRoot>,
     hide_at: &mut Option<Instant>,
     cx: &mut gpui::AsyncApp,
 ) {
     if let Some(t) = *hide_at {
         if Instant::now() >= t {
             *hide_at = None;
-            let _ = overlay.update(cx, |_model, window, _cx| {
-                window_config::order_out(window);
-            });
+            // See `apply_events`'s matching comment: bridge `&mut AsyncApp`
+            // to the `&mut App` `hide_if_hud` needs via `AsyncApp::update`.
+            let _ = cx.update(|cx| panel::hide_if_hud(panel, cx));
         }
     }
 }
 
-/// Drain pipeline (or demo) events into the overlay for the process lifetime.
+/// Drain pipeline (or demo) events into the panel's overlay entity for the
+/// process lifetime.
 ///
 /// Exits (with a diagnostic) if `event_rx`'s sender is ever dropped, instead
 /// of silently spinning (CONSTITUTION rule 10 — finding 4).
 pub(crate) fn spawn_event_drain(
-    overlay: WindowHandle<overlay::OverlayModel>,
+    panel: WindowHandle<PanelRoot>,
     event_rx: crossbeam_channel::Receiver<DictationEvent>,
     status: StatusHandle,
     cx: &mut App,
@@ -264,7 +279,7 @@ pub(crate) fn spawn_event_drain(
                 };
                 if !events.is_empty() {
                     hide_at = apply_events(
-                        overlay,
+                        panel,
                         events,
                         &mut cx,
                         hide_at,
@@ -272,7 +287,7 @@ pub(crate) fn spawn_event_drain(
                         &status,
                     );
                 }
-                maybe_hide(overlay, &mut hide_at, &mut cx);
+                maybe_hide(panel, &mut hide_at, &mut cx);
                 cx.background_executor().timer(DRAIN_POLL_INTERVAL).await;
             }
         }
@@ -281,11 +296,12 @@ pub(crate) fn spawn_event_drain(
 }
 
 /// Drain `UiCommand`s from the status-bar menu's objc2 delegate (which has
-/// no GPUI handle of its own) into GPUI window-creation calls.
+/// no GPUI handle of its own) into panel transitions.
 ///
 /// Mirrors [`spawn_event_drain`]'s poll-and-detach shape.
 #[cfg(not(feature = "demo"))]
 pub(crate) fn spawn_ui_drain(
+    panel: WindowHandle<PanelRoot>,
     ui_rx: crossbeam_channel::Receiver<crate::app_state::UiCommand>,
     status: StatusHandle,
     cx: &mut App,
@@ -300,22 +316,32 @@ pub(crate) fn spawn_ui_drain(
                 };
                 for command in commands {
                     match command {
-                        crate::app_state::UiCommand::OpenSettings
-                        // TODO(ui-rehaul): route to the unified panel — for
-                        // now this is the closest existing approximation.
-                        | crate::app_state::UiCommand::OpenPanel => {
-                            let _ = cx.update(crate::settings_window::open_settings_window);
-                        }
-                        crate::app_state::UiCommand::OpenReadiness => {
-                            let _ = cx.update(readiness::reopen_or_front_production_window);
+                        crate::app_state::UiCommand::OpenPanel => {
+                            let _ = cx.update(|cx| panel::open_from_tray(panel, cx));
                         }
                         crate::app_state::UiCommand::ModelStatus(model_status) => {
+                            let failed = matches!(
+                                model_status,
+                                vuho_domain::ModelStatus::Failed { .. }
+                            );
                             let _ = status.update(&mut cx, |model, cx| {
                                 model.model = Some(model_status.clone());
                                 cx.notify();
                             });
-                            let _ =
-                                cx.update(|cx| readiness::handle_model_status(model_status, cx));
+                            // Routine Downloading/Verifying ticks must never
+                            // surface the panel — only a `Failed` status the
+                            // user actually needs to act on, and only if the
+                            // panel isn't already open (never steal focus
+                            // from whatever the user is doing).
+                            if failed {
+                                let shown =
+                                    cx.update(|cx| panel::is_shown(panel, cx)).unwrap_or(true);
+                                if !shown {
+                                    let _ = cx.update(|cx| {
+                                        panel::show_full(panel, panel::Tab::Settings, cx);
+                                    });
+                                }
+                            }
                         }
                         crate::app_state::UiCommand::EngineReady(Ok(())) => {
                             let _ = status.update(&mut cx, |model, cx| {
