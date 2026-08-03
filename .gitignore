@@ -1,0 +1,33 @@
+# Build artifacts.
+# No trailing slash: a pattern ending in `/` matches directories only, so a
+# *symlink* with the same name slips past it silently (this happened to
+# `/models` below — a symlink named `models` got committed and a merge then
+# destroyed the real tree it was shadowing). Every pattern in this file
+# that names something this repo's own scripts create is anchored and
+# slash-free so it matches the entry whatever its type.
+target
+
+# Packaged app (VUHO_BUNDLE_MODEL=1 embeds the ~474 MB model —
+# scripts/bundle-macos.sh recreates this directory on every run, making it
+# the highest-risk entry for the symlink hole described above)
+/Vuho.app
+/dist
+
+# ML models (provisioned out-of-band via scripts/fetch-model.sh).
+/models
+
+# Local agent/tooling state. `.rune` is a mode-700 SQLite database of local
+# session state and `.claude` holds a machine-specific permission allowlist —
+# neither belongs in a public repo. Both previously survived only because each
+# directory carried its own `*` ignore file, which is itself ignored and so
+# vanishes with any tree clean; anchor them here where the repo can see them.
+/.claude
+/.rune
+/.venv
+
+# IDE
+*.swiftpm
+.xcuserdata
+
+# macOS Finder metadata
+.DS_Store

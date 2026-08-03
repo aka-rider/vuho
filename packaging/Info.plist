@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleIdentifier</key>
+    <string>tech.iurii.vuho</string>
+    <key>CFBundleName</key>
+    <string>Vuho</string>
+    <key>CFBundleExecutable</key>
+    <string>vuho</string>
+    <key>CFBundleShortVersionString</key>
+    <string>__VERSION__</string>
+    <!--
+      CFBundleVersion ("build number"): must increase monotonically across
+      releases sharing a CFBundleShortVersionString, or LaunchServices can
+      get confused about which build is newer on an in-place upgrade.
+      Scheme: the commit count (bundle-macos.sh sets this via `plutil
+      -replace` from `git rev-list --count HEAD`) — monotonic along main
+      and a property of the commit, so it needs no separate counter file.
+    -->
+    <key>CFBundleVersion</key>
+    <string>__BUILD__</string>
+    <key>CFBundleIconFile</key>
+    <string>Vuho</string>
+    <key>LSMinimumSystemVersion</key>
+    <string>14.0</string>
+    <key>LSUIElement</key>
+    <true/>
+    <key>NSMicrophoneUsageDescription</key>
+    <string>Vuho transcribes your speech locally on-device.</string>
+    <key>NSHumanReadableCopyright</key>
+    <string>© 2026 Iurii Krasnoshchok</string>
+</dict>
+</plist>

@@ -1,0 +1,25 @@
+[package]
+name = "vuho-model-fetch"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "The only crate in the workspace permitted to perform network I/O: downloads and verifies the Parakeet-TDT model into the user-data directory (ADR-020)"
+
+[dependencies]
+vuho-model-paths = { workspace = true }
+vuho-domain = { workspace = true }
+crossbeam-channel = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+log = { workspace = true }
+hf-hub = { version = "1.0", features = ["blocking"] }
+sha2 = "0.11"
+hex = "0.4"
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints]
+workspace = true

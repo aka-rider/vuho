@@ -1,0 +1,89 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/vuho-domain",
+    "crates/vuho-model-paths",
+    "crates/vuho-stt-engine",
+    "crates/vuho-dictation",
+    "crates/vuho-postprocess",
+    "crates/vuho-os-integration",
+    "crates/vuho-settings",
+    "crates/vuho-audio",
+    "crates/vuho-model-fetch",
+    "crates/vuho-ui",
+    "crates/test-stt-ffi",
+]
+
+[workspace.package]
+version = "0.2.0"
+edition = "2021"
+rust-version = "1.88"
+license = "MIT"
+# Not published to crates.io — a local macOS app, not a library ecosystem.
+publish = false
+
+[workspace.dependencies]
+vuho-domain = { path = "crates/vuho-domain" }
+vuho-model-paths = { path = "crates/vuho-model-paths" }
+vuho-stt-engine = { path = "crates/vuho-stt-engine" }
+vuho-dictation = { path = "crates/vuho-dictation" }
+vuho-postprocess = { path = "crates/vuho-postprocess" }
+vuho-os-integration = { path = "crates/vuho-os-integration" }
+vuho-settings = { path = "crates/vuho-settings" }
+vuho-audio = { path = "crates/vuho-audio" }
+vuho-model-fetch = { path = "crates/vuho-model-fetch" }
+
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+crossbeam-channel = "0.5"
+log = "0.4"
+thiserror = "2"
+env_logger = "0.11"
+hound = "3"
+objc2 = { version = "0.6", features = ["alloc"] }
+objc2-app-kit = { version = "0.3", features = [
+    "NSPasteboard",
+    # Menu-bar status item (Phase 2) + permission dialogs (Phase 3).
+    "objc2-core-foundation",
+    "NSStatusBar",
+    "NSStatusItem",
+    "NSStatusBarButton",
+    "NSMenu",
+    "NSMenuItem",
+    "NSApplication",
+    "NSImage",
+    "NSAlert",
+    "NSWorkspace",
+    # NSApplication::activationPolicy/setActivationPolicy — the typed
+    # replacement for window_config.rs's raw objc_msgSend activation-policy
+    # hack.
+    "NSRunningApplication",
+] }
+objc2-core-foundation = { version = "0.3", features = ["CFString", "CFArray", "CFDate", "CFDictionary", "CFNumber"] }
+objc2-core-graphics = { version = "0.3", features = ["CGEvent", "CGEventSource"] }
+objc2-foundation = { version = "0.3", features = ["NSString", "NSURL", "NSDictionary", "NSObject", "NSArray", "NSError", "NSSet", "NSNull", "NSNotification", "NSDistributedNotificationCenter", "NSOperation"] }
+objc2-core-ml = { version = "0.3", features = ["MLModel", "MLModelConfiguration", "MLMultiArray", "MLFeatureProvider", "MLDictionaryFeatureProvider", "MLFeatureValue", "MLFeatureDescription", "block2"] }
+objc2-av-foundation = { version = "0.3", features = ["AVCaptureDevice", "AVMediaFormat", "block2"] }
+block2 = "0.6"
+half = "2"
+cpal = "0.18"
+rubato = "0.16"
+rtrb = "0.3"
+voice_activity_detector = "0.2"
+raw-window-handle = "0.6"
+fastrand = "2.0"
+
+[workspace.lints.clippy]
+all = { level = "warn" }
+pedantic = { level = "warn" }
+
+[workspace.lints.rust]
+missing_docs = "warn"
+unreachable_pub = "warn"
+unsafe_op_in_unsafe_fn = "deny"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+# NOT panic = "abort": engine.rs distinguishes "thread panicked" from other
+# failures, and DictationSession::drop/abort_session rely on unwind.

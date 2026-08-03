@@ -1,0 +1,25 @@
+[package]
+name = "vuho-settings"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "User settings persistence: hotkey preset + microphone device"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+log = { workspace = true }
+thiserror = { workspace = true }
+vuho-model-paths = { workspace = true }
+
+[features]
+# Exposes `SettingsStore::new_temp`, the shared temp-path test constructor,
+# to other crates' test code (see `vuho-dictation`'s dev-dependency), so the
+# "unique temp settings path" logic lives in exactly one place
+# (CONSTITUTION rule 26) instead of being copy-pasted per crate.
+test-util = []
+
+[lints]
+workspace = true

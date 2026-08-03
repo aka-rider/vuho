@@ -1,0 +1,15 @@
+[package]
+name = "vuho-model-paths"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Shared model-manifest chokepoint: names, revisions, component lists, and env-var/bundle/workspace path resolution for Vuho's STT and cleanup models"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[lints]
+workspace = true

@@ -1,0 +1,265 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+# A tag push creates exactly one release; a second push to the same tag
+# (e.g. a force-pushed tag) should not race a half-finished job for the
+# same artifact. Different tags use different refs, so this never blocks
+# two distinct versions from releasing concurrently.
+#
+# cancel-in-progress is false, deliberately: this job creates a GitHub
+# Release and uploads an asset partway through its run. Cancelling a run
+# that already did that (because someone force-pushed the same tag again)
+# would leave a published release with a partial/missing asset behind —
+# worse than letting the in-flight run finish and a second run simply
+# queue behind it.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+# Narrowest permission that can create a GitHub release and upload assets.
+permissions:
+  contents: write
+
+# Vuho is Apple Silicon macOS only (CLAUDE.md) — Metal (via GPUI) is
+# required to build, so this can only run on a macOS runner. macos-15 is
+# the current GA arm64 runner image, matching ci.yml; macos-14 is
+# deprecated (GitHub's runner-images docs, checked 2026-07).
+jobs:
+  release:
+    runs-on: macos-15
+    # Job-level so later steps' `if:` conditions can branch on whether it's
+    # configured, without each step re-deriving that from `secrets` (which
+    # `if:` can reference directly, but env is what the two Homebrew-cask
+    # steps below key off of for a single readable on/off signal).
+    env:
+      HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+    steps:
+      # Full history, not the default shallow (fetch-depth: 1) clone.
+      # bundle-macos.sh derives CFBundleVersion from `git rev-list --count
+      # HEAD`; on a shallow clone that is always 1, so every release would
+      # ship the same build number and LaunchServices could not tell which
+      # build is newer on an in-place upgrade — the exact property the
+      # commit-count scheme exists to provide.
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      # A separate cache key from ci.yml's: this job builds --release
+      # (ci.yml only ever builds/tests in debug profile), so the compiled
+      # target/ artifacts are not interchangeable with the debug cache —
+      # sharing a key would mean every release job either misses entirely
+      # or, worse, restores a debug target/ that a --release build then
+      # has to partially rebuild around. A dedicated "release" key keeps
+      # both caches useful across their own kind of run.
+      - name: Cache cargo registry + build artifacts
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-release-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-release-
+
+      # A tag can point at any commit, including one ci.yml never ran
+      # (e.g. `git tag` on a branch pushed straight to a commit, or a tag
+      # moved by hand). Re-run the same gates ci.yml applies to main
+      # before this commit becomes a public download — trusting "CI must
+      # have passed" would be trusting a fact this workflow never checks.
+      - name: cargo fmt --check
+        run: cargo fmt --check
+
+      - name: cargo clippy (deny warnings)
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      # No `models/` is available on this runner (gitignored, provisioned
+      # out-of-band). Model-gated tests skip cleanly rather than fail, same
+      # as ci.yml's `cargo test --workspace` step.
+      - name: cargo test --workspace
+        run: cargo test --workspace
+
+      # The cask URL is `Vuho-#{version}-arm64.tar.gz`, built from the tag.
+      # If the tag and the crate version ever drift, the cask points at a
+      # URL that 404s — and the only place that would be noticed is a
+      # user's `brew install`. Fail here instead, loudly, with both values.
+      - name: Derive and verify VERSION
+        id: version
+        run: |
+          TAG_VERSION="${GITHUB_REF_NAME#v}"
+          # This is a virtual workspace (no root [package]), so
+          # `cargo metadata`'s packages[] array has no guaranteed order —
+          # index 0 is not reliably the workspace version. Every member
+          # inherits `version.workspace = true`, so pick a fixed, always-
+          # present member (vuho-ui, the binary this release ships) by
+          # name instead of by position.
+          CARGO_VERSION="$(cargo metadata --no-deps --format-version 1 | \
+            jq -r '.packages[] | select(.name == "vuho-ui") | .version')"
+
+          echo "Tag version:   $TAG_VERSION"
+          echo "Cargo version: $CARGO_VERSION"
+
+          if [[ "$TAG_VERSION" != "$CARGO_VERSION" ]]; then
+            echo "::error::Tag version ($TAG_VERSION) does not match cargo metadata workspace version ($CARGO_VERSION)"
+            exit 1
+          fi
+
+          echo "version=$TAG_VERSION" >> "$GITHUB_OUTPUT"
+
+      # Model-less package: VUHO_BUNDLE_MODEL=0 skips the ~474 MB Parakeet-TDT
+      # copy and its preconditions, so this build never touches the Hugging
+      # Face download. models.lock.json (committed) is only needed for the
+      # runtime download path, not for building the app itself.
+      - name: Package Vuho.app (model-less)
+        run: VUHO_BUNDLE_MODEL=0 ./scripts/package.sh
+
+      - name: Verify Vuho.app (model-less)
+        run: VUHO_BUNDLE_MODEL=0 ./scripts/verify-app.sh
+
+      # bundle-macos.sh places the bundle at the repo root
+      # ($WORKSPACE_ROOT/Vuho.app), not a staging directory, so `-C
+      # "$GITHUB_WORKSPACE"` is what makes the tar's only top-level entry
+      # `Vuho.app/` — a `cask "vuho"` stanza's `app "Vuho.app"` artifact
+      # requires exactly that, with no leading path component.
+      - name: Archive tarball
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          tar -C "$GITHUB_WORKSPACE" -czf "Vuho-${VERSION}-arm64.tar.gz" Vuho.app
+
+      # A wrong prefix (e.g. a leading "./" or a staging-dir component)
+      # silently produces a cask that "installs" without error but leaves
+      # no Vuho.app in /Applications. Assert the exact entry now, rather
+      # than let a Homebrew user discover it.
+      - name: Verify tarball layout
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          first_entry="$(tar -tzf "Vuho-${VERSION}-arm64.tar.gz" | head -1)"
+          echo "First tar entry: $first_entry"
+          if [[ "$first_entry" != "Vuho.app/" ]]; then
+            echo "::error::Expected first tarball entry to be 'Vuho.app/', got '$first_entry'"
+            exit 1
+          fi
+
+      # An ad-hoc code signature surviving tar/untar byte-for-byte is an
+      # assumption, not a guarantee (extended attributes and resource
+      # forks are the usual casualties). This is the one cheap place to
+      # falsify that assumption before a `brew install --cask` user does,
+      # by re-verifying against a copy that actually went through
+      # tar/untar rather than the freshly-built original.
+      - name: Verify signature survives archive round-trip
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          scratch="$(mktemp -d)"
+          tar -xzf "Vuho-${VERSION}-arm64.tar.gz" -C "$scratch"
+          codesign --verify --deep --strict "$scratch/Vuho.app"
+
+      # The Homebrew cask needs this sha256 for its `sha256 "…"` stanza;
+      # print it plainly (for a human copying it into Casks/vuho.rb), record
+      # it in the job summary, AND set it as a step output so the following
+      # step can hand it to the tap automatically — printing it for a human
+      # to copy-paste is exactly the handoff that lets a stale sha256 slip
+      # into a later version bump unnoticed (see the next step's comment).
+      - name: Compute tarball SHA-256
+        id: sha256
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          SHA256="$(shasum -a 256 "Vuho-${VERSION}-arm64.tar.gz" | awk '{print $1}')"
+          echo "SHA-256: $SHA256"
+          echo "sha256=$SHA256" >> "$GITHUB_OUTPUT"
+          {
+            echo "### Vuho-${VERSION}-arm64.tar.gz"
+            echo ""
+            echo "\`\`\`"
+            echo "$SHA256"
+            echo "\`\`\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload release
+        uses: softprops/action-gh-release@v3
+        with:
+          files: Vuho-*-arm64.tar.gz
+
+      # Close the hand-off gap: a version/sha256 pair that can drift apart
+      # (someone bumps Casks/vuho.rb's `version` for a later release but
+      # forgets `sha256`, since the tap's CI grep only checks for the
+      # one-time placeholder) is the actual defect — not merely that a
+      # human has to copy-paste. Push both fields together, atomically, as
+      # one commit, straight from the value just computed above.
+      #
+      # Needs a `HOMEBREW_TAP_TOKEN` repo secret (a PAT with `contents:
+      # write` + `pull-requests: write` on aka-rider/homebrew-tap, or a
+      # fine-grained token scoped to that repo) — cross-repo pushes can't
+      # use the default GITHUB_TOKEN, which is scoped to this repo only.
+      # If that secret isn't configured, this step is a documented no-op
+      # (see the fallback step below) rather than a failure: the release
+      # itself must not depend on tap-repo credentials existing.
+      #
+      # This is a best-effort convenience, not the safety net — ci.yml's
+      # "Verify declared sha256 matches release asset" step in
+      # homebrew-tap is what actually prevents a stale hash from being
+      # trusted, whether or not this step ever ran.
+      - name: Open homebrew-tap PR to bump version + sha256
+        if: ${{ env.HOMEBREW_TAP_TOKEN != '' }}
+        env:
+          HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          VERSION: ${{ steps.version.outputs.version }}
+          SHA256: ${{ steps.sha256.outputs.sha256 }}
+          GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          set -euo pipefail
+          BRANCH="bump-vuho-${VERSION}"
+          git clone "https://x-access-token:${HOMEBREW_TAP_TOKEN}@github.com/aka-rider/homebrew-tap.git" tap-repo
+          cd tap-repo
+          git checkout -b "$BRANCH"
+          # Both fields, one commit: this is the atomicity that closes the
+          # blocker — a version bump can never land without its own sha256.
+          perl -0pi -e "s/version \"[^\"]*\"/version \"${VERSION}\"/" Casks/vuho.rb
+          perl -0pi -e "s/sha256 \"[0-9a-f]+\"/sha256 \"${SHA256}\"/" Casks/vuho.rb
+          if git diff --quiet; then
+            echo "Casks/vuho.rb already at version ${VERSION} / sha256 ${SHA256} — nothing to do."
+            exit 0
+          fi
+          git -c user.name="vuho-release-bot" -c user.email="actions@github.com" commit -am "vuho: bump to ${VERSION}"
+          git push origin "$BRANCH"
+          gh pr create --repo aka-rider/homebrew-tap \
+            --title "vuho: bump to ${VERSION}" \
+            --body "Automated bump from aka-rider/vuho's release.yml (tag v${VERSION}). sha256=${SHA256}" \
+            --head "$BRANCH" --base main
+
+      - name: Homebrew cask update — manual step required (no HOMEBREW_TAP_TOKEN configured)
+        if: ${{ env.HOMEBREW_TAP_TOKEN == '' }}
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          SHA256: ${{ steps.sha256.outputs.sha256 }}
+        run: |
+          {
+            echo "### Manual Homebrew cask update required"
+            echo ""
+            echo "\`HOMEBREW_TAP_TOKEN\` is not configured on this repo, so the tap's"
+            echo "\`Casks/vuho.rb\` was NOT updated automatically. In"
+            echo "\`aka-rider/homebrew-tap\`, set BOTH fields together in the same commit:"
+            echo ""
+            echo "\`\`\`ruby"
+            echo "version \"${VERSION}\""
+            echo "sha256 \"${SHA256}\""
+            echo "\`\`\`"
+            echo ""
+            echo "Updating one without the other is exactly the drift this automation"
+            echo "exists to prevent — the tap's own CI"
+            echo "(\"Verify declared sha256 matches release asset\" in ci.yml) will catch"
+            echo "a mismatch, but don't rely on that as your review step."
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "::warning::HOMEBREW_TAP_TOKEN not set — update aka-rider/homebrew-tap's Casks/vuho.rb (version=${VERSION}, sha256=${SHA256}) manually. See job summary."

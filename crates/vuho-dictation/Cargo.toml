@@ -1,0 +1,27 @@
+[package]
+name = "vuho-dictation"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Dictation session orchestration: streaming STT → post-process → inject"
+
+[dependencies]
+vuho-domain = { workspace = true }
+vuho-postprocess = { workspace = true }
+vuho-stt-engine = { workspace = true }
+vuho-os-integration = { workspace = true }
+vuho-settings = { workspace = true }
+crossbeam-channel = { workspace = true }
+log = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+# Enables `SettingsStore::new_temp` for this crate's test modules — the
+# `test-util` feature is only active for test/bench builds (resolver v2),
+# never in the shipped binary.
+vuho-settings = { workspace = true, features = ["test-util"] }
+
+[lints]
+workspace = true

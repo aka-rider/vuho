@@ -1,0 +1,76 @@
+# Advisory-only cargo-deny config (Constraints: "cargo deny is
+# advisory-only (warn)"). Wired into `make lint` as a non-blocking check —
+# it surfaces license/advisory/duplicate-version drift for a human to read,
+# but never fails CI or a local build. The workspace pulls in gpui and
+# candle, whose own dependency trees carry ~96 transitive version
+# duplicates and a handful of "unmaintained" RUSTSEC advisories (e.g.
+# rustybuzz, ttf-parser, deep in gpui's font-shaping stack) that are not
+# actionable from this repo.
+
+[graph]
+# Vuho is Apple Silicon macOS only (CLAUDE.md) — pruning the graph to this
+# target excludes gpui's Linux-only backends (wayland/x11/ashpd and their
+# transitive deps), which otherwise show up as unreachable "vulnerable"/
+# "unmaintained" noise for code that never builds on this platform.
+targets = ["aarch64-apple-darwin"]
+all-features = false
+no-default-features = false
+
+[output]
+feature-depth = 1
+
+# ── advisories ──────────────────────────────────────────────────────────
+[advisories]
+# Only error on *direct* workspace dependencies going unmaintained — the
+# transitive ones (async-std, instant, rustybuzz, ttf-parser, deep in
+# gpui's own dependency stack) have no available fix from this repo, and
+# `make lint`'s cargo-deny invocation is advisory-only (non-blocking)
+# regardless (Constraints).
+unmaintained = "workspace"
+yanked = "warn"
+
+# ── licenses ────────────────────────────────────────────────────────────
+[licenses]
+# Union of every SPDX identifier actually observed across the resolved
+# dependency graph (`cargo deny check licenses`, captured when this file was
+# written) — all standard OSS-permissive/copyleft-lite licenses.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "ISC",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "0BSD",
+    "BSL-1.0",
+    "CC0-1.0",
+    "MPL-2.0",
+    "Unicode-3.0",
+    "Zlib",
+    "CDLA-Permissive-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+]
+confidence-threshold = 0.8
+
+[licenses.private]
+# All 9 workspace crates now declare license.workspace = true (MIT, see
+# root LICENSE) and publish.workspace = true = false — this "ignore"
+# excludes unpublished-by-design crates from license checking, which is
+# what publish=false means, not a loophole for missing metadata.
+ignore = true
+
+# ── bans ────────────────────────────────────────────────────────────────
+[bans]
+# Warn (not deny): ~96 transitive version duplicates are gpui/candle skew,
+# not actionable from this repo (Constraints).
+multiple-versions = "warn"
+wildcards = "allow"
+highlight = "all"
+workspace-default-features = "allow"
+external-default-features = "allow"
+allow-workspace = false
+
+# ── sources ─────────────────────────────────────────────────────────────
+[sources]
+unknown-registry = "warn"
+unknown-git = "warn"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

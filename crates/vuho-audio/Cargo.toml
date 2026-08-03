@@ -1,0 +1,28 @@
+[package]
+name = "vuho-audio"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Rust-native microphone capture + resampling (cpal), no vuho-* deps"
+
+[dependencies]
+cpal = { workspace = true }
+rubato = { workspace = true }
+rtrb = { workspace = true }
+crossbeam-channel = { workspace = true }
+thiserror = { workspace = true }
+log = { workspace = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = { workspace = true }
+objc2-av-foundation = { workspace = true }
+objc2-foundation = { workspace = true }
+block2 = { workspace = true }
+
+[dev-dependencies]
+hound = { workspace = true }
+
+[lints]
+workspace = true

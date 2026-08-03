@@ -1,0 +1,25 @@
+{
+  "bundle_id": "tech.iurii.vuho",
+  "stt": {
+    "repo": "FluidInference/parakeet-tdt-0.6b-v3-coreml",
+    "revision": "aed02740059203c4a87495924f685de3722ae9ce",
+    "dir_name": "parakeet-tdt-0.6b-v3-coreml",
+    "env_folder": "VUHO_MODEL_FOLDER",
+    "env_name": "VUHO_MODEL_NAME",
+    "components": [
+      "Preprocessor.mlmodelc",
+      "ParakeetEncoder_15s.mlmodelc",
+      "ParakeetDecoder.mlmodelc",
+      "RNNTJoint.mlmodelc",
+      "parakeet_v3_vocab.json"
+    ]
+  },
+  "silero": {
+    "repo": "onnx-community/silero-vad",
+    "revision": "e71cae966052b992a7eca6b17738916ce0eca4ec",
+    "dir_name": "silero-vad",
+    "components": [
+      "onnx/model_fp16.onnx"
+    ]
+  }
+}

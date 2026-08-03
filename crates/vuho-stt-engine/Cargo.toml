@@ -1,0 +1,53 @@
+[package]
+name = "vuho-stt-engine"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Parakeet-TDT STT engine via native CoreML on the ANE"
+
+[features]
+# Exposes `pub mod test_support` (a WAV-fixture loader) for external
+# consumers (`test-stt-ffi`, `tests/batch_multiwindow.rs`) so this crate is
+# the ONE place WAV parsing lives (CONSTITUTION rule 26). Kept out of
+# default builds — pulls in `hound`, which release/production code has no
+# use for.
+test-fixtures = ["dep:hound"]
+
+[dependencies]
+vuho-domain = { workspace = true }
+vuho-model-paths = { workspace = true }
+vuho-audio = { workspace = true }
+crossbeam-channel = { workspace = true }
+thiserror = { workspace = true }
+log = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+voice_activity_detector = { workspace = true }
+hound = { workspace = true, optional = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = { workspace = true }
+objc2-foundation = { workspace = true }
+objc2-core-ml = { workspace = true }
+block2 = { workspace = true }
+half = { workspace = true }
+
+[dev-dependencies]
+# Self-dependency to turn on `test-fixtures` for this crate's own `cargo
+# test` run — both its unit tests (`vad.rs`/`stream/session.rs`, which use
+# `test_support` directly) and `tests/batch_multiwindow.rs` (an integration
+# test, which depends on this crate like any external consumer) need the
+# feature enabled; this is the standard Cargo pattern for "a feature only my
+# own tests need", without making the feature part of the crate's own
+# default build.
+vuho-stt-engine = { path = ".", features = ["test-fixtures"] }
+criterion = { version = "0.5", default-features = false }
+
+[[bench]]
+name = "hot_paths"
+harness = false
+
+[lints]
+workspace = true

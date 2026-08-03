@@ -1,0 +1,11 @@
+[package]
+name = "vuho-domain"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Pure domain types and events for Vuho speech-to-text"
+
+[lints]
+workspace = true
