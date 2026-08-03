@@ -7,11 +7,12 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use crossbeam_channel::{unbounded, Receiver, Sender};
-use gpui::App;
+use gpui::{App, AppContext as _};
 use vuho_domain::{DictationCommand, DictationEvent, ModelStatus};
 use vuho_settings::SettingsStore;
 
 use crate::app_state::{UiCommand, VuhoState};
+use crate::app_status::{EngineState, HotkeyState, StatusModel};
 use crate::event_loop::{spawn_event_drain, spawn_ui_drain};
 use crate::{hotkey_presets, overlay, permissions, settings_window, status_bar};
 
@@ -149,11 +150,38 @@ pub(crate) fn wire_production(overlay: gpui::WindowHandle<overlay::OverlayModel>
     // the dialog may never appear and the stream fails silently.
     request_mic_permission_on_startup(&event_tx);
 
-    // Menu-bar status item (Start/Stop toggle + Settings + Quit) shares the
-    // command channel and gets its own channel to reach the GPUI foreground
-    // task that owns window creation (the status item has no GPUI handle).
+    // Menu-bar status item (click-split button + toggle/Open/Quit menu)
+    // shares the command channel and gets its own channel to reach the GPUI
+    // foreground task that owns window creation (the status item has no
+    // GPUI handle).
     status_bar::install(cmd_tx.clone(), ui_tx.clone());
-    status_bar::set_warmup(status_bar::WarmupState::Loading);
+
+    // TODO(ui-rehaul): creation moves to main() when the permission gate
+    // merges into the panel — for now `wire_production` is the only place
+    // that ever needs one, since the gate path (`readiness`'s preflight
+    // check) short-circuits before this function runs at all.
+    //
+    // Initial `hotkey` is `Active(preset)`, corrected to `Failed` by
+    // `start_hotkey` below if the listener actually fails to start — a
+    // transient over-optimistic read for however long `start_hotkey` takes.
+    let status = cx.new(|_| StatusModel {
+        model: None,
+        engine: EngineState::Loading,
+        recording: false,
+        hotkey: HotkeyState::Active(settings.get().hotkey),
+        permissions_missing: Vec::new(),
+        launch_blocked: false,
+        settings_load_warning: None,
+    });
+    // The tray must show `Loading model…` immediately, not just on the
+    // first future change — `cx.observe` alone only fires on a later
+    // `notify()`, so the freshly installed (title-less) toggle item needs
+    // one explicit sync before that.
+    status_bar::sync(&status.read(cx).composite());
+    cx.observe(&status, |status, cx| {
+        status_bar::sync(&status.read(cx).composite());
+    })
+    .detach();
 
     spawn_warmup_and_bridge(
         cmd_rx,
@@ -164,7 +192,7 @@ pub(crate) fn wire_production(overlay: gpui::WindowHandle<overlay::OverlayModel>
         settings.clone(),
     );
 
-    let hotkey = start_hotkey(&cmd_tx, &settings, cx);
+    let hotkey = start_hotkey(&cmd_tx, &settings, &status, cx);
 
     // Registered once for the process lifetime: the settings window and the
     // hotkey-preset live-rebind both reach through this global.
@@ -174,6 +202,7 @@ pub(crate) fn wire_production(overlay: gpui::WindowHandle<overlay::OverlayModel>
         cmd_tx,
         provision_tx,
         settings_window: None,
+        status: status.clone(),
     });
 
     // Keyboard shortcut to open settings — reliable backup to the
@@ -187,8 +216,8 @@ pub(crate) fn wire_production(overlay: gpui::WindowHandle<overlay::OverlayModel>
         settings_window::open_settings_window(cx);
     });
 
-    spawn_event_drain(overlay, event_rx, cx);
-    spawn_ui_drain(ui_rx, cx);
+    spawn_event_drain(overlay, event_rx, status.clone(), cx);
+    spawn_ui_drain(ui_rx, status, cx);
 }
 
 /// Check microphone permission status at app startup.
@@ -724,18 +753,27 @@ fn spawn_download_thread() -> (Receiver<DownloadOutcome>, Receiver<ModelStatus>)
 fn start_hotkey(
     cmd_tx: &crossbeam_channel::Sender<vuho_domain::DictationCommand>,
     settings: &vuho_settings::SettingsStore,
+    status: &gpui::Entity<StatusModel>,
     cx: &mut App,
 ) -> vuho_os_integration::HotkeyListener {
     let mut hotkey = vuho_os_integration::HotkeyListener::new();
-    let config = hotkey_presets::to_hotkey_config(settings.get().hotkey);
+    let preset = settings.get().hotkey;
+    let config = hotkey_presets::to_hotkey_config(preset);
     log::info!("hotkey: starting with config {config:?}");
-    if hotkey.start(cmd_tx, config).is_err() {
+    let new_hotkey_state = if hotkey.start(cmd_tx, config).is_err() {
         log::warn!("hotkey: start failed — Accessibility not granted");
         cx.spawn(move |_cx: &mut gpui::AsyncApp| async move {
             permissions::prompt_accessibility();
         })
         .detach();
-    }
+        HotkeyState::Failed(preset)
+    } else {
+        HotkeyState::Active(preset)
+    };
+    status.update(cx, |model, cx| {
+        model.hotkey = new_hotkey_state;
+        cx.notify();
+    });
     hotkey
 }
 

@@ -2,21 +2,16 @@
 //! rehaul), feeding the tray icon/menu, the panel's in-window status
 //! display, and (a later package) a Settings tab.
 //!
-//! This module only builds the model type and its pure derivation logic
-//! ([`StatusModel::composite`], [`StatusModel::idle_headline`],
-//! [`CompositeStatus::menu_title`], [`CompositeStatus::toggle_enabled`]).
-//! Nothing here is wired into `wiring.rs`/`event_loop.rs`/`status_bar.rs`
-//! yet — later packages replace `status_bar.rs`'s `AppStatus` and the
-//! three-window setup with a `StatusModel` GPUI `Entity` driving one panel.
+//! [`StatusModel::composite`]/[`CompositeStatus::menu_title`]/
+//! [`CompositeStatus::toggle_enabled`] drive `status_bar.rs`'s tray as of
+//! the WP4 wiring (`wiring::wire_production`/`event_loop.rs`); the panel
+//! that will read [`StatusModel::idle_headline`] and the still-unwired
+//! `permissions_missing`/`launch_blocked`/`settings_load_warning` fields is
+//! a later package, so those stay behind item-level `#[allow(dead_code)]`.
 //!
 //! `StatusModel` itself stays a plain struct — no `Global` impl, no
 //! channels — so it composes as a GPUI `Entity` (`cx.new(|_| StatusModel {
 //! .. })`) exactly like `ReadinessView`/`SettingsView` do today.
-
-// TODO(ui-rehaul): remove once wired — nothing outside this module and its
-// own tests constructs or reads a `StatusModel` yet; the later wiring
-// package is what makes these reachable.
-#![allow(dead_code)]
 
 use gpui::SharedString;
 use vuho_domain::ModelStatus;
@@ -71,6 +66,9 @@ pub(crate) struct StatusModel {
     /// is required after granting for the new process identity to carry
     /// the TCC grant (see `readiness.rs`'s module doc comment).
     pub launch_blocked: bool,
+    /// Consumer is a later package (the panel's settings tab surfacing a
+    /// malformed-settings-file warning) — not read anywhere yet.
+    #[allow(dead_code, reason = "no reader until the panel package")]
     pub settings_load_warning: Option<SharedString>,
 }
 
@@ -90,8 +88,7 @@ pub(crate) enum CompositeStatus {
     RelaunchRequired,
     /// [`ModelStatus::Missing`] or [`ModelStatus::Failed`] — both need the
     /// same next user action (open the readiness window, click
-    /// Download/Retry), so they collapse to one composite state, mirroring
-    /// `status_bar::app_status_for_model`.
+    /// Download/Retry), so they collapse to one composite state.
     ModelMissing,
     /// Rounded download percent, `0..=100`.
     Downloading(u8),
@@ -131,6 +128,9 @@ impl StatusModel {
     /// Headline + optional sub-line for the panel's idle status block, one
     /// per [`CompositeStatus`] — computed via [`StatusModel::composite`] so
     /// this never drifts from the priority order it defines.
+    ///
+    /// No caller until the panel package renders it.
+    #[allow(dead_code, reason = "no caller until the panel package")]
     #[must_use]
     pub(crate) fn idle_headline(&self) -> (SharedString, Option<SharedString>) {
         match self.composite() {
@@ -189,6 +189,10 @@ fn model_composite_status(status: &ModelStatus) -> Option<CompositeStatus> {
 /// via [`readiness::format_mb`] when the model is simply [`ModelStatus::Missing`]
 /// (the size is known up front from the pinned lockfile — see that variant's
 /// doc comment); show the failure message for [`ModelStatus::Failed`].
+///
+/// Only reachable via [`StatusModel::idle_headline`], which has no caller
+/// until the panel package.
+#[allow(dead_code, reason = "only reachable via idle_headline")]
 fn model_missing_headline(model: Option<&ModelStatus>) -> (SharedString, Option<SharedString>) {
     let sub = match model {
         Some(ModelStatus::Missing { total_bytes }) => Some(SharedString::from(format!(
@@ -203,6 +207,10 @@ fn model_missing_headline(model: Option<&ModelStatus>) -> (SharedString, Option<
 
 /// [`CompositeStatus::EngineFailed`]'s headline: surface the warmup failure
 /// message from [`EngineState::Failed`] as the sub-line.
+///
+/// Only reachable via [`StatusModel::idle_headline`], which has no caller
+/// until the panel package.
+#[allow(dead_code, reason = "only reachable via idle_headline")]
 fn engine_failed_headline(engine: &EngineState) -> (SharedString, Option<SharedString>) {
     let sub = match engine {
         EngineState::Failed(message) => Some(SharedString::from(message.clone())),
@@ -216,6 +224,10 @@ fn engine_failed_headline(engine: &EngineState) -> (SharedString, Option<SharedS
 /// [`HotkeySetting::label`] source (`settings_window.rs`/`hotkey_presets.rs`
 /// render the same presets today) — never hardcoded, since the preset is
 /// user-configurable.
+///
+/// Only reachable via [`StatusModel::idle_headline`], which has no caller
+/// until the panel package.
+#[allow(dead_code, reason = "only reachable via idle_headline")]
 fn ready_headline(hotkey: HotkeyState) -> (SharedString, Option<SharedString>) {
     match hotkey {
         HotkeyState::Failed(_) => (

@@ -63,7 +63,9 @@ const DEMO_PHRASES_LONG: &[(&str, &str)] = &[
 pub(crate) fn run_demo_mode(overlay: WindowHandle<overlay::OverlayModel>, cx: &mut App) {
     let (demo_tx, demo_rx) = crossbeam_channel::unbounded();
 
-    spawn_event_drain(overlay, demo_rx, cx);
+    // No `StatusModel` in demo mode (no menu bar, no settings) — `()` is
+    // `event_loop::StatusHandle`'s demo-build value.
+    spawn_event_drain(overlay, demo_rx, (), cx);
 
     cx.spawn(move |cx: &mut gpui::AsyncApp| {
         let cx = cx.clone();
