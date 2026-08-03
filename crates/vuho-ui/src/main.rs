@@ -30,6 +30,12 @@ mod permissions;
 mod app_state;
 #[cfg(not(feature = "demo"))]
 mod app_status;
+// The `Assets` `AssetSource` (icons/*.svg) is always compiled — the demo
+// build still creates GPUI windows and will want the same icon set once a
+// later package wires the panel/tray into it (see `assets.rs`'s doc comment).
+mod assets;
+#[cfg(not(feature = "demo"))]
+mod controls;
 #[cfg(feature = "demo")]
 mod demo;
 mod event_loop;
@@ -37,6 +43,8 @@ mod event_loop;
 mod hotkey_presets;
 #[cfg(not(feature = "demo"))]
 mod readiness;
+#[cfg(not(feature = "demo"))]
+mod settings_tab;
 #[cfg(not(feature = "demo"))]
 mod settings_window;
 #[cfg(not(feature = "demo"))]
@@ -108,7 +116,7 @@ fn main() {
     {
         log::warn!("vuho: failed to init logger: {e}");
     }
-    Application::new().run(move |cx: &mut App| {
+    Application::new().with_assets(assets::Assets).run(move |cx: &mut App| {
         bind_quit_hotkey(cx);
 
         // Set accessory activation policy: no Dock icon, non-activating.
