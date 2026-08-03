@@ -139,24 +139,37 @@ impl Settings {
     /// - A `version` field present but structurally malformed elsewhere
     ///   (fields with the wrong type) falls back to `Settings::default()`
     ///   with a warning, same as today's malformed-JSON handling.
-    fn migrate(raw: &serde_json::Value) -> Settings {
+    ///
+    /// Returns the resolved `Settings` alongside a human-readable reason
+    /// whenever it fell back to defaults (`None` on a clean version-matched
+    /// load) — [`SettingsStore::load_from`] folds this together with its own
+    /// "file isn't valid JSON at all" case into [`SettingsStore::load_warning`],
+    /// the one place a caller (e.g. a Settings-tab notice banner) can learn
+    /// that defaults are in use without re-parsing the file itself.
+    fn migrate(raw: &serde_json::Value) -> (Settings, Option<String>) {
         let version = raw
             .get("version")
             .and_then(serde_json::Value::as_u64)
             .unwrap_or(u64::from(CURRENT_SETTINGS_VERSION));
 
         if version != u64::from(CURRENT_SETTINGS_VERSION) {
-            log::warn!(
+            let reason = format!(
                 "settings file has version {version}, this build only understands version \
                  {CURRENT_SETTINGS_VERSION} — using defaults; file left untouched"
             );
-            return Settings::default();
+            log::warn!("{reason}");
+            return (Settings::default(), Some(reason));
         }
 
-        serde_json::from_value(raw.clone()).unwrap_or_else(|e| {
-            log::warn!("settings file is malformed ({e}) — using defaults; file left untouched");
-            Settings::default()
-        })
+        match serde_json::from_value(raw.clone()) {
+            Ok(settings) => (settings, None),
+            Err(e) => {
+                let reason =
+                    format!("settings file is malformed ({e}) — using defaults; file left untouched");
+                log::warn!("{reason}");
+                (Settings::default(), Some(reason))
+            }
+        }
     }
 }
 
@@ -179,6 +192,11 @@ pub enum SettingsError {
 pub struct SettingsStore {
     path: PathBuf,
     current: RwLock<Settings>,
+    /// Human-readable reason the load fell back to defaults, captured once
+    /// at [`Self::load_from`] time — `None` on a clean load. Immutable for
+    /// the store's lifetime: a load-time fact, not something `update()`
+    /// changes. See [`Self::load_warning`].
+    load_warning: Option<String>,
 }
 
 impl SettingsStore {
@@ -215,23 +233,36 @@ impl SettingsStore {
     /// production entry point is [`Self::load_or_default`]).
     #[must_use]
     pub fn load_from(path: PathBuf) -> Self {
-        let settings = match fs::read_to_string(&path) {
+        let (settings, load_warning) = match fs::read_to_string(&path) {
             Ok(contents) => match serde_json::from_str::<serde_json::Value>(&contents) {
                 Ok(raw) => Settings::migrate(&raw),
                 Err(e) => {
-                    log::warn!(
+                    let reason = format!(
                         "settings file at {} is malformed ({e}) — using defaults; file left untouched",
                         path.display()
                     );
-                    Settings::default()
+                    log::warn!("{reason}");
+                    (Settings::default(), Some(reason))
                 }
             },
-            Err(_) => Settings::default(),
+            // A missing file is the expected, unremarkable first-run case —
+            // not a warning-worthy fallback.
+            Err(_) => (Settings::default(), None),
         };
         Self {
             path,
             current: RwLock::new(settings),
+            load_warning,
         }
+    }
+
+    /// A human-readable reason the load fell back to defaults — a malformed
+    /// file, or a `version` this build doesn't understand — or `None` on a
+    /// clean load (including "no file existed yet"). Captured once at load
+    /// time; not re-checked on every [`Self::get`]/[`Self::update`] call.
+    #[must_use]
+    pub fn load_warning(&self) -> Option<&str> {
+        self.load_warning.as_deref()
     }
 
     /// Return a clone of the current in-memory settings.
@@ -381,6 +412,9 @@ mod tests {
         let store = SettingsStore::load_from(path.clone());
         assert_eq!(store.get(), Settings::default());
         assert!(!path.exists());
+        // A missing file is the ordinary first-run case, not a fallback
+        // worth warning the user about.
+        assert_eq!(store.load_warning(), None);
     }
 
     #[test]
@@ -395,6 +429,24 @@ mod tests {
         // The malformed bytes must not have been overwritten by the load.
         let bytes = fs::read(&path).unwrap();
         assert_eq!(bytes, b"not valid json");
+
+        let warning = store.load_warning().expect("malformed load must warn");
+        assert!(warning.contains("malformed"), "warning: {warning:?}");
+    }
+
+    #[test]
+    fn clean_load_has_no_warning() {
+        let path = temp_settings_path("clean-load-warning");
+        let store = SettingsStore::load_from(path.clone());
+        store
+            .update(|s| s.hotkey = HotkeySetting::OptionSpace)
+            .unwrap();
+        assert_eq!(store.load_warning(), None);
+
+        // A fresh store loading that same, well-formed, current-version file
+        // must also see no warning.
+        let reloaded = SettingsStore::load_from(path);
+        assert_eq!(reloaded.load_warning(), None);
     }
 
     #[test]
@@ -500,6 +552,11 @@ mod tests {
             bytes_after, original,
             "loading a future-version settings file must not modify it on disk"
         );
+
+        let warning = store
+            .load_warning()
+            .expect("an unrecognized future version must populate load_warning");
+        assert!(warning.contains("999"), "warning: {warning:?}");
     }
 
     #[test]

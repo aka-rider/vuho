@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">
+  <!-- An 8-tooth gear silhouette (SF Symbols "gearshape"-like) with a
+       circular center hole cut out via fill-rule="evenodd". Fill is left at
+       the SVG default (opaque black), not a hardcoded color — GPUI
+       rasterizes this and recolors it from the alpha channel with the
+       current text color at paint time (see gpui's svg_renderer.rs). -->
+  <path fill-rule="evenodd" d="
+    M12 1.5 L14.91 4.98 L19.42 4.58 L19.02 9.09 L22.5 12 L19.02 14.91
+    L19.42 19.42 L14.91 19.02 L12 22.5 L9.09 19.02 L4.58 19.42 L4.98 14.91
+    L1.5 12 L4.98 9.09 L4.58 4.58 L9.09 4.98 Z
+    M8.6 12 A3.4 3.4 0 1 0 15.4 12 A3.4 3.4 0 1 0 8.6 12 Z
+  "/>
+</svg>

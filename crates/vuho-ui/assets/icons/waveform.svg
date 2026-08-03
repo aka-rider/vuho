@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">
+  <!-- Five rounded vertical bars, tallest in the center (SF Symbols
+       "waveform"-like). GPUI's SvgRenderer rasterizes this and keeps only
+       the alpha channel (see gpui's svg_renderer.rs), recoloring the result
+       with the current text color at paint time — so the fill below is
+       intentionally left at the SVG default (opaque black) rather than a
+       hardcoded color. -->
+  <path d="
+    M2.8 8.2 A1.2 1.2 0 0 1 5.2 8.2 L5.2 15.8 A1.2 1.2 0 0 1 2.8 15.8 Z
+    M6.8 5.2 A1.2 1.2 0 0 1 9.2 5.2 L9.2 18.8 A1.2 1.2 0 0 1 6.8 18.8 Z
+    M10.8 2.2 A1.2 1.2 0 0 1 13.2 2.2 L13.2 21.8 A1.2 1.2 0 0 1 10.8 21.8 Z
+    M14.8 5.2 A1.2 1.2 0 0 1 17.2 5.2 L17.2 18.8 A1.2 1.2 0 0 1 14.8 18.8 Z
+    M18.8 8.2 A1.2 1.2 0 0 1 21.2 8.2 L21.2 15.8 A1.2 1.2 0 0 1 18.8 15.8 Z
+  "/>
+</svg>
