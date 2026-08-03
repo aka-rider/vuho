@@ -138,7 +138,7 @@ impl Permission {
     ];
 
     /// Pure (non-prompting) tri-state check — safe to call on every poll tick.
-    fn access(self) -> Access {
+    pub(crate) fn access(self) -> Access {
         match self {
             Permission::Accessibility => {
                 accessibility_access(vuho_os_integration::accessibility_trusted())
@@ -154,7 +154,7 @@ impl Permission {
     /// "Open System Settings" button. One source of truth for every URL —
     /// `permissions.rs` (CONSTITUTION rule 26); `show_microphone_denied`
     /// reuses the same `MICROPHONE_SETTINGS_URL` constant.
-    fn settings_url(self) -> &'static str {
+    pub(crate) fn settings_url(self) -> &'static str {
         match self {
             Permission::Accessibility => ACCESSIBILITY_SETTINGS_URL,
             Permission::InputMonitoring => INPUT_MONITORING_SETTINGS_URL,
@@ -162,7 +162,7 @@ impl Permission {
         }
     }
 
-    fn label(self) -> &'static str {
+    pub(crate) fn label(self) -> &'static str {
         match self {
             Permission::Accessibility => "Accessibility",
             Permission::InputMonitoring => "Input Monitoring",
@@ -170,7 +170,7 @@ impl Permission {
         }
     }
 
-    fn description(self) -> &'static str {
+    pub(crate) fn description(self) -> &'static str {
         match self {
             Permission::Accessibility => {
                 "Lets Vuho listen for the global CapsLock dictation hotkey."
@@ -185,7 +185,7 @@ impl Permission {
     /// Trigger this permission's native prompt. Fire-and-forget for all
     /// three: none of the underlying calls wait for the user's answer, so
     /// the gate's poll loop is what actually observes the grant landing.
-    fn request(self) {
+    pub(crate) fn request(self) {
         match self {
             Permission::Accessibility => {
                 let _ = vuho_os_integration::prompt_accessibility_trust();
@@ -731,7 +731,7 @@ fn render_speech_model_row(
 }
 
 /// Human-readable subtitle for a model-status row.
-fn model_status_text(status: &ModelStatus) -> String {
+pub(crate) fn model_status_text(status: &ModelStatus) -> String {
     match status {
         ModelStatus::Missing { total_bytes } => {
             format!("{} · not yet downloaded", format_mb(*total_bytes))
@@ -754,7 +754,7 @@ fn model_status_text(status: &ModelStatus) -> String {
 
 /// Format a byte count as a whole number of megabytes (decimal, "474 MB") —
 /// readable, unlike the raw byte count `models.lock.json` stores.
-fn format_mb(bytes: u64) -> String {
+pub(crate) fn format_mb(bytes: u64) -> String {
     format!("{} MB", (bytes + BYTES_PER_MB / 2) / BYTES_PER_MB)
 }
 
@@ -856,7 +856,7 @@ fn render_relaunch_row(cx: &mut Context<ReadinessView>) -> impl IntoElement {
 /// cases, no bundle-path logic needed. Only exits if the spawn actually
 /// succeeded, so a failed relaunch doesn't strand the user with no window at
 /// all.
-fn relaunch() {
+pub(crate) fn relaunch() {
     let exe = match std::env::current_exe() {
         Ok(exe) => exe,
         Err(e) => {

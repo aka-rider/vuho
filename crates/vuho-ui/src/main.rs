@@ -28,6 +28,8 @@ mod permissions;
 // aren't dead code under `--features demo`.
 #[cfg(not(feature = "demo"))]
 mod app_state;
+#[cfg(not(feature = "demo"))]
+mod app_status;
 #[cfg(feature = "demo")]
 mod demo;
 mod event_loop;
