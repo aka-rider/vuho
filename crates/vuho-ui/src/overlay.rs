@@ -532,42 +532,76 @@ fn outcome_for_injection(injection: &InjectionOutcome) -> Outcome {
     }
 }
 
-impl Render for OverlayModel {
-    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-        let amps = &self.amplitudes;
+/// Wrap `content` in the Hud presentation's floating, translucent panel
+/// chrome — background/border/rounded/shadow, sized to fill the window.
+/// The one place this exact chrome is built (`panel.rs`'s Hud arm is its
+/// only caller); keeping it here rather than in `panel.rs` lets
+/// `color_panel_bg`/`color_panel_border` stay private to this module.
+/// `panel.rs`'s Full presentation builds its own (opaque) chrome instead —
+/// the Overlay tab embeds [`OverlayModel::render_content`] directly, with no
+/// second background of its own (see that method's doc comment).
+pub(crate) fn hud_chrome(content: AnyElement) -> AnyElement {
+    div()
+        .relative()
+        .size_full()
+        .bg(color_panel_bg())
+        .border_1()
+        .border_color(color_panel_border())
+        .rounded(px(theme::RADIUS_PANEL))
+        .shadow_lg()
+        .child(content)
+        .into_any_element()
+}
 
+impl OverlayModel {
+    /// The overlay's live content: the transcript/outcome line, the ambient
+    /// waveform, and the recording LED — no outer chrome (background/
+    /// border/shadow) of its own. [`hud_chrome`] wraps this for the Hud
+    /// presentation; the Full presentation's Overlay tab (`panel.rs`) embeds
+    /// it directly inside the panel's own opaque chrome, so this must never
+    /// paint a second background — that's why the panel-sizing/background
+    /// styling that used to live in `impl Render for OverlayModel` stays out
+    /// of this method.
+    pub(crate) fn render_content(&self) -> AnyElement {
+        let amps = &self.amplitudes;
         div()
             .relative()
-            .size_full()
-            .bg(color_panel_bg())
-            .border_1()
-            .border_color(color_panel_border())
-            .rounded(px(theme::RADIUS_PANEL))
-            .shadow_lg()
             .flex()
             .flex_col()
             .gap_2()
             .px_6()
             .py_4()
-            .child(self.render_content())
+            .child(self.render_transcript_area())
             .child(render_waveform(amps, self.recording))
             .child(render_recording_led(self.recording))
+            .into_any_element()
     }
-}
 
-impl OverlayModel {
-    /// The panel's main content: the end-of-session confirmation if present,
-    /// else the live wrapping transcript — rendered inside the *same*
-    /// bottom-anchored viewport (`render_transcript_viewport`) rather than a
-    /// separately-laid-out slot. User correction after review: "✓ Inserted"
-    /// must replace the transcript organically, appearing exactly where its
-    /// last line was, not jump to a different position.
-    fn render_content(&self) -> AnyElement {
+    /// The panel's main text content: the end-of-session confirmation if
+    /// present, else the live wrapping transcript — rendered inside the
+    /// *same* bottom-anchored viewport (`render_transcript_viewport`) rather
+    /// than a separately-laid-out slot. User correction after review: "✓
+    /// Inserted" must replace the transcript organically, appearing exactly
+    /// where its last line was, not jump to a different position.
+    fn render_transcript_area(&self) -> AnyElement {
         let line = match &self.outcome {
             Some(outcome) => render_outcome_line(outcome),
             None => render_transcript_paragraph(&self.confirmed_text, &self.unconfirmed_text),
         };
         render_transcript_viewport(line)
+    }
+
+    /// Whether the overlay currently has anything session-related to show —
+    /// true while recording, or while a `SessionCompleted`/`Error` outcome
+    /// is still on screen. Drives the Full presentation's Overlay tab
+    /// (`panel.rs`): live session content when true, the idle status block
+    /// (driven by `StatusModel`) otherwise. `cfg`-gated: the Full
+    /// presentation — and therefore this method's only caller — does not
+    /// exist under `--features demo` (presentation never leaves Hud there).
+    #[cfg(not(feature = "demo"))]
+    #[must_use]
+    pub(crate) fn has_session_content(&self) -> bool {
+        self.recording || self.outcome.is_some()
     }
 }
 
@@ -836,6 +870,39 @@ mod tests {
         });
         assert_eq!(model.confirmed_text.as_ref(), "hello world");
         assert_eq!(model.unconfirmed_text.as_ref(), "xyz");
+    }
+
+    // ── has_session_content — drives panel.rs's Full-presentation Overlay tab ──
+
+    #[cfg(not(feature = "demo"))]
+    #[test]
+    fn has_session_content_false_when_idle() {
+        let model = test_overlay_model();
+        assert!(!model.has_session_content());
+    }
+
+    #[cfg(not(feature = "demo"))]
+    #[test]
+    fn has_session_content_true_while_recording() {
+        let mut model = test_overlay_model();
+        model.handle_event(DictationEvent::SessionStarted);
+        assert!(model.has_session_content());
+    }
+
+    #[cfg(not(feature = "demo"))]
+    #[test]
+    fn has_session_content_true_while_an_outcome_is_on_screen() {
+        let mut model = test_overlay_model();
+        model.handle_event(DictationEvent::SessionCompleted {
+            result: vuho_domain::TranscriptionResult {
+                segments: vec![],
+                full_text: "hello".to_string(),
+                language: "en".to_string(),
+            },
+            injection: InjectionOutcome::Inserted,
+        });
+        assert!(!model.recording);
+        assert!(model.has_session_content());
     }
 
     // ── Frozen-waveform regression (WP10, rule 22) ──────────────────────────

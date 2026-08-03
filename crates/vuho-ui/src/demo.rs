@@ -1,7 +1,10 @@
-//! Demo mode: feeds synthetic `DictationEvent`s into the overlay so
-//! `cargo run -p vuho-ui --features demo` previews the UI with no
+//! Demo mode: feeds synthetic `DictationEvent`s into the panel's overlay
+//! entity so `cargo run -p vuho-ui --features demo` previews the UI with no
 //! microphone or engine required. Split out of `main.rs` (WP10) — this
-//! whole module is `#[cfg(feature = "demo")]`.
+//! whole module is `#[cfg(feature = "demo")]`. The demo panel never leaves
+//! the Hud presentation (see `panel.rs`'s module doc comment), so this
+//! drives events into `panel`'s overlay entity exactly as the old
+//! standalone overlay window did.
 
 use std::time::Duration;
 
@@ -9,7 +12,7 @@ use gpui::{App, WindowHandle};
 use vuho_domain::DictationEvent;
 
 use crate::event_loop::spawn_event_drain;
-use crate::overlay;
+use crate::panel::PanelRoot;
 
 /// Duration for demo session phases. Only used by `run_demo_mode`.
 const DEMO_PAUSE_DURATION: Duration = Duration::from_secs(2);
@@ -52,7 +55,8 @@ const DEMO_PHRASES_LONG: &[(&str, &str)] = &[
     ),
 ];
 
-/// Start the demo mode: feed synthetic events into the overlay model.
+/// Start the demo mode: feed synthetic events into the panel's overlay
+/// entity.
 ///
 /// Uses the same `spawn_event_drain` the production wiring uses, so the demo
 /// previews the real lifecycle (outcome flash + delayed hide). Alternates
@@ -60,12 +64,12 @@ const DEMO_PHRASES_LONG: &[(&str, &str)] = &[
 /// (long, `ClipboardOnly`) every cycle — see [`demo_script`] — so a demo run
 /// previews every outcome wording/duration (Fix 4) and the multi-line
 /// wrap/fade (Fix 3), not just the original single short/`Inserted` path.
-pub(crate) fn run_demo_mode(overlay: WindowHandle<overlay::OverlayModel>, cx: &mut App) {
+pub(crate) fn run_demo_mode(panel: WindowHandle<PanelRoot>, cx: &mut App) {
     let (demo_tx, demo_rx) = crossbeam_channel::unbounded();
 
     // No `StatusModel` in demo mode (no menu bar, no settings) — `()` is
     // `event_loop::StatusHandle`'s demo-build value.
-    spawn_event_drain(overlay, demo_rx, (), cx);
+    spawn_event_drain(panel, demo_rx, (), cx);
 
     cx.spawn(move |cx: &mut gpui::AsyncApp| {
         let cx = cx.clone();

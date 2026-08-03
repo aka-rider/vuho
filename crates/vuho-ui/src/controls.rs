@@ -1,22 +1,9 @@
-//! Shared hand-rolled widgets for the Settings tab (`settings_tab.rs`).
+//! Shared hand-rolled widgets for the panel's Settings tab (`settings_tab.rs`)
+//! and idle status block (`panel.rs`) — restyled to consume `theme.rs`'s
+//! visual-language consts instead of ad hoc `hsla(..)` literals.
 //!
-//! Copied — not moved — from `settings_window.rs`'s dropdown trio
-//! (`dropdown_button`/`dropdown_option_list`/`dropdown_option`, ~286-331)
-//! and `readiness.rs`'s button styling (`action_button`/`button_base`), then
-//! restyled to consume `theme.rs`'s visual-language consts instead of the
-//! ad hoc `hsla(..)` literals those two modules still carry. The originals
-//! are left untouched: they die wholesale in a later integration package
-//! that replaces both windows with the unified panel this module's only
-//! caller (`settings_tab.rs`) belongs to — copying now avoids a
-//! half-migrated shared dependency between old and new UI in the meantime.
-//!
-//! Only what `settings_tab.rs` actually renders lives here — no speculative
+//! Only what those two callers actually render lives here — no speculative
 //! extras.
-
-// TODO(ui-rehaul): remove once wired — `settings_tab.rs` is this module's
-// only caller, and neither is reachable from `main.rs` yet (the later
-// integration package embeds the Settings tab in the unified panel).
-#![allow(dead_code)]
 
 use gpui::{
     div, prelude::*, px, App, ClickEvent, Div, ElementId, Hsla, IntoElement, SharedString, Window,

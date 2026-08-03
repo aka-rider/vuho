@@ -1,26 +1,21 @@
-//! The Settings tab view (WP5): microphone/hotkey dropdowns, permission
-//! rows, and speech-model provisioning — the eventual replacement for
-//! `settings_window.rs` and most of `readiness.rs`'s content once a later
-//! integration package embeds this in the unified panel.
+//! The Settings tab view: microphone/hotkey dropdowns, permission rows, and
+//! speech-model provisioning — the panel's (`crate::panel::PanelRoot`)
+//! Settings tab, and (before launch permissions are all granted) the panel
+//! opened on this tab *is* the permission gate (ARCHITECTURE.md ADR-021,
+//! amending ADR-016).
 //!
 //! Reads [`crate::app_status::StatusModel`] for everything status-shaped
 //! (model/engine/permissions/hotkey/launch-blocked/settings-load-warning) —
 //! this view never re-derives that state itself (e.g. it never calls
 //! `readiness::missing_permissions()` directly) — and reads
 //! [`vuho_settings::SettingsStore`] fresh on every render for the persisted
-//! microphone/hotkey choice, exactly like `settings_window.rs::SettingsView`
-//! does today.
+//! microphone/hotkey choice.
 //!
 //! Every side-effecting action is constructor-injected (CONSTITUTION rule
 //! 5): the Download/Retry button sends on the `provision_tx` passed into
-//! [`SettingsTab::new`], never through `cx.global::<VuhoState>()` — this
-//! view must work standalone, before any later package wires it behind that
-//! global.
-
-// TODO(ui-rehaul): remove once wired — nothing outside this module and its
-// own tests constructs a `SettingsTab` yet; the later integration package
-// embeds it in the unified panel.
-#![allow(dead_code)]
+//! [`SettingsTab::new`], and the live hotkey listener arrives via
+//! [`SettingsTab::connect_hotkey`] — this view never reaches through a
+//! process-lifetime global to get either.
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -92,9 +87,24 @@ impl SettingsTab {
         cx.notify();
     }
 
+    /// Connect a just-started production hotkey listener into this tab —
+    /// called once by `wiring::wire_production`, right after
+    /// `wiring::start_hotkey` succeeds, so the hotkey dropdown can
+    /// live-rebind it. Never called on the permissions/relaunch-blocked
+    /// startup path (`main.rs`) — `hotkey`/`cmd_tx` simply stay `None`
+    /// there, and [`Self::select_hotkey`] persists the choice without
+    /// rebinding anything.
+    pub(crate) fn connect_hotkey(
+        &mut self,
+        hotkey: Rc<RefCell<HotkeyListener>>,
+        cmd_tx: Sender<DictationCommand>,
+    ) {
+        self.hotkey = Some(hotkey);
+        self.cmd_tx = Some(cmd_tx);
+    }
+
     /// Persist the chosen microphone (`None` = system default) and close the
-    /// dropdown. Applied at the *next* session start (ADR-013) — same
-    /// copy-semantics as `settings_window.rs::SettingsView::select_microphone`,
+    /// dropdown. Applied at the *next* session start (ADR-013) —
     /// deliberately not live-rebound.
     fn select_microphone(&mut self, choice: Option<String>, cx: &mut Context<Self>) {
         self.mic_open = false;
@@ -105,9 +115,8 @@ impl SettingsTab {
     }
 
     /// Persist the chosen hotkey preset, close the dropdown, and — when a
-    /// live listener was injected (production mode) — rebind it exactly like
-    /// `settings_window.rs::SettingsView::select_hotkey`: `stop()` then
-    /// `start()` with the new config, deferring the Accessibility prompt via
+    /// live listener was injected (production mode) — rebind it: `stop()`
+    /// then `start()` with the new config, deferring the Accessibility prompt via
     /// `cx.spawn` on failure (same nested-run-loop hazard documented on
     /// `wiring::start_hotkey`). Either way, the resulting `HotkeyState` is
     /// written back into the shared `StatusModel` so the tray/panel and this
@@ -411,8 +420,7 @@ impl Render for SettingsTab {
 // ── Pure helpers (unit-tested without GPUI) ─────────────────────────────
 
 /// Re-snapshot input device names from `vuho_stt_engine`. An enumeration
-/// failure just means the dropdown offers only "System Default" — mirrors
-/// `settings_window.rs::SettingsView::new`'s handling.
+/// failure just means the dropdown offers only "System Default".
 fn list_devices() -> Vec<String> {
     match vuho_stt_engine::list_input_devices() {
         Ok(devices) => devices,

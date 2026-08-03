@@ -879,6 +879,114 @@ path, regardless of which candidate produced it — the design this ADR explicit
 path, which is the DMG build, `cargo run`, `VUHO_MODEL_FOLDER`, and `test-stt-ffi` — i.e.
 everything except the one new path this ADR adds.
 
+### ADR-021 — Single-panel UI (two presentations)
+
+**Status:** Accepted. Supersedes the three-window design; amends ADR-016 and ADR-020.
+
+**Problem:** the UI had accreted three independent `NSWindow`s with no shared visual language or
+lifecycle: the dictation overlay (`overlay.rs`, always present but hidden, `WindowKind::PopUp`,
+click-through), a lazily-created settings window (`settings_window.rs`, `WindowKind::Normal`,
+opened via `Cmd+Shift+S` or a status-bar menu item), and a separate permission/model readiness
+window (`readiness.rs`, also `WindowKind::Normal`, opened either as ADR-016's startup gate or
+ADR-020's model-download prompt). Each window duplicated construction boilerplate (dropdown
+widgets, button styling, centering math), and the readiness window in particular existed in two
+subtly different modes (`ReadinessMode::Gate`/`Production`) with their own poll loops, dismissal
+tracking, and reopen logic. The status bar itself had two installs (`install`/`install_gate`) and
+two delegate modes to match. None of the three windows shared a design system — `theme.rs` only
+ever styled the overlay.
+
+**Decision:** one window, `panel::PanelRoot`, with two presentations:
+- **Hud** — the old dictation overlay, unchanged behavior: bottom-center, click-through, no
+  keyboard focus, shown on `SessionStarted`, auto-hidden per outcome duration
+  (`overlay::outcome_hide_delay`).
+- **Full** — a centered, opaque, tabbed window (Overlay / Settings) that replaces both the old
+  settings window and the readiness window. The Settings tab
+  (`crate::settings_tab::SettingsTab`, built in WP5 but never wired to anything user-reachable
+  until this ADR) shows permission rows, speech-model provisioning, and the microphone/hotkey
+  dropdowns in one scrollable column, reading `StatusModel` for every piece of live state instead
+  of re-deriving it.
+
+The window itself is created once, at startup, in `Presentation::Hud`, `shown: false` — exactly
+like the old overlay was. Switching presentation is one **surgery chokepoint**
+(`panel::apply_presentation`): `Hud` sets the window's frame to the bottom-center bounds and turns
+click-through on; `Full` sets the frame to the centered bounds, turns click-through off, and calls
+`makeKeyAndOrderFront:` (`window_config::make_key_and_order_front`) — giving the panel keyboard
+focus *without* activating the application, since GPUI's `WindowKind::PopUp` already produces a
+non-activating `NSPanel` (`NSWindowStyleMaskNonactivatingPanel`) that can become key on its own.
+The window's level stays `kCGScreenSaverWindowLevel` (1000, set once at creation) across both
+presentations, so the Full presentation floats above normal windows exactly like the Hud does.
+Three further transitions build on that chokepoint: `show_full` (tray click, `Cmd+,`, a `Failed`
+model status), `on_session_started` (a session beginning while the panel is hidden shows the Hud;
+while the Full presentation is already open, it only switches the active tab back to Overlay —
+never re-frames or steals key status from a window the user opened deliberately), and
+`hide_if_hud` (the old outcome-duration auto-hide, now a no-op while the Full presentation is
+open).
+
+**The permission gate is now the panel's Settings tab (amends ADR-016).** `main.rs` builds the
+settings store, the `StatusModel`/`SettingsTab` entities, and the panel itself *before* checking
+`readiness::missing_permissions()`. If anything is missing, `wiring::wire_production` never runs
+this launch — instead the panel opens on its Settings tab
+(`panel::show_full(panel, Tab::Settings, cx)`), and the tray installs with `cmd_tx: None` (the
+toggle item is a no-op; `CompositeStatus::toggle_enabled` also disables it). The permission rows
+and, once every grant lands, the relaunch row (`CompositeStatus::RelaunchRequired`) live in
+exactly the same Settings tab a fully-launched app's Cmd+, would open — there is no separate gate
+window, and no separate `install_gate`/`DelegateMode::Gate`/`GateCommand` machinery in
+`status_bar.rs`: one `install(cmd_tx: Option<Sender<DictationCommand>>, ui_tx)` call serves both
+states, with `sync`'s existing `CompositeStatus::menu_title`/`toggle_enabled` already covering
+`PermissionsMissing`/`RelaunchRequired`. A `Full`-presentation permissions poll
+(`panel::start_permissions_poll`, spawned by `show_full`, dropped by `hide_if_hud`) replaces the
+old readiness window's `spawn_poll_loop`, writing `StatusModel::permissions_missing` only when it
+actually changed.
+
+**ADR-020's "model row never on the gate path" invariant is now enforced by a type, not a
+window-selection branch.** The old readiness window kept the model row off the permission-gate
+path by simply never calling `handle_model_status` from that entry point. The panel enforces the
+same fact structurally: `StatusModel.model: Option<ModelStatus>` starts (and, on the
+permissions-blocked path, stays) `None` for the process lifetime — `wire_production`, the only
+code that ever calls `ui_tx.send(UiCommand::ModelStatus(..))` (via `wiring::send_phase_status`),
+never runs on that path — and every render site that would show a model row
+(`SettingsTab::render`'s `should_show_speech_model_section`, `PanelRoot::render_idle_status`'s
+`CompositeStatus::ModelMissing`/`Downloading`/`Verifying` arms) is downstream of that same
+`Option`. A model row appearing on the gate path is therefore not a reachable state, not merely an
+unexercised one.
+
+**Consequences:**
+- `settings_window.rs` is deleted outright (`SettingsView`, `open_settings_window`, the
+  `VuhoState::settings_window` singleton field). `readiness.rs` sheds every window/render/poll
+  item (`ReadinessView`, `ReadinessMode`, `open_permission_gate_window`,
+  `reopen_or_front_gate_window`, `reopen_or_front_production_window`, `handle_model_status`,
+  `spawn_poll_loop`, `spawn_gate_command_drain`, `GateCommand`, every `render_*`/`*_button`
+  helper) and keeps only the data model both remaining callers need: `Permission`/`Access`/
+  `missing_permissions`/`model_status_text`/`format_mb`/`relaunch`.
+- `VuhoState` (the process-lifetime `Global` holding the settings store, hotkey listener, command
+  channel, and settings-window handle) is deleted entirely — nothing needs a global anymore.
+  `SettingsTab` owns the hotkey listener/command-sender it needs directly
+  (`SettingsTab::connect_hotkey`, called once by `wiring::wire_production` after
+  `wiring::start_hotkey` succeeds), and the Download/Retry button's `Sender<ProvisionCommand>` is
+  constructor-injected into `SettingsTab::new` by `main.rs`, never reached through a global.
+- `app_state::UiCommand` sheds `OpenSettings`/`OpenReadiness` (both already unreachable after
+  WP4's tray click-split); `OpenPanel` now resolves to `panel::open_from_tray`, which shows the
+  Overlay tab while a session has live content and whichever tab was last active otherwise.
+- `overlay.rs`'s chrome and content are split (`overlay::hud_chrome` wraps
+  `OverlayModel::render_content` for the Hud arm; the Full presentation's Overlay tab embeds
+  `render_content` directly, inside the panel's own opaque chrome, never the Hud's translucent
+  one) — zero behavior change to the Hud presentation itself, verified by moving
+  `bottom_center_origin`'s two existing unit tests into `panel.rs` unmodified.
+- `theme.rs` (previously overlay-only, with a blanket `dead_code` allow for the tokens
+  `settings_tab.rs`/`controls.rs` were already coded against) is now the shared token set for
+  every rendered surface across both presentations; the allow stays because roughly a dozen of
+  those tokens are consumed only by production-only (`#[cfg(not(feature = "demo"))]`) modules and
+  are therefore genuinely unreachable in a `--features demo` build — a structural fact of a
+  cfg-split consumer set, not unfinished wiring.
+
+**Rejected alternative:** keeping the readiness window's two `ReadinessMode`s as-is and merely
+retargeting the Settings tab to open it in the appropriate mode — rejected because it would have
+preserved two independent "let the user finish setup" implementations
+(`readiness.rs`'s row-building + `settings_tab.rs`'s, already written and better factored against
+`StatusModel`) with no way for a future edit to keep both in sync short of reading both files
+every time. Deleting the older one and keeping the single reads-`StatusModel` implementation is
+the one-source-of-truth outcome CONSTITUTION rule 26 asks for.
+
 ---
 
 ## Target architecture (after these ADRs)
@@ -918,10 +1026,12 @@ added, ADR-020; no Swift package, ADR-014):**
   fully verifies it → writes the sidecar **inside** `<dir>.partial`, only once verification has
   passed → atomically renames `<dir>.partial` to `<dir>`, promoting the verified bytes and their
   sidecar together). Depends on `vuho-model-paths` and `vuho-domain`.
-- `vuho-ui` — GPUI overlay + settings window (mic + hotkey-preset dropdowns, save-on-change,
-  live hotkey rebind); produces the `vuho` binary. Status-bar menu, quit hotkey
-  `Cmd+Option+Shift+Q` (`LSUIElement`, no Dock icon). Owns the readiness window (ADR-020) that
-  generalizes ADR-016's permission gate to also surface model download/verify progress.
+- `vuho-ui` — GPUI: a single non-activating panel (`panel::PanelRoot`, ADR-021) with two
+  presentations — Hud (the dictation overlay) and Full (a tabbed Overlay/Settings window; the
+  Settings tab holds the mic + hotkey-preset dropdowns, save-on-change, live hotkey rebind, and
+  the ADR-016/ADR-020 permission + model provisioning rows); produces the `vuho` binary.
+  Status-bar menu, quit hotkey `Cmd+Option+Shift+Q`, `Cmd+,` opens the panel on Settings
+  (`LSUIElement`, no Dock icon).
 - `test-stt-ffi` — batch STT regression binary; the deterministic `PASS`-on-`jfk.wav` gate.
 
 **No Swift engine package** — the row this table used to have for one is gone; there is no

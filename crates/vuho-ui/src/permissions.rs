@@ -1,14 +1,15 @@
-//! macOS permission prompts (ADR-012 / GAP 3; preflight gate: ADR-016).
+//! macOS permission prompts (ADR-012 / GAP 3; preflight gate: ADR-016,
+//! merged into the panel's Settings tab by ADR-021).
 //!
 //! Accessibility (for the `CapsLock` `CGEventTap`) and Microphone (for STT
-//! capture) are runtime TCC grants, not entitlements. As of ADR-016, the
-//! primary path for both is the startup preflight gate
-//! (`permission_gate::open_gate_window`) — the functions here are now only
-//! defensive fallbacks for the two reactive call sites where a grant is
-//! revoked **mid-session** (`start_hotkey`'s error branch,
-//! `settings_window.rs`'s `select_hotkey` error branch), so a single native
-//! dialog (or none, if still trusted) is the correct, non-nagging behavior
-//! there too — never native+custom dialog stacking.
+//! capture) are runtime TCC grants, not entitlements. The primary path for
+//! both is the panel opened on its Settings tab (`crate::settings_tab`,
+//! `crate::panel::show_full`) — the functions here are defensive fallbacks
+//! for the two reactive call sites where a grant is revoked **mid-session**
+//! (`wiring::start_hotkey`'s error branch, `settings_tab.rs`'s
+//! `select_hotkey` error branch), so a single native dialog (or none, if
+//! still trusted) is the correct, non-nagging behavior there too — never
+//! native+custom dialog stacking.
 //!
 //! All functions must run on the main thread (they build `AppKit` UI).
 
