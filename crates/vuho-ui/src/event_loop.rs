@@ -176,7 +176,7 @@ pub(crate) fn apply_events(
     }
     let _ = overlay.update(cx, |model, window, cx| {
         if show {
-            window_config::show_overlay(window);
+            window_config::order_front(window);
         }
         for (ev, skip) in events.into_iter().zip(skip) {
             if skip {
@@ -199,7 +199,7 @@ pub(crate) fn maybe_hide(
         if Instant::now() >= t {
             *hide_at = None;
             let _ = overlay.update(cx, |_model, window, _cx| {
-                window_config::hide_overlay(window);
+                window_config::order_out(window);
             });
         }
     }
