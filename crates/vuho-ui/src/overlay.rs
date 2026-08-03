@@ -8,6 +8,8 @@ use gpui::{
 use std::time::{Duration, Instant};
 use vuho_domain::{DictationEvent, InjectionOutcome};
 
+use crate::theme;
+
 /// Number of waveform bars.
 const BAR_COUNT: usize = 12;
 
@@ -74,8 +76,8 @@ pub(crate) fn outcome_hide_delay(injection: &InjectionOutcome) -> Option<Duratio
     Some(display + HIDE_MARGIN)
 }
 
-/// Text size for the transcript / outcome message rows.
-const TRANSCRIPT_TEXT_SIZE: Pixels = px(16.0);
+/// Text size for the transcript / outcome message rows: `theme::TEXT_LG`.
+const TRANSCRIPT_TEXT_SIZE: Pixels = px(theme::TEXT_LG);
 /// Line height for the wrapped transcript paragraph (Fix 3: ~1.4x text size).
 const TRANSCRIPT_LINE_HEIGHT: Pixels = px(22.0);
 /// Visible transcript viewport height: 3 lines at `TRANSCRIPT_LINE_HEIGHT`.
@@ -92,55 +94,54 @@ const FADE_HEIGHT: Pixels = px(18.0);
 // numbers, not just the hues). Design principle (user correction after
 // review): separate elements with text color — opacity/contrast and
 // typography — first; hue is a last resort. The only saturated hue left on
-// the panel is the recording LED (`RECORDING_HUE` below); everything else
-// — transcript, outcome text, the ⌘V chip, the waveform — is neutral
+// the panel is the recording LED (`theme::ERROR_RED`); everything else —
+// transcript, outcome text, the ⌘V chip, the waveform — is neutral
 // white/gray, distinguished by opacity and size alone.
+//
+// The prominent/secondary/disabled text opacities and the recording red
+// itself now live in `theme.rs` (the crate's shared visual-language
+// chokepoint) as `TEXT_PRIMARY`/`TEXT_SECONDARY`/`TEXT_DISABLED`/
+// `ERROR_RED`; only the magnitudes with no cross-window equivalent — panel
+// chrome, the waveform's own faint alphas, the idle recording dot, the LED
+// pulse/glow geometry — stay local to this file.
 
 /// Neutral (gray/white) hue: 0 with zero saturation.
 const NEUTRAL_HUE: f32 = 0.0;
 const NEUTRAL_SATURATION: f32 = 0.0;
 
-/// Full white, used for message/transcript text on the dark panel.
+/// Full white, used for the waveform, panel border, and key-cap chip border.
 const LIGHTNESS_WHITE: f32 = 1.0;
 /// Mid gray, used for the idle recording dot.
 const LIGHTNESS_IDLE_DOT: f32 = 0.5;
 
-/// Opacity of the confirmed transcript text and the outcome headline
-/// ("✓ Inserted", "Copied to clipboard") — the most prominent text on the
-/// panel. The two share this exact color (not just the same hue) so the
-/// outcome headline reads as a continuation of the transcript, not a
-/// different kind of thing.
-const OPACITY_PROMINENT: f32 = 0.95;
-/// Opacity of the active recording dot.
+/// Opacity of the active recording dot, applied over `theme::ERROR_RED`.
 const OPACITY_ACTIVE_DOT: f32 = 0.9;
-/// Opacity of the outcome message text (errors / clipboard-fallback notes).
-const OPACITY_MESSAGE: f32 = 0.85;
 /// Waveform bars are ambient activity texture, not information — a faint
 /// alpha pulse is enough; no hue shift with recording state (that's the red
 /// LED's job alone, Fix 5).
 const WAVEFORM_ACTIVE_ALPHA: f32 = 0.3;
 const WAVEFORM_IDLE_ALPHA: f32 = 0.12;
-/// Opacity of the unconfirmed transcript tail and the idle recording dot —
-/// both are deliberately de-emphasized relative to confirmed/active state.
+/// Opacity of the idle recording dot — same magnitude as
+/// `theme::TEXT_DISABLED`'s alpha, deliberately de-emphasized relative to
+/// the active state.
 const OPACITY_DIMMED: f32 = 0.4;
 
 // Panel chrome (Fix 3: moved out of the inline literals at the old
 // `overlay.rs:357-359` and into this named block, so the fade strip below
-// can reference the exact same background color).
+// can reference the exact same background color). No shared-theme
+// equivalent: this exact hue/opacity combination is unique to the overlay's
+// floating, semi-transparent panel.
 const PANEL_HUE: f32 = 0.7;
 const PANEL_SATURATION: f32 = 0.1;
 const PANEL_LIGHTNESS: f32 = 0.08;
 /// Raised from 0.85 (Fix 3): text should never fight the desktop behind it.
 const PANEL_BG_OPACITY: f32 = 0.9;
 const PANEL_BORDER_OPACITY: f32 = 0.1;
-pub(crate) const PANEL_RADIUS: Pixels = px(16.0);
 
-// Recording LED (Fix 5): warm red, replacing the old green/gray dot — the
-// only saturated hue on the panel; every other element (transcript, outcome
-// text, chip, waveform) is neutral white/gray (see the palette note above).
-const RECORDING_HUE: f32 = 0.0;
-const RECORDING_SATURATION: f32 = 0.75;
-const RECORDING_LIGHTNESS: f32 = 0.55;
+// Recording LED (Fix 5): warm red (`theme::ERROR_RED`), replacing the old
+// green/gray dot — the only saturated hue on the panel; every other element
+// (transcript, outcome text, chip, waveform) is neutral white/gray (see the
+// palette note above).
 const OPACITY_GLOW: f32 = 0.5;
 const LED_SIZE: Pixels = px(8.0);
 /// Distance from the panel's top-left corner to the LED — freed up from the
@@ -168,22 +169,17 @@ const WAVEFORM_BAR_MIN_HEIGHT: Pixels = px(2.0);
 const WAVEFORM_BAR_RADIUS: Pixels = px(1.5);
 const WAVEFORM_TOP_MARGIN: Pixels = px(8.0);
 
-// Key-cap chip (Fix 4).
+// Key-cap chip (Fix 4). Radius is `theme::RADIUS_CHIP`, applied at the
+// chip's `.rounded()` call site; text size is `theme::TEXT_SM`.
 const KEYCAP_BORDER_OPACITY: f32 = 0.25;
-const KEYCAP_TEXT_SIZE: Pixels = px(12.0);
-const KEYCAP_RADIUS: Pixels = px(4.0);
+const KEYCAP_TEXT_SIZE: Pixels = px(theme::TEXT_SM);
 /// Chip + hint opacity for the dimmed ("to paste again") vs. prominent
 /// ("to paste") wordings — see `Outcome::chip_hint`.
 const CHIP_OPACITY_DIMMED: f32 = 0.6;
 const CHIP_OPACITY_PROMINENT: f32 = 0.95;
 
 fn color_message() -> Hsla {
-    hsla(
-        NEUTRAL_HUE,
-        NEUTRAL_SATURATION,
-        LIGHTNESS_WHITE,
-        OPACITY_MESSAGE,
-    )
+    theme::TEXT_SECONDARY
 }
 
 /// Neutral white, alpha-only distinction between active/idle — no hue shift
@@ -201,16 +197,12 @@ fn color_waveform_bar(recording: bool) -> Hsla {
     )
 }
 
-/// Recording LED color: warm red while recording, neutral gray idle
-/// (unchanged idle behavior — only the active color moved off green).
+/// Recording LED color: warm red (`theme::ERROR_RED`) while recording,
+/// neutral gray idle (unchanged idle behavior — only the active color moved
+/// off green).
 fn color_recording_dot(recording: bool) -> Hsla {
     if recording {
-        hsla(
-            RECORDING_HUE,
-            RECORDING_SATURATION,
-            RECORDING_LIGHTNESS,
-            OPACITY_ACTIVE_DOT,
-        )
+        theme::ERROR_RED.opacity(OPACITY_ACTIVE_DOT)
     } else {
         hsla(
             NEUTRAL_HUE,
@@ -222,33 +214,18 @@ fn color_recording_dot(recording: bool) -> Hsla {
 }
 
 fn color_recording_glow() -> Hsla {
-    hsla(
-        RECORDING_HUE,
-        RECORDING_SATURATION,
-        RECORDING_LIGHTNESS,
-        OPACITY_GLOW,
-    )
+    theme::ERROR_RED.opacity(OPACITY_GLOW)
 }
 
-/// Confirmed transcript text: full white, prominent opacity.
+/// Confirmed transcript text: `theme::TEXT_PRIMARY`.
 fn color_confirmed_text() -> Hsla {
-    hsla(
-        NEUTRAL_HUE,
-        NEUTRAL_SATURATION,
-        LIGHTNESS_WHITE,
-        OPACITY_PROMINENT,
-    )
+    theme::TEXT_PRIMARY
 }
 
-/// Unconfirmed (in-flight) transcript tail: same white, dimmed opacity —
+/// Unconfirmed (in-flight) transcript tail: `theme::TEXT_DISABLED` —
 /// visually distinguishes text the engine hasn't confirmed yet.
 fn color_unconfirmed_text() -> Hsla {
-    hsla(
-        NEUTRAL_HUE,
-        NEUTRAL_SATURATION,
-        LIGHTNESS_WHITE,
-        OPACITY_DIMMED,
-    )
+    theme::TEXT_DISABLED
 }
 
 fn color_panel_bg() -> Hsla {
@@ -565,7 +542,7 @@ impl Render for OverlayModel {
             .bg(color_panel_bg())
             .border_1()
             .border_color(color_panel_border())
-            .rounded(PANEL_RADIUS)
+            .rounded(px(theme::RADIUS_PANEL))
             .shadow_lg()
             .flex()
             .flex_col()
@@ -728,7 +705,7 @@ fn key_cap_chip() -> impl IntoElement {
     div()
         .px_1p5()
         .py_0p5()
-        .rounded(KEYCAP_RADIUS)
+        .rounded(px(theme::RADIUS_CHIP))
         .border_1()
         .border_color(hsla(
             NEUTRAL_HUE,
