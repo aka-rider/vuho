@@ -241,9 +241,16 @@ jobs:
           VERSION: ${{ steps.version.outputs.version }}
         run: |
           set -euo pipefail
-          gh api repos/aka-rider/homebrew-tap/dispatches \
-            -f event_type=vuho-release \
-            -f "client_payload[version]=${VERSION}"
+          # An expired or under-scoped PAT is the expected way this breaks, and
+          # it breaks *after* the release is already published — so say plainly
+          # what is still fine, what is not, and how to finish the job by hand.
+          # A bare `gh` HTTP 404 here reads like the tap is missing.
+          if ! gh api repos/aka-rider/homebrew-tap/dispatches \
+                 -f event_type=vuho-release \
+                 -f "client_payload[version]=${VERSION}"; then
+            echo "::error::Dispatch to aka-rider/homebrew-tap failed. The v${VERSION} release IS published; only the cask is stale. Most likely HOMEBREW_TAP_TOKEN is expired or lacks 'contents: write' on the tap (the endpoint 404s rather than 403s when under-scoped). Re-mint it, then run: gh workflow run release-vuho.yml --repo aka-rider/homebrew-tap -f vuho_version=v${VERSION}"
+            exit 1
+          fi
           echo "Dispatched vuho-release (version=${VERSION}) to aka-rider/homebrew-tap."
           {
             echo "### Homebrew cask"
