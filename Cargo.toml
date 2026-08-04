@@ -15,7 +15,15 @@ members = [
 ]
 
 [workspace.package]
-version = "0.2.0"
+# Deliberately a fixed sentinel, never bumped. The git tag is the single
+# source of truth for the released version: `scripts/bundle-macos.sh` takes
+# it via $VUHO_VERSION (which .github/workflows/release.yml derives from the
+# tag) for CFBundleShortVersionString, and the same value names the release
+# tarball and the Homebrew cask. Nothing reads CARGO_PKG_VERSION, and
+# `publish = false` below means crates.io never sees this number — so a real
+# version here would only be a second copy of the tag to keep in sync, which
+# is exactly the drift the tag-driven scheme removes.
+version = "0.0.0-dev"
 edition = "2021"
 rust-version = "1.88"
 license = "MIT"

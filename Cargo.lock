@@ -6923,7 +6923,7 @@ dependencies = [
 
 [[package]]
 name = "test-stt-ffi"
-version = "0.2.0"
+version = "0.0.0-dev"
 dependencies = [
  "env_logger",
  "vuho-stt-engine",
@@ -7803,7 +7803,7 @@ dependencies = [
 
 [[package]]
 name = "vuho-audio"
-version = "0.2.0"
+version = "0.0.0-dev"
 dependencies = [
  "block2",
  "cpal",
@@ -7820,7 +7820,7 @@ dependencies = [
 
 [[package]]
 name = "vuho-dictation"
-version = "0.2.0"
+version = "0.0.0-dev"
 dependencies = [
  "crossbeam-channel",
  "log",
@@ -7834,11 +7834,11 @@ dependencies = [
 
 [[package]]
 name = "vuho-domain"
-version = "0.2.0"
+version = "0.0.0-dev"
 
 [[package]]
 name = "vuho-model-fetch"
-version = "0.2.0"
+version = "0.0.0-dev"
 dependencies = [
  "crossbeam-channel",
  "hex",
@@ -7854,7 +7854,7 @@ dependencies = [
 
 [[package]]
 name = "vuho-model-paths"
-version = "0.2.0"
+version = "0.0.0-dev"
 dependencies = [
  "serde",
  "serde_json",
@@ -7862,7 +7862,7 @@ dependencies = [
 
 [[package]]
 name = "vuho-os-integration"
-version = "0.2.0"
+version = "0.0.0-dev"
 dependencies = [
  "block2",
  "crossbeam-channel",
@@ -7878,11 +7878,11 @@ dependencies = [
 
 [[package]]
 name = "vuho-postprocess"
-version = "0.2.0"
+version = "0.0.0-dev"
 
 [[package]]
 name = "vuho-settings"
-version = "0.2.0"
+version = "0.0.0-dev"
 dependencies = [
  "log",
  "serde",
@@ -7893,7 +7893,7 @@ dependencies = [
 
 [[package]]
 name = "vuho-stt-engine"
-version = "0.2.0"
+version = "0.0.0-dev"
 dependencies = [
  "block2",
  "criterion",
@@ -7916,7 +7916,7 @@ dependencies = [
 
 [[package]]
 name = "vuho-ui"
-version = "0.2.0"
+version = "0.0.0-dev"
 dependencies = [
  "crossbeam-channel",
  "dispatch2",

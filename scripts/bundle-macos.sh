@@ -143,14 +143,27 @@ info "Copying binary..."
 cp "$SRC_BIN" "$BUNDLE_CONTENTS/MacOS/vuho"
 chmod 755 "$BUNDLE_CONTENTS/MacOS/vuho"
 
-info "Resolving app version from cargo metadata..."
-# The single source of truth for the app version is [workspace.package]
-# version in Cargo.toml; every crate (including vuho-ui, which produces the
-# binary this bundle wraps) inherits it via `version.workspace = true`. Read
-# it through `cargo metadata` rather than hand-parsing Cargo.toml.
-APP_VERSION="$(cargo metadata --no-deps --format-version 1 --manifest-path "$WORKSPACE_ROOT/Cargo.toml" \
-    | python3 -c "import json, sys; d = json.load(sys.stdin); print(next(p['version'] for p in d['packages'] if p['name'] == 'vuho-ui'))")"
-[[ -n "$APP_VERSION" ]] || die "Failed to resolve app version from cargo metadata"
+# The single source of truth for a *released* version is the git tag:
+# .github/workflows/release.yml derives it from the tag and passes it in as
+# $VUHO_VERSION, and the same value names the release tarball and the
+# Homebrew cask's `version` stanza. Taking both from one string is what makes
+# a cask pointing at a 404 URL unrepresentable, rather than something a CI
+# equality check has to catch after the fact.
+#
+# Unreleased builds (local `./scripts/package.sh`, ci.yml) leave $VUHO_VERSION
+# unset and fall back to `cargo metadata`, which reports Cargo.toml's fixed
+# "0.0.0-dev" sentinel — a self-identifying not-a-release marker, not a stale
+# number pretending to be one. Read it through `cargo metadata` rather than
+# hand-parsing Cargo.toml.
+if [[ -n "${VUHO_VERSION:-}" ]]; then
+    info "Using app version from \$VUHO_VERSION..."
+    APP_VERSION="$VUHO_VERSION"
+else
+    info "Resolving app version from cargo metadata (\$VUHO_VERSION unset)..."
+    APP_VERSION="$(cargo metadata --no-deps --format-version 1 --manifest-path "$WORKSPACE_ROOT/Cargo.toml" \
+        | python3 -c "import json, sys; d = json.load(sys.stdin); print(next(p['version'] for p in d['packages'] if p['name'] == 'vuho-ui'))")"
+fi
+[[ -n "$APP_VERSION" ]] || die "Failed to resolve app version"
 
 # Monotonic build number: see the CFBundleVersion comment in Info.plist.
 #
@@ -190,7 +203,7 @@ plutil -replace CFBundleVersion -string "$APP_BUILD" "$BUNDLE_CONTENTS/Info.plis
 info "Verifying installed Info.plist's CFBundleShortVersionString and CFBundleVersion..."
 INSTALLED_VERSION="$(plutil -extract CFBundleShortVersionString raw "$BUNDLE_CONTENTS/Info.plist")"
 if [[ "$INSTALLED_VERSION" != "$APP_VERSION" ]]; then
-    die "Installed Info.plist CFBundleShortVersionString ($INSTALLED_VERSION) != cargo metadata version ($APP_VERSION) — substitution failed"
+    die "Installed Info.plist CFBundleShortVersionString ($INSTALLED_VERSION) != resolved app version ($APP_VERSION) — substitution failed"
 fi
 INSTALLED_BUILD="$(plutil -extract CFBundleVersion raw "$BUNDLE_CONTENTS/Info.plist")"
 if [[ "$INSTALLED_BUILD" != "$APP_BUILD" ]]; then

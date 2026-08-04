@@ -29,6 +29,7 @@ MacOS Silicon ONLY. ANE. Metal.
   via `ParakeetEngine`; override the audio with `JFK_WAV`). Green as of the Parakeet-TDT rewrite.
 - Model provisioning (idempotent, pinned revisions): `./scripts/fetch-model.sh`.
 - Package a signed `.app`: `./scripts/package.sh` (delegates to `scripts/bundle-macos.sh`; ad-hoc signature by default, set `SIGN_ID` for a stable identity so TCC grants survive rebuilds).
+- **Release: the git tag is the version.** Push `vMAJOR.MINOR.PATCH` (e.g. `v0.9.0`) and `.github/workflows/release.yml` does the rest — it validates the tag's *shape* (a 2-component `v0.9` is rejected), then feeds that one string to the bundle's `CFBundleShortVersionString` (as `VUHO_VERSION`, which `bundle-macos.sh` prefers over `cargo metadata`), the tarball name, and the Homebrew cask. **Never bump `Cargo.toml`'s version**: it is pinned at the `0.0.0-dev` sentinel deliberately, since nothing reads `CARGO_PKG_VERSION` and `publish = false` — a real number there would only be a second copy of the tag to keep in sync. Local/CI builds leave `VUHO_VERSION` unset and stamp `0.0.0-dev`, a self-identifying not-a-release marker.
 
 ## Architecture
 

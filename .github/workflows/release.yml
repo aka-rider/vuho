@@ -89,27 +89,31 @@ jobs:
         run: cargo test --workspace
 
       # The cask URL is `Vuho-#{version}-arm64.tar.gz`, built from the tag.
-      # If the tag and the crate version ever drift, the cask points at a
-      # URL that 404s — and the only place that would be noticed is a
-      # user's `brew install`. Fail here instead, loudly, with both values.
+      # The tag is the single source of truth for the released version. Every
+      # downstream consumer — the .app's CFBundleShortVersionString (via
+      # $VUHO_VERSION, which bundle-macos.sh prefers over `cargo metadata`),
+      # the tarball name, and the Homebrew cask's `version` stanza — derives
+      # from this one string, so a cask pointing at a URL that 404s is
+      # unrepresentable rather than something an equality check catches after
+      # the fact. Cargo.toml holds a fixed "0.0.0-dev" sentinel and is never
+      # bumped; there is no second copy of the version to drift from.
+      #
+      # What can still go wrong is a malformed tag, so that is what is checked
+      # here: `v0.9` (a real mistake this repo has made) yields the version
+      # "0.9", which would ship a cask and a bundle whose version is not
+      # MAJOR.MINOR.PATCH. Reject it now, at the one place a human's typo
+      # enters the system, rather than in a user's `brew install`.
       - name: Derive and verify VERSION
         id: version
         run: |
           TAG_VERSION="${GITHUB_REF_NAME#v}"
-          # This is a virtual workspace (no root [package]), so
-          # `cargo metadata`'s packages[] array has no guaranteed order —
-          # index 0 is not reliably the workspace version. Every member
-          # inherits `version.workspace = true`, so pick a fixed, always-
-          # present member (vuho-ui, the binary this release ships) by
-          # name instead of by position.
-          CARGO_VERSION="$(cargo metadata --no-deps --format-version 1 | \
-            jq -r '.packages[] | select(.name == "vuho-ui") | .version')"
-
+          echo "Tag:           $GITHUB_REF_NAME"
           echo "Tag version:   $TAG_VERSION"
-          echo "Cargo version: $CARGO_VERSION"
 
-          if [[ "$TAG_VERSION" != "$CARGO_VERSION" ]]; then
-            echo "::error::Tag version ($TAG_VERSION) does not match cargo metadata workspace version ($CARGO_VERSION)"
+          # Strict MAJOR.MINOR.PATCH, optionally with a -prerelease suffix.
+          # No leading zeros, no 2-component "0.9", no trailing junk.
+          if ! [[ "$TAG_VERSION" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::Tag '$GITHUB_REF_NAME' does not yield a MAJOR.MINOR.PATCH version (got '$TAG_VERSION'). Tag as e.g. v0.9.0."
             exit 1
           fi
 
@@ -119,11 +123,33 @@ jobs:
       # copy and its preconditions, so this build never touches the Hugging
       # Face download. models.lock.json (committed) is only needed for the
       # runtime download path, not for building the app itself.
+      #
+      # VUHO_VERSION is what makes the tag drive the bundle: without it,
+      # bundle-macos.sh falls back to `cargo metadata` and would stamp the
+      # "0.0.0-dev" sentinel into a released .app.
       - name: Package Vuho.app (model-less)
+        env:
+          VUHO_VERSION: ${{ steps.version.outputs.version }}
         run: VUHO_BUNDLE_MODEL=0 ./scripts/package.sh
 
       - name: Verify Vuho.app (model-less)
         run: VUHO_BUNDLE_MODEL=0 ./scripts/verify-app.sh
+
+      # verify-app.sh only asserts the __VERSION__ placeholder was substituted
+      # by *something*; it cannot know which version was intended. Assert the
+      # shipped bundle carries the tag's version specifically — otherwise a
+      # future refactor that drops the env: block above would silently publish
+      # a "0.0.0-dev" .app inside a correctly-named tarball.
+      - name: Verify bundle version matches tag
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          BUNDLE_VERSION="$(plutil -extract CFBundleShortVersionString raw Vuho.app/Contents/Info.plist)"
+          echo "Bundle CFBundleShortVersionString: $BUNDLE_VERSION"
+          if [[ "$BUNDLE_VERSION" != "$VERSION" ]]; then
+            echo "::error::Bundle version ($BUNDLE_VERSION) does not match tag version ($VERSION)"
+            exit 1
+          fi
 
       # bundle-macos.sh places the bundle at the repo root
       # ($WORKSPACE_ROOT/Vuho.app), not a staging directory, so `-C
