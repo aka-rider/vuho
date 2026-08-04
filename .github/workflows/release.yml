@@ -191,20 +191,18 @@ jobs:
           tar -xzf "Vuho-${VERSION}-arm64.tar.gz" -C "$scratch"
           codesign --verify --deep --strict "$scratch/Vuho.app"
 
-      # The Homebrew cask needs this sha256 for its `sha256 "…"` stanza;
-      # print it plainly (for a human copying it into Casks/vuho.rb), record
-      # it in the job summary, AND set it as a step output so the following
-      # step can hand it to the tap automatically — printing it for a human
-      # to copy-paste is exactly the handoff that lets a stale sha256 slip
-      # into a later version bump unnoticed (see the next step's comment).
+      # Recorded for humans only — to compare against a download by hand, or
+      # to diagnose a cask mismatch. The cask's own `sha256` stanza is NOT
+      # fed from here: aka-rider/homebrew-tap's release-vuho.yml recomputes it
+      # from the published asset, so the value users' Homebrew verifies is
+      # derived from the artifact actually being served rather than from this
+      # job's local copy of it.
       - name: Compute tarball SHA-256
-        id: sha256
         env:
           VERSION: ${{ steps.version.outputs.version }}
         run: |
           SHA256="$(shasum -a 256 "Vuho-${VERSION}-arm64.tar.gz" | awk '{print $1}')"
           echo "SHA-256: $SHA256"
-          echo "sha256=$SHA256" >> "$GITHUB_OUTPUT"
           {
             echo "### Vuho-${VERSION}-arm64.tar.gz"
             echo ""
@@ -218,74 +216,59 @@ jobs:
         with:
           files: Vuho-*-arm64.tar.gz
 
-      # Close the hand-off gap: a version/sha256 pair that can drift apart
-      # (someone bumps Casks/vuho.rb's `version` for a later release but
-      # forgets `sha256`, since the tap's CI grep only checks for the
-      # one-time placeholder) is the actual defect — not merely that a
-      # human has to copy-paste. Push both fields together, atomically, as
-      # one commit, straight from the value just computed above.
+      # Hand off to the tap, which owns cask updates for every project in it
+      # (see also its release-rune.yml / release-whisper.yml). This step only
+      # says "0.9.0 is published"; aka-rider/homebrew-tap's release-vuho.yml
+      # re-downloads the asset, computes the sha256 from what users will
+      # actually get, rewrites Casks/vuho.rb and pushes — so the checksum is
+      # verified against the published artifact rather than restated from
+      # this builder's own belief about it.
       #
-      # Needs a `HOMEBREW_TAP_TOKEN` repo secret (a PAT with `contents:
-      # write` + `pull-requests: write` on aka-rider/homebrew-tap, or a
-      # fine-grained token scoped to that repo) — cross-repo pushes can't
-      # use the default GITHUB_TOKEN, which is scoped to this repo only.
-      # If that secret isn't configured, this step is a documented no-op
-      # (see the fallback step below) rather than a failure: the release
-      # itself must not depend on tap-repo credentials existing.
+      # This must run after "Upload release": the tap fetches the asset by
+      # URL, so dispatching earlier is a race against the upload.
       #
-      # This is a best-effort convenience, not the safety net — ci.yml's
-      # "Verify declared sha256 matches release asset" step in
-      # homebrew-tap is what actually prevents a stale hash from being
-      # trusted, whether or not this step ever ran.
-      - name: Open homebrew-tap PR to bump version + sha256
+      # Needs a `HOMEBREW_TAP_TOKEN` repo secret (a fine-grained PAT scoped to
+      # aka-rider/homebrew-tap with `contents: write`, which is what the
+      # dispatches endpoint requires). GitHub has no cross-repo trigger and
+      # the default GITHUB_TOKEN is scoped to this repo only, so some token
+      # is unavoidable for an instant publish. If the secret is absent this
+      # step is a documented no-op (see the fallback below) rather than a
+      # failure: publishing the release must not depend on tap credentials.
+      - name: Trigger homebrew-tap cask publish
         if: ${{ env.HOMEBREW_TAP_TOKEN != '' }}
         env:
-          HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
-          VERSION: ${{ steps.version.outputs.version }}
-          SHA256: ${{ steps.sha256.outputs.sha256 }}
           GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          VERSION: ${{ steps.version.outputs.version }}
         run: |
           set -euo pipefail
-          BRANCH="bump-vuho-${VERSION}"
-          git clone "https://x-access-token:${HOMEBREW_TAP_TOKEN}@github.com/aka-rider/homebrew-tap.git" tap-repo
-          cd tap-repo
-          git checkout -b "$BRANCH"
-          # Both fields, one commit: this is the atomicity that closes the
-          # blocker — a version bump can never land without its own sha256.
-          perl -0pi -e "s/version \"[^\"]*\"/version \"${VERSION}\"/" Casks/vuho.rb
-          perl -0pi -e "s/sha256 \"[0-9a-f]+\"/sha256 \"${SHA256}\"/" Casks/vuho.rb
-          if git diff --quiet; then
-            echo "Casks/vuho.rb already at version ${VERSION} / sha256 ${SHA256} — nothing to do."
-            exit 0
-          fi
-          git -c user.name="vuho-release-bot" -c user.email="actions@github.com" commit -am "vuho: bump to ${VERSION}"
-          git push origin "$BRANCH"
-          gh pr create --repo aka-rider/homebrew-tap \
-            --title "vuho: bump to ${VERSION}" \
-            --body "Automated bump from aka-rider/vuho's release.yml (tag v${VERSION}). sha256=${SHA256}" \
-            --head "$BRANCH" --base main
+          gh api repos/aka-rider/homebrew-tap/dispatches \
+            -f event_type=vuho-release \
+            -f "client_payload[version]=${VERSION}"
+          echo "Dispatched vuho-release (version=${VERSION}) to aka-rider/homebrew-tap."
+          {
+            echo "### Homebrew cask"
+            echo ""
+            echo "Dispatched \`vuho-release\` (version \`${VERSION}\`) to aka-rider/homebrew-tap."
+            echo "Watch: https://github.com/aka-rider/homebrew-tap/actions/workflows/release-vuho.yml"
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Homebrew cask update — manual step required (no HOMEBREW_TAP_TOKEN configured)
         if: ${{ env.HOMEBREW_TAP_TOKEN == '' }}
         env:
           VERSION: ${{ steps.version.outputs.version }}
-          SHA256: ${{ steps.sha256.outputs.sha256 }}
         run: |
           {
             echo "### Manual Homebrew cask update required"
             echo ""
-            echo "\`HOMEBREW_TAP_TOKEN\` is not configured on this repo, so the tap's"
-            echo "\`Casks/vuho.rb\` was NOT updated automatically. In"
-            echo "\`aka-rider/homebrew-tap\`, set BOTH fields together in the same commit:"
+            echo "\`HOMEBREW_TAP_TOKEN\` is not configured on this repo, so the tap was"
+            echo "never told about this release. Run the bump by hand:"
             echo ""
-            echo "\`\`\`ruby"
-            echo "version \"${VERSION}\""
-            echo "sha256 \"${SHA256}\""
+            echo "\`\`\`sh"
+            echo "gh workflow run release-vuho.yml --repo aka-rider/homebrew-tap -f vuho_version=v${VERSION}"
             echo "\`\`\`"
             echo ""
-            echo "Updating one without the other is exactly the drift this automation"
-            echo "exists to prevent — the tap's own CI"
-            echo "(\"Verify declared sha256 matches release asset\" in ci.yml) will catch"
-            echo "a mismatch, but don't rely on that as your review step."
+            echo "That workflow computes the sha256 from the published asset itself, so"
+            echo "there is no hash to copy by hand and no way to update one field"
+            echo "without the other."
           } >> "$GITHUB_STEP_SUMMARY"
-          echo "::warning::HOMEBREW_TAP_TOKEN not set — update aka-rider/homebrew-tap's Casks/vuho.rb (version=${VERSION}, sha256=${SHA256}) manually. See job summary."
+          echo "::warning::HOMEBREW_TAP_TOKEN not set — run: gh workflow run release-vuho.yml --repo aka-rider/homebrew-tap -f vuho_version=v${VERSION}"
