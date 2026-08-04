@@ -17,6 +17,8 @@ use objc2::MainThreadMarker;
 use objc2_app_kit::{NSAlert, NSApplication, NSWorkspace};
 use objc2_foundation::{NSString, NSURL};
 
+use crate::main_queue;
+
 /// `NSModalResponse` for the first (default) alert button.
 const NS_ALERT_FIRST_BUTTON: isize = 1000;
 
@@ -57,11 +59,18 @@ pub(crate) const INPUT_MONITORING_SETTINGS_URL: &str =
 /// a dialog at all if not already trusted, so this never stacks a second
 /// dialog on top of it.
 ///
+/// Self-deferring ([`main_queue::defer`]): `AXIsProcessTrustedWithOptions`'s
+/// dialog pumps a nested run loop, so a caller can never get the deferral
+/// wrong by forgetting it — see `main_queue`'s module doc for the hazard this
+/// guards against.
+///
 /// Only called from `wire_production` (production-only wiring) — cfg-gated so
 /// it isn't dead code under `--features demo`, which has no hotkey to prompt for.
 #[cfg(not(feature = "demo"))]
 pub(crate) fn prompt_accessibility() {
-    let _ = vuho_os_integration::prompt_accessibility_trust();
+    main_queue::defer(|| {
+        let _ = vuho_os_integration::prompt_accessibility_trust();
+    });
 }
 
 /// Alert the user that microphone access is required, with a settings shortcut.
@@ -69,38 +78,29 @@ pub(crate) fn prompt_accessibility() {
 /// Called reactively when the pipeline reports a microphone-permission error
 /// (see the typed `ErrorKind::MicPermissionDenied` path).
 ///
-/// # Contract: must be called from a deferred/async context, never
-/// synchronously inside the top-level `Application::run` closure
-///
-/// This function's `NSAlert::runModal()` pumps a nested run loop, exactly
-/// like `prompt_accessibility`'s underlying dialog — see
-/// `wiring::start_hotkey`'s doc comment for the full hazard: while
-/// `Application::run`'s closure is still on the stack, the app context is
-/// borrowed for its entire duration, and anything that re-enters GPUI from
-/// within a nested modal run loop during that window (e.g. the overlay's
-/// own animation timer) hits an already-borrowed panic. Its current caller,
-/// `event_loop::apply_events`, is safe: it only ever runs from inside
-/// `spawn_event_drain`'s `cx.spawn`'d task, which GPUI's
-/// `ForegroundExecutor` dispatches to run *after* the top-level closure has
-/// already returned — never call this function any earlier in that
-/// closure's own call stack.
+/// Self-deferring ([`main_queue::defer`]): `NSAlert::runModal()` pumps a
+/// nested run loop, exactly like `prompt_accessibility`'s underlying
+/// dialog — a caller can never get the deferral wrong by forgetting it, see
+/// `main_queue`'s module doc for the hazard this guards against.
 pub(crate) fn show_microphone_denied() {
-    let Some(mtm) = MainThreadMarker::new() else {
-        return;
-    };
-    activate_app(mtm);
+    main_queue::defer(|| {
+        let Some(mtm) = MainThreadMarker::new() else {
+            return;
+        };
+        activate_app(mtm);
 
-    let alert = NSAlert::new(mtm);
-    alert.setMessageText(&NSString::from_str("Vuho needs Microphone access"));
-    alert.setInformativeText(&NSString::from_str(
-        "Enable Vuho under System Settings → Privacy & Security → Microphone to dictate.",
-    ));
-    alert.addButtonWithTitle(&NSString::from_str("Open Settings"));
-    alert.addButtonWithTitle(&NSString::from_str("Later"));
+        let alert = NSAlert::new(mtm);
+        alert.setMessageText(&NSString::from_str("Vuho needs Microphone access"));
+        alert.setInformativeText(&NSString::from_str(
+            "Enable Vuho under System Settings → Privacy & Security → Microphone to dictate.",
+        ));
+        alert.addButtonWithTitle(&NSString::from_str("Open Settings"));
+        alert.addButtonWithTitle(&NSString::from_str("Later"));
 
-    if alert.runModal() == NS_ALERT_FIRST_BUTTON {
-        open_url(MICROPHONE_SETTINGS_URL);
-    }
+        if alert.runModal() == NS_ALERT_FIRST_BUTTON {
+            open_url(MICROPHONE_SETTINGS_URL);
+        }
+    });
 }
 
 /// Bring the accessory app forward so a modal alert appears frontmost.

@@ -13,13 +13,50 @@
 //! `NSScreen::screens`/`mainScreen`/`frame` (G2) rather than raw
 //! `msg_send!` because the array/`Option` return shapes are awkward to
 //! thread through untyped `AnyObject` pointers.
+//!
+//! **Deferred surgery (CONSTITUTION rule 33):** `setFrame:display:YES`,
+//! `orderFront:`, `orderOut:`, `makeKeyAndOrderFront:`, and
+//! `setIgnoresMouseEvents:` all deliver synchronous `AppKit` delegate
+//! callbacks back into gpui (`windowDidMove:`, the content view's
+//! `setFrameSize:`) — sending them from inside a live gpui `App` borrow
+//! re-enters gpui and corrupts that borrow. `set_frame`, `set_click_through`,
+//! `order_front`, `order_out`, `make_key_and_order_front`, and
+//! `resign_key_keep_front` therefore no longer take `&mut Window` at all:
+//! they enqueue their `msg_send!` through [`main_queue::defer`], reading the
+//! `NSWindow` handle from the module's `WINDOW` `thread_local` inside the
+//! deferred body rather than from the caller's `Window` — the same
+//! borrow-discipline rule `status_bar.rs`'s module doc documents: clone the
+//! handle out of any borrow before sending an `AppKit` message.
+//! `apply_window_config`'s own static one-time config (level, collection
+//! behavior, `setHidesOnDeactivate:`, the initial `setIgnoresMouseEvents:`)
+//! stays inline — it runs once at window creation, on a window that is still
+//! hidden and has never been shown, so it triggers no delegate callback gpui
+//! could re-enter through.
+
+use std::cell::RefCell;
 
 use gpui::{Bounds, Pixels, Window};
 use objc2::ffi::{NSInteger, NSUInteger};
 use objc2::msg_send;
+use objc2::rc::Retained;
 use objc2::runtime::AnyObject;
 use objc2_foundation::NSRect;
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+
+use crate::main_queue;
+
+thread_local! {
+    /// Main-thread-only storage for the panel's `NSWindow`, retained once at
+    /// [`apply_window_config`] time — `main.rs` creates exactly one panel
+    /// window per process. Every surgery function below (`set_frame`,
+    /// `set_click_through`, `order_front`, `order_out`,
+    /// `make_key_and_order_front`, `resign_key_keep_front`) reads this from
+    /// inside its `main_queue::defer`red body instead of threading a
+    /// `&mut Window` all the way from its own caller, following this
+    /// module's borrow-discipline rule (below): clone the handle out of the
+    /// borrow before sending any `AppKit` message.
+    static WINDOW: RefCell<Option<Retained<AnyObject>>> = const { RefCell::new(None) };
+}
 
 /// Window level: above menu bar and fullscreen apps.
 ///
@@ -40,6 +77,13 @@ pub(crate) fn apply_window_config(window: &mut Window) {
         log::warn!("window_config: could not obtain NSWindow handle");
         return;
     };
+
+    // SAFETY: `ns_window` is a valid, live `NSWindow*` just obtained from
+    // `get_ns_window` (a borrowed/unretained pointer per that function's own
+    // doc comment) — retaining it here is what lets `WINDOW` hold it safely
+    // for the process lifetime, past this function's own call stack.
+    let retained = unsafe { Retained::retain(ns_window) };
+    WINDOW.with(|w| *w.borrow_mut() = retained);
 
     // Click-through (ADR-006 criterion 2).
     unsafe {
@@ -69,24 +113,34 @@ pub(crate) fn apply_window_config(window: &mut Window) {
     }
 }
 
+/// Run `f` on the next main-queue turn ([`main_queue::defer`]) with a
+/// reference to the panel's retained `NSWindow` — a no-op (logged) if
+/// [`apply_window_config`] hasn't installed [`WINDOW`] yet.
+fn defer_on_window(f: impl FnOnce(&AnyObject) + Send + 'static) {
+    main_queue::defer(move || {
+        WINDOW.with(|w| {
+            let borrow = w.borrow();
+            let Some(ns_window) = borrow.as_ref() else {
+                log::warn!("window_config: NSWindow handle not yet installed");
+                return;
+            };
+            f(ns_window);
+        });
+    });
+}
+
 /// Show the overlay window (objc2 `orderFront:`).
-pub(crate) fn order_front(window: &mut Window) {
-    let Some(ns_window) = get_ns_window(window) else {
-        return;
-    };
-    unsafe {
+pub(crate) fn order_front() {
+    defer_on_window(|ns_window| unsafe {
         let _: () = msg_send![ns_window, orderFront: std::ptr::null_mut::<AnyObject>()];
-    }
+    });
 }
 
 /// Hide the overlay window (objc2 `orderOut:`).
-pub(crate) fn order_out(window: &mut Window) {
-    let Some(ns_window) = get_ns_window(window) else {
-        return;
-    };
-    unsafe {
+pub(crate) fn order_out() {
+    defer_on_window(|ns_window| unsafe {
         let _: () = msg_send![ns_window, orderOut: std::ptr::null_mut::<AnyObject>()];
-    }
+    });
 }
 
 /// Toggle click-through (objc2 `setIgnoresMouseEvents:`).
@@ -96,13 +150,10 @@ pub(crate) fn order_out(window: &mut Window) {
 /// flips it off for the Full presentation (which accepts clicks, e.g. the
 /// tab strip and Settings controls) and back on for the Hud presentation
 /// (click-through, like the old overlay).
-pub(crate) fn set_click_through(window: &mut Window, on: bool) {
-    let Some(ns_window) = get_ns_window(window) else {
-        return;
-    };
-    unsafe {
+pub(crate) fn set_click_through(on: bool) {
+    defer_on_window(move |ns_window| unsafe {
         let _: () = msg_send![ns_window, setIgnoresMouseEvents: on];
-    }
+    });
 }
 
 /// Synchronously make the window key and order it to the front (objc2
@@ -119,13 +170,10 @@ pub(crate) fn set_click_through(window: &mut Window, on: bool) {
 /// `panel.rs`'s presentation-surgery chokepoint calls this for the Full
 /// presentation only — the Hud presentation stays non-key (click-through,
 /// no keyboard focus stolen from whatever app the user is dictating into).
-pub(crate) fn make_key_and_order_front(window: &mut Window) {
-    let Some(ns_window) = get_ns_window(window) else {
-        return;
-    };
-    unsafe {
+pub(crate) fn make_key_and_order_front() {
+    defer_on_window(|ns_window| unsafe {
         let _: () = msg_send![ns_window, makeKeyAndOrderFront: std::ptr::null_mut::<AnyObject>()];
-    }
+    });
 }
 
 /// Move and resize the window in one atomic `setFrame:display:` call.
@@ -157,10 +205,7 @@ pub(crate) fn make_key_and_order_front(window: &mut Window) {
 /// against the wrong screen on a multi-monitor setup silently reinterprets
 /// `bounds` in that screen's coordinate space, placing the window offset or
 /// off-screen.
-pub(crate) fn set_frame(window: &mut Window, bounds: Bounds<Pixels>) {
-    let Some(ns_window) = get_ns_window(window) else {
-        return;
-    };
+pub(crate) fn set_frame(bounds: Bounds<Pixels>) {
     let Some(mtm) = objc2::MainThreadMarker::new() else {
         log::warn!("window_config: set_frame called off the main thread");
         return;
@@ -183,13 +228,21 @@ pub(crate) fn set_frame(window: &mut Window, bounds: Bounds<Pixels>) {
         screen_frame.origin.y,
         screen_frame.size.height,
     );
-    let frame = NSRect::new(
-        objc2_foundation::NSPoint::new(cocoa_x, cocoa_y),
-        objc2_foundation::NSSize::new(bounds.size.width.to_f64(), bounds.size.height.to_f64()),
-    );
-    unsafe {
+    let width = bounds.size.width.to_f64();
+    let height = bounds.size.height.to_f64();
+    // Only the final `setFrame:display:` send is deferred — the NSScreen
+    // lookup and coordinate flip above are pure/read-only (no delegate
+    // callback risk) and need the caller's own thread anyway
+    // (`MainThreadMarker`). `NSRect` itself doesn't cross the closure
+    // boundary (its fields aren't `Send`); its `f64` components do, and the
+    // rect is reconstructed from them inside the deferred body.
+    defer_on_window(move |ns_window| unsafe {
+        let frame = NSRect::new(
+            objc2_foundation::NSPoint::new(cocoa_x, cocoa_y),
+            objc2_foundation::NSSize::new(width, height),
+        );
         let _: () = msg_send![ns_window, setFrame: frame, display: true];
-    }
+    });
 }
 
 /// Make a currently-key window give up key status while staying visible
@@ -205,17 +258,19 @@ pub(crate) fn set_frame(window: &mut Window, bounds: Bounds<Pixels>) {
 /// `inject_text`'s synthesized ⌘V is delivered to whatever window is key at
 /// the moment it fires — leaving the panel key would send it into Vuho's
 /// own window instead of the target app.
-pub(crate) fn resign_key_keep_front(window: &mut Window) {
-    let Some(ns_window) = get_ns_window(window) else {
-        return;
-    };
-    unsafe {
+///
+/// The `isKeyWindow` read happens inside the deferred body, at apply time —
+/// not a main-queue turn early — which is strictly more correct than reading
+/// it eagerly at the call site and letting it go stale before the deferred
+/// `orderOut:`/`orderFront:` pair actually runs.
+pub(crate) fn resign_key_keep_front() {
+    defer_on_window(|ns_window| unsafe {
         let is_key: bool = msg_send![ns_window, isKeyWindow];
         if is_key {
             let _: () = msg_send![ns_window, orderOut: std::ptr::null_mut::<AnyObject>()];
             let _: () = msg_send![ns_window, orderFront: std::ptr::null_mut::<AnyObject>()];
         }
-    }
+    });
 }
 
 /// Pure coordinate flip for [`set_frame`]: GPUI top-left-relative-to-screen

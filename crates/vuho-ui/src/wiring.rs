@@ -746,15 +746,9 @@ fn spawn_download_thread() -> (Receiver<DownloadOutcome>, Receiver<ModelStatus>)
 /// On failure (Accessibility not granted), prompts for the grant; the menu
 /// bar still works and the hotkey binds after a relaunch (or after the user
 /// grants access and re-selects a preset in the panel's Settings tab).
-///
-/// The prompt is deferred via `cx.spawn` rather than called inline: this
-/// whole function runs synchronously inside GPUI's top-level `Application::run`
-/// closure, which holds the app context borrowed for its entire duration.
-/// `prompt_accessibility`'s `NSAlert::runModal()` pumps a nested run loop, and
-/// the overlay's animation timer (already ticking) would try to re-borrow the
-/// app context from within that nested loop and hit an already-borrowed panic.
-/// Deferring lets `Application::run`'s closure return and release its borrow
-/// first, so the nested modal loop runs with no outer borrow to conflict with.
+/// `permissions::prompt_accessibility` is self-deferring, so calling it here
+/// — synchronously, inside GPUI's top-level `Application::run` closure — is
+/// safe without this function needing its own deferral wrapper.
 fn start_hotkey(
     cmd_tx: &crossbeam_channel::Sender<vuho_domain::DictationCommand>,
     settings: &vuho_settings::SettingsStore,
@@ -767,10 +761,7 @@ fn start_hotkey(
     log::info!("hotkey: starting with config {config:?}");
     let new_hotkey_state = if hotkey.start(cmd_tx, config).is_err() {
         log::warn!("hotkey: start failed — Accessibility not granted");
-        cx.spawn(move |_cx: &mut gpui::AsyncApp| async move {
-            permissions::prompt_accessibility();
-        })
-        .detach();
+        permissions::prompt_accessibility();
         HotkeyState::Failed(preset)
     } else {
         HotkeyState::Active(preset)

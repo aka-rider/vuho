@@ -313,19 +313,19 @@ fn full_bounds(cx: &App) -> Bounds<Pixels> {
 /// `order_front`s the window instead of stealing key status — and with it,
 /// the destination of `inject_text`'s synthesized ⌘V — from the app the
 /// user is dictating into.
-fn apply_presentation(window: &mut Window, cx: &App, presentation: Presentation, grab_key: bool) {
+fn apply_presentation(cx: &App, presentation: Presentation, grab_key: bool) {
     match presentation {
         Presentation::Hud => {
-            window_config::set_frame(window, hud_bounds(cx));
-            window_config::set_click_through(window, true);
+            window_config::set_frame(hud_bounds(cx));
+            window_config::set_click_through(true);
         }
         Presentation::Full => {
-            window_config::set_frame(window, full_bounds(cx));
-            window_config::set_click_through(window, false);
+            window_config::set_frame(full_bounds(cx));
+            window_config::set_click_through(false);
             if grab_key {
-                window_config::make_key_and_order_front(window);
+                window_config::make_key_and_order_front();
             } else {
-                window_config::order_front(window);
+                window_config::order_front();
             }
         }
     }
@@ -343,11 +343,11 @@ fn apply_presentation(window: &mut Window, cx: &App, presentation: Presentation,
 #[cfg(not(feature = "demo"))]
 pub(crate) fn show_full(panel: WindowHandle<PanelRoot>, tab: Tab, cx: &mut App) {
     let needs_poll = panel
-        .update(cx, |root, window, cx| {
+        .update(cx, |root, _window, cx| {
             root.presentation = Presentation::Full;
             root.active_tab = tab;
             let grab_key = !root.overlay.read(cx).is_recording();
-            apply_presentation(window, cx, Presentation::Full, grab_key);
+            apply_presentation(cx, Presentation::Full, grab_key);
             root.shown = true;
             if tab == Tab::Settings {
                 root.settings.update(cx, SettingsTab::refresh_devices);
@@ -401,13 +401,13 @@ pub(crate) fn open_from_tray(panel: WindowHandle<PanelRoot>, cx: &mut App) {
 /// the user's attention, arriving after the panel was already dismissed).
 /// No-op while the panel is already shown, in either presentation — never
 /// re-frames or steals focus from a window already on screen.
-fn show_hud_if_hidden(root: &mut PanelRoot, window: &mut Window, cx: &App) {
+fn show_hud_if_hidden(root: &mut PanelRoot, cx: &App) {
     if root.shown {
         return;
     }
     root.presentation = Presentation::Hud;
-    apply_presentation(window, cx, Presentation::Hud, false);
-    window_config::order_front(window);
+    apply_presentation(cx, Presentation::Hud, false);
+    window_config::order_front();
     root.shown = true;
 }
 
@@ -423,12 +423,12 @@ fn show_hud_if_hidden(root: &mut PanelRoot, window: &mut Window, cx: &App) {
 /// key status would send `inject_text`'s synthesized ⌘V into itself
 /// instead.
 pub(crate) fn on_session_started(panel: WindowHandle<PanelRoot>, cx: &mut App) {
-    let _ = panel.update(cx, |root, window, cx| {
+    let _ = panel.update(cx, |root, _window, cx| {
         let was_shown = root.shown;
-        show_hud_if_hidden(root, window, cx);
+        show_hud_if_hidden(root, cx);
         if was_shown && root.presentation == Presentation::Full {
             root.active_tab = Tab::Overlay;
-            window_config::resign_key_keep_front(window);
+            window_config::resign_key_keep_front();
         }
         cx.notify();
     });
@@ -443,8 +443,8 @@ pub(crate) fn on_session_started(panel: WindowHandle<PanelRoot>, cx: &mut App) {
 /// the panel is already shown, in either presentation.
 #[cfg(not(feature = "demo"))]
 pub(crate) fn show_hud_for_outcome(panel: WindowHandle<PanelRoot>, cx: &mut App) {
-    let _ = panel.update(cx, |root, window, cx| {
-        show_hud_if_hidden(root, window, cx);
+    let _ = panel.update(cx, |root, _window, cx| {
+        show_hud_if_hidden(root, cx);
         cx.notify();
     });
 }
@@ -465,11 +465,11 @@ pub(crate) fn is_shown(panel: WindowHandle<PanelRoot>, cx: &mut App) -> bool {
 /// the Full presentation is open (nothing about a finished dictation session
 /// should close a window the user opened deliberately).
 pub(crate) fn hide_if_hud(panel: WindowHandle<PanelRoot>, cx: &mut App) {
-    let _ = panel.update(cx, |root, window, cx| {
+    let _ = panel.update(cx, |root, _window, cx| {
         if root.presentation != Presentation::Hud {
             return;
         }
-        window_config::order_out(window);
+        window_config::order_out();
         root.shown = false;
         // permissions_poll is deliberately left untouched here (F4, amended
         // G1): reaching this point already means `presentation == Hud`, and
@@ -494,8 +494,8 @@ pub(crate) fn hide_if_hud(panel: WindowHandle<PanelRoot>, cx: &mut App) {
 /// open Full presentation alone).
 #[cfg(not(feature = "demo"))]
 pub(crate) fn hide(panel: WindowHandle<PanelRoot>, cx: &mut App) {
-    let _ = panel.update(cx, |root, window, cx| {
-        hide_root(root, window, cx);
+    let _ = panel.update(cx, |root, _window, cx| {
+        hide_root(root, cx);
         cx.notify();
     });
 }
@@ -521,8 +521,8 @@ pub(crate) fn hide(panel: WindowHandle<PanelRoot>, cx: &mut App) {
 /// this used before G6) because closing the Settings dropdowns goes through
 /// `Entity::update`, which requires mutable access.
 #[cfg(not(feature = "demo"))]
-fn hide_root(root: &mut PanelRoot, window: &mut Window, cx: &mut App) {
-    window_config::order_out(window);
+fn hide_root(root: &mut PanelRoot, cx: &mut App) {
+    window_config::order_out();
     root.shown = false;
     if root.status.read(cx).permissions_missing.is_empty() {
         root.permissions_poll = None;
@@ -530,7 +530,7 @@ fn hide_root(root: &mut PanelRoot, window: &mut Window, cx: &mut App) {
     root.settings
         .update(cx, |settings, _cx| settings.close_dropdowns());
     root.presentation = Presentation::Hud;
-    apply_presentation(window, cx, Presentation::Hud, false);
+    apply_presentation(cx, Presentation::Hud, false);
 }
 
 // ── Permissions poll ─────────────────────────────────────────────────────
@@ -692,8 +692,8 @@ impl PanelRoot {
             .text_color(theme::TEXT_TERTIARY)
             .hover(|style| style.bg(theme::FILL_HOVER).text_color(theme::TEXT_PRIMARY))
             .child("✕")
-            .on_click(cx.listener(|this, _event, window, cx| {
-                hide_root(this, window, cx);
+            .on_click(cx.listener(|this, _event, _window, cx| {
+                hide_root(this, cx);
                 cx.notify();
             }))
     }

@@ -139,11 +139,12 @@ impl SettingsTab {
 
     /// Persist the chosen hotkey preset, close the dropdown, and — when a
     /// live listener was injected (production mode) — rebind it: `stop()`
-    /// then `start()` with the new config, deferring the Accessibility prompt via
-    /// `cx.spawn` on failure (same nested-run-loop hazard documented on
-    /// `wiring::start_hotkey`). Either way, the resulting `HotkeyState` is
-    /// written back into the shared `StatusModel` so the tray/panel and this
-    /// tab agree on whether the hotkey is actually listening.
+    /// then `start()` with the new config, prompting for Accessibility on
+    /// failure (`permissions::prompt_accessibility` is self-deferring, so no
+    /// deferral wrapper is needed here). Either way, the resulting
+    /// `HotkeyState` is written back into the shared `StatusModel` so the
+    /// tray/panel and this tab agree on whether the hotkey is actually
+    /// listening.
     fn select_hotkey(&mut self, preset: HotkeySetting, cx: &mut Context<Self>) {
         self.hotkey_open = false;
 
@@ -175,10 +176,7 @@ impl SettingsTab {
         });
 
         if start_result.is_err() {
-            cx.spawn(|_this, _cx: &mut gpui::AsyncApp| async move {
-                permissions::prompt_accessibility();
-            })
-            .detach();
+            permissions::prompt_accessibility();
         }
         cx.notify();
     }

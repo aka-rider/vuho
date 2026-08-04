@@ -19,6 +19,7 @@
 //! compiled with `--features demo`) owns the synthetic event generator.
 //! `main()` itself creates the panel and picks one of the two paths.
 
+mod main_queue;
 mod overlay;
 mod panel;
 mod permissions;

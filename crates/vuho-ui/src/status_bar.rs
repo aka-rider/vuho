@@ -54,6 +54,7 @@ use vuho_domain::DictationCommand;
 
 use crate::app_state::UiCommand;
 use crate::app_status::CompositeStatus;
+use crate::main_queue;
 
 // ── TrayIcon (the one data-driven icon mapping — CONSTITUTION rule 26) ────
 
@@ -336,31 +337,37 @@ pub(crate) fn install(
     sync(initial);
 }
 
-/// Pop the production menu synchronously via the modern status-item trick:
-/// attach it, simulate a click to run `AppKit`'s own menu-tracking loop, then
-/// detach — so the button can stay click-split (a plain click reaches
+/// Pop the production menu via the modern status-item trick: attach it,
+/// simulate a click to run `AppKit`'s own menu-tracking loop, then detach —
+/// so the button can stay click-split (a plain click reaches
 /// `statusItemClicked:` instead of a permanently attached menu intercepting
 /// every click first).
 ///
-/// Copies the `Retained` handles it needs out of [`STATE`]'s borrow before
-/// calling into `AppKit` (this module's borrow-discipline rule — see the
-/// module doc comment): `performClick:` pumps a nested run loop, and an
-/// entity observer re-entering [`sync`] from inside it would deadlock the
-/// `RefCell` if this function were still holding the borrow.
+/// The whole `setMenu(Some)`/`performClick:`/`setMenu(None)` sequence runs
+/// inside a single [`main_queue::defer`]red closure (CONSTITUTION rule 33):
+/// `performClick:` pumps a nested run loop, so it must never run from inside
+/// a live gpui `App` borrow — deferring lets `statusItemClicked:`'s own
+/// call stack unwind first, so the nested loop starts from a guaranteed-clean
+/// stack rather than from whichever stack happened to call this. Re-derives
+/// the `Retained` handles it needs from [`STATE`] *inside* the deferred
+/// closure (this module's borrow-discipline rule — see the module doc
+/// comment) rather than capturing them, since `Retained<T>` isn't `Send`.
 fn pop_menu() {
-    let Some((item, menu, button)) = STATE.with(|s| {
-        s.borrow()
-            .as_ref()
-            .map(|state| (state.item.clone(), state.menu.clone(), state.button.clone()))
-    }) else {
-        return;
-    };
-    item.setMenu(Some(&menu));
-    // SAFETY: `performClick:` simulates a user click on `button`; `None`
-    // matches Cocoa's convention for a programmatic click with no
-    // originating control.
-    unsafe { button.performClick(None) };
-    item.setMenu(None);
+    main_queue::defer(|| {
+        let Some((item, menu, button)) = STATE.with(|s| {
+            s.borrow()
+                .as_ref()
+                .map(|state| (state.item.clone(), state.menu.clone(), state.button.clone()))
+        }) else {
+            return;
+        };
+        item.setMenu(Some(&menu));
+        // SAFETY: `performClick:` simulates a user click on `button`; `None`
+        // matches Cocoa's convention for a programmatic click with no
+        // originating control.
+        unsafe { button.performClick(None) };
+        item.setMenu(None);
+    });
 }
 
 /// Set the status-item button's initial icon — the waveform icon is how the
