@@ -66,14 +66,14 @@ pub(crate) struct StatusModel {
     /// `main.rs`'s `run_gate_blocked` one-time gate-path seed (writes
     /// `readiness::missing_permissions()` inline — it runs before the panel
     /// exists, so it can't call the shared helper below), and
-    /// `crate::panel`'s `show_full` (a synchronous seed on every Full-
-    /// presentation open, through the private `refresh_permissions_missing`
-    /// helper) and `start_permissions_poll` (that same helper, on every
-    /// tick) — the latter two are the same derivation by construction, so
-    /// they can never disagree in shape with each other, and all three read
-    /// the identical `readiness::missing_permissions()` call. The seeds
-    /// exist only so a Settings-tab-showing first paint — the tray's, via
-    /// `run_gate_blocked` (`main.rs`), or the panel's own, via `show_full`
+    /// `crate::panel`'s `show` (a synchronous seed on every explicit panel
+    /// open, through the private `refresh_permissions_missing` helper) and
+    /// `start_permissions_poll` (that same helper, on every tick) — the
+    /// latter two are the same derivation by construction, so they can
+    /// never disagree in shape with each other, and all three read the
+    /// identical `readiness::missing_permissions()` call. The seeds exist
+    /// only so a Settings-tab-showing first paint — the tray's, via
+    /// `run_gate_blocked` (`main.rs`), or the panel's own, via `show`
     /// (G7) — never renders one visibly wrong frame from a field the async
     /// poll hasn't had a chance to write to yet (`launch_blocked` true with
     /// an empty `permissions_missing` derives

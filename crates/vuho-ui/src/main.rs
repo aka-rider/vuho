@@ -1,23 +1,22 @@
-//! Vuho: a single, always-on-top, non-activating panel (`panel::PanelRoot`)
-//! with two presentations — Hud (the dictation overlay: bottom-center,
-//! click-through, semi-transparent) and Full (a centered, opaque, tabbed
-//! Overlay/Settings window). See ARCHITECTURE.md ADR-021 for the design —
-//! this replaces the former three-window design (a hidden overlay popup, a
-//! lazily-opened settings window, and a separate permission/model readiness
-//! window).
+//! Vuho: a single, always-on-top, non-activating panel (`panel::PanelRoot`),
+//! bottom-center, always mouse-interactive but never keyboard-key (ADR-021).
+//! One tabbed presentation (Overlay / Settings) — the active tab, not the
+//! entry point, decides the window height. This replaces the former
+//! three-window design (a hidden overlay popup, a lazily-opened settings
+//! window, and a separate permission/model readiness window).
 //!
 //! --demo mode: `cargo run -p vuho-ui --features demo` simulates dictation
 //! events with synthetic transcript updates, no mic or engine required —
-//! the panel never leaves the Hud presentation in demo mode (no
-//! `StatusModel`/`SettingsTab`/permissions to show a Full presentation of).
+//! the panel has no tab strip in demo mode (no `StatusModel`/`SettingsTab`/
+//! permissions to show a Settings tab of).
 //!
 //! Module map (WP10 split of a former 808+-line `main.rs`, WP6 rehaul):
-//! [`panel`] owns the window itself and its two presentations; [`event_loop`]
-//! owns the poll-and-apply drains + hide/stale-detection logic shared by
-//! both production and demo; [`wiring`] owns production-only startup
-//! (dictation session, hotkey, provisioning, status-bar item); `demo` (only
-//! compiled with `--features demo`) owns the synthetic event generator.
-//! `main()` itself creates the panel and picks one of the two paths.
+//! [`panel`] owns the window itself and its geometry; [`event_loop`] owns
+//! the poll-and-apply drains + hide/stale-detection logic shared by both
+//! production and demo; [`wiring`] owns production-only startup (dictation
+//! session, hotkey, provisioning, status-bar item); `demo` (only compiled
+//! with `--features demo`) owns the synthetic event generator. `main()`
+//! itself creates the panel and picks one of the two paths.
 
 mod main_queue;
 mod overlay;
@@ -32,8 +31,8 @@ mod app_state;
 #[cfg(not(feature = "demo"))]
 mod app_status;
 // The `Assets` `AssetSource` (icons/*.svg) is always compiled — the panel's
-// tab strip needs the icons in both builds (demo renders the Hud only, but
-// still creates the same GPUI `Application::new().with_assets(..)`).
+// tab strip (production only) needs the icons, and the demo build still
+// creates the same GPUI `Application::new().with_assets(..)`.
 mod assets;
 #[cfg(not(feature = "demo"))]
 mod controls;
@@ -106,14 +105,14 @@ fn main() {
 /// **not** the primary quit path, despite older documentation here having
 /// claimed so: `cx.on_action` dispatches through GPUI's own key-window
 /// responder chain, and this app is an accessory app whose panel is created
-/// with `focus: false` and stays non-key while presenting the Hud — so this
-/// binding can only ever fire while the panel happens to be key (the Full
-/// presentation, which does take key status) or some other GPUI window is.
-/// The reliable, always-available quit path — reachable with no window
-/// focused at all, which is the app's normal steady state — is the
-/// status-bar menu's "Quit Vuho" item (`status_bar.rs`'s `quit:` action).
-/// This binding exists purely as a keyboard-only convenience for whenever a
-/// window *does* happen to be focused.
+/// with `focus: false` and, per ADR-021's `setBecomesKeyOnlyIfNeeded`, never
+/// takes key status from ordinary clicks — so this binding can only ever
+/// fire while some other GPUI window happens to be key. The reliable,
+/// always-available quit path — reachable with no window focused at all,
+/// which is the app's normal steady state — is the status-bar menu's "Quit
+/// Vuho" item (`status_bar.rs`'s `quit:` action). This binding exists
+/// purely as a keyboard-only convenience for whenever a window *does*
+/// happen to be focused.
 fn bind_quit_hotkey(cx: &mut App) {
     cx.bind_keys([gpui::KeyBinding::new("cmd-alt-shift-q", Quit, None)]);
     cx.on_action(|_: &Quit, _cx: &mut App| {
@@ -237,7 +236,7 @@ fn run_gate_blocked(
     status.update(cx, |model, cx| {
         model.launch_blocked = true;
         // Seeded with the same derivation (`readiness::missing_permissions()`)
-        // `panel::start_permissions_poll`/`panel::show_full` (G7) both write
+        // `panel::start_permissions_poll`/`panel::show` (G7) both write
         // through — see `StatusModel::permissions_missing`'s doc comment for
         // the full list of writer sites and why this one synchronous write
         // coexists with them instead of leaving the field to the async ones
@@ -245,14 +244,14 @@ fn run_gate_blocked(
         // `status_bar::install`) would see an empty `permissions_missing`
         // and derive `RelaunchRequired` instead of `PermissionsMissing` for
         // one visible frame — `status_bar::install` runs *before*
-        // `panel::show_full` further down (whose own G7 seed would
-        // otherwise be the first write), and neither it nor a `cx.spawn`'d
-        // poll task runs synchronously inline at this point.
+        // `panel::show` further down (whose own G7 seed would otherwise be
+        // the first write), and neither it nor a `cx.spawn`'d poll task
+        // runs synchronously inline at this point.
         model.permissions_missing = missing;
         cx.notify();
     });
     status_bar::install(None, ui_tx, &status.read(cx).composite());
-    panel::show_full(panel, panel::Tab::Settings, cx);
+    panel::show(panel, panel::Tab::Settings, cx);
     event_loop::spawn_ui_drain(panel, ui_rx, status.clone(), cx);
     bind_select_settings_tab(cx, panel);
     bind_close_panel(cx, panel);
@@ -271,21 +270,23 @@ fn bind_select_settings_tab(cx: &mut App, panel: gpui::WindowHandle<panel::Panel
         None,
     )]);
     cx.on_action(move |_action: &actions::SelectSettingsTab, cx: &mut App| {
-        panel::show_full(panel, panel::Tab::Settings, cx);
+        panel::show(panel, panel::Tab::Settings, cx);
     });
 }
 
-/// Bind Esc to close the Full presentation (`panel::hide`, F1) — the
-/// keyboard-reachable dismiss path alongside the tab strip's own "✕"
-/// button. Bound on both the permissions-blocked and production paths
-/// (mirrors [`bind_select_settings_tab`] immediately above), so it works
-/// from the very first launch.
+/// Bind Esc to close the panel (`panel::hide`, F1) — the keyboard-reachable
+/// dismiss path alongside the tab strip's own "✕" button. Bound on both the
+/// permissions-blocked and production paths (mirrors
+/// [`bind_select_settings_tab`] immediately above), so it works from the
+/// very first launch.
 ///
-/// Bindings only fire while a GPUI window is key; the panel's Full
-/// presentation is the only window in this app that ever takes key status
-/// (`window_config::make_key_and_order_front`'s doc comment — the Hud stays
-/// non-key/click-through), so this can never intercept Esc from some other
-/// context.
+/// Known regression (ADR-021's `setBecomesKeyOnlyIfNeeded`,
+/// `window_config`'s module doc comment): bindings only fire while a GPUI
+/// window is key, and the panel now accepts clicks *without* ever becoming
+/// key — so this (and ⌘,) stop firing while the panel isn't key. The tab
+/// strip's "✕" button and the tray-icon toggle remain always available, so
+/// the panel is never unclosable; a global CGEventTap-based Esc is tracked
+/// in `TODO.md` if this turns out to be missed in practice.
 #[cfg(not(feature = "demo"))]
 fn bind_close_panel(cx: &mut App, panel: gpui::WindowHandle<panel::PanelRoot>) {
     cx.bind_keys([gpui::KeyBinding::new("escape", actions::ClosePanel, None)]);

@@ -8,7 +8,7 @@
 //! its two jobs are now both the panel's Settings tab
 //! ([`crate::settings_tab::SettingsTab`], which reads [`Permission::ALL`]/
 //! [`Access`]/[`missing_permissions`] directly) opened on launch via
-//! `crate::panel::show_full` when [`missing_permissions`] is non-empty. What
+//! `crate::panel::show` when [`missing_permissions`] is non-empty. What
 //! remains here is exactly the data model + pure helpers those two callers
 //! need — no window, no polling loop (`crate::panel`'s own
 //! `start_permissions_poll` replaces it), no `AppKit` window construction.

@@ -126,29 +126,6 @@ const WAVEFORM_IDLE_ALPHA: f32 = 0.12;
 /// the active state.
 const OPACITY_DIMMED: f32 = 0.4;
 
-// Panel chrome (Fix 3: moved out of the inline literals at the old
-// `overlay.rs:357-359` and into this named block, so the fade strip below
-// can reference the exact same background color). The hue/saturation/
-// lightness themselves live in `theme::PANEL_HUE`/`PANEL_SATURATION`/
-// `PANEL_LIGHTNESS` (F20) — shared with `panel.rs`'s `FULL_BG`; only the
-// opacity below is unique to the overlay's floating, semi-transparent panel.
-/// The Hud is a *semi-transparent* overlay (CLAUDE.md, step 1): at the
-/// previous 0.9 — over `theme::PANEL_LIGHTNESS`, a near-black — it read as a
-/// solid black box, hiding the desktop it floats over instead of hovering
-/// above it. 0.65 is the deliberate trade: the desktop stays faintly
-/// visible, and transcript text (`theme::TEXT_PRIMARY`, white at 0.95) keeps
-/// enough contrast to read over it. The Full presentation, which the user
-/// reads and clicks rather than glances at, stays near-opaque instead
-/// (`panel.rs`'s `FULL_BG`).
-const PANEL_BG_OPACITY: f32 = 0.65;
-const PANEL_BORDER_OPACITY: f32 = 0.1;
-/// Visual height of the Hud chrome — unchanged from the old overlay
-/// window's own height, so the dictation overlay looks and sits exactly as
-/// it always did. This is a *paint* dimension, not a window dimension: the
-/// panel window is taller (`panel.rs`'s `PANEL_HEIGHT`) and [`hud_chrome`]
-/// pins this band to its bottom edge.
-pub(crate) const HUD_CHROME_HEIGHT: Pixels = px(180.0);
-
 // Recording LED (Fix 5): warm red (`theme::ERROR_RED`), replacing the old
 // green/gray dot — the only saturated hue on the panel; every other element
 // (transcript, outcome text, chip, waveform) is neutral white/gray (see the
@@ -237,24 +214,6 @@ fn color_confirmed_text() -> Hsla {
 /// visually distinguishes text the engine hasn't confirmed yet.
 fn color_unconfirmed_text() -> Hsla {
     theme::TEXT_DISABLED
-}
-
-fn color_panel_bg() -> Hsla {
-    hsla(
-        theme::PANEL_HUE,
-        theme::PANEL_SATURATION,
-        theme::PANEL_LIGHTNESS,
-        PANEL_BG_OPACITY,
-    )
-}
-
-fn color_panel_border() -> Hsla {
-    hsla(
-        NEUTRAL_HUE,
-        NEUTRAL_SATURATION,
-        LIGHTNESS_WHITE,
-        PANEL_BORDER_OPACITY,
-    )
 }
 
 /// The outcome of a finished session, shown briefly in place of the transcript.
@@ -543,63 +502,13 @@ fn outcome_for_injection(injection: &InjectionOutcome) -> Outcome {
     }
 }
 
-/// Wrap `content` in the Hud presentation's floating, translucent panel
-/// chrome — background/border/rounded/shadow — pinned to the **bottom** of
-/// the panel window, [`HUD_CHROME_HEIGHT`] tall.
-///
-/// The window's frame is taller than this (`panel.rs`'s `PANEL_HEIGHT`,
-/// shared with the Full presentation so that switching between them never
-/// moves or resizes the window), so the Hud paints only the bottom band of
-/// it and leaves the rest transparent — which is why the anchoring lives
-/// here, inside the chrome both `Render` impls share, rather than in a
-/// wrapper each caller would have to remember. The unpainted region is never
-/// a stray hit-target: the Hud is click-through
-/// (`window_config::set_click_through(true)`), and the Full presentation
-/// paints the whole frame.
-///
-/// The one place this exact chrome is built (`panel.rs`'s Hud arm is its
-/// only caller); keeping it here rather than in `panel.rs` lets
-/// `color_panel_bg`/`color_panel_border` stay private to this module.
-/// `panel.rs`'s Full presentation builds its own (near-opaque) chrome
-/// instead — the Overlay tab embeds [`OverlayModel::render_content`]
-/// directly, with no second background of its own (see that method's doc
-/// comment).
-pub(crate) fn hud_chrome(content: AnyElement) -> AnyElement {
-    div()
-        .size_full()
-        .flex()
-        .flex_col()
-        .justify_end()
-        .child(
-            div()
-                // The positioned ancestor for anything absolutely placed
-                // within the chrome's own bounds.
-                .relative()
-                .w_full()
-                .h(HUD_CHROME_HEIGHT)
-                // Same hazard `render_transcript_viewport` documents: taffy's
-                // default `flex_shrink: 1.0` would squash a fixed height if
-                // the column ever ran short of space.
-                .flex_shrink_0()
-                .bg(color_panel_bg())
-                .border_1()
-                .border_color(color_panel_border())
-                .rounded(px(theme::RADIUS_PANEL))
-                .shadow_lg()
-                .child(content),
-        )
-        .into_any_element()
-}
-
 impl OverlayModel {
     /// The overlay's live content: the transcript/outcome line, the ambient
     /// waveform, and the recording LED — no outer chrome (background/
-    /// border/shadow) of its own. [`hud_chrome`] wraps this for the Hud
-    /// presentation; the Full presentation's Overlay tab (`panel.rs`) embeds
-    /// it directly inside the panel's own opaque chrome, so this must never
-    /// paint a second background — that's why the panel-sizing/background
-    /// styling that used to live in `impl Render for OverlayModel` stays out
-    /// of this method.
+    /// border/shadow) of its own. `panel.rs`'s `panel_chrome` supplies that
+    /// chrome for both builds — a demo build wraps this directly, and
+    /// production's Overlay tab embeds it inside the panel's own chrome —
+    /// so this must never paint a second background of its own.
     pub(crate) fn render_content(&self) -> AnyElement {
         let amps = &self.amplitudes;
         div()
@@ -631,28 +540,14 @@ impl OverlayModel {
 
     /// Whether the overlay currently has anything session-related to show —
     /// true while recording, or while a `SessionCompleted`/`Error` outcome
-    /// is still on screen. Drives the Full presentation's Overlay tab
-    /// (`panel.rs`): live session content when true, the idle status block
-    /// (driven by `StatusModel`) otherwise. `cfg`-gated: the Full
-    /// presentation — and therefore this method's only caller — does not
-    /// exist under `--features demo` (presentation never leaves Hud there).
+    /// is still on screen. Drives the panel's Overlay tab (`panel.rs`): live
+    /// session content when true, the idle status block (driven by
+    /// `StatusModel`) otherwise. `cfg`-gated: the tab strip — and therefore
+    /// this method's only caller — does not exist under `--features demo`.
     #[cfg(not(feature = "demo"))]
     #[must_use]
     pub(crate) fn has_session_content(&self) -> bool {
         self.recording || self.outcome.is_some()
-    }
-
-    /// Whether a dictation session is actively recording right now —
-    /// narrower than [`Self::has_session_content`], which also stays `true`
-    /// while a finished session's outcome flash is still on screen. Drives
-    /// `panel.rs`'s G3(c) hazard: opening the Full presentation while a
-    /// session is actually live must not steal keyboard focus from the app
-    /// the user is dictating into (`inject_text`'s synthesized ⌘V is
-    /// delivered to whichever window is key when it fires).
-    #[cfg(not(feature = "demo"))]
-    #[must_use]
-    pub(crate) fn is_recording(&self) -> bool {
-        self.recording
     }
 }
 
@@ -720,8 +615,8 @@ fn fade_strip() -> impl IntoElement {
         .h(FADE_HEIGHT)
         .bg(linear_gradient(
             180.0,
-            linear_color_stop(color_panel_bg(), 0.0),
-            linear_color_stop(color_panel_bg().opacity(0.0), 1.0),
+            linear_color_stop(crate::panel::PANEL_BG, 0.0),
+            linear_color_stop(crate::panel::PANEL_BG.opacity(0.0), 1.0),
         ))
 }
 
@@ -929,7 +824,7 @@ mod tests {
         assert_eq!(model.unconfirmed_text.as_ref(), "xyz");
     }
 
-    // ── has_session_content — drives panel.rs's Full-presentation Overlay tab ──
+    // ── has_session_content — drives panel.rs's Overlay tab ──────────────
 
     #[cfg(not(feature = "demo"))]
     #[test]

@@ -14,24 +14,34 @@
 //! `msg_send!` because the array/`Option` return shapes are awkward to
 //! thread through untyped `AnyObject` pointers.
 //!
+//! **Click/focus model (ARCHITECTURE.md ADR-021):** the panel is always
+//! mouse-interactive — there is no click-through mode any more — but must
+//! never take keyboard focus, so `inject_text`'s synthesized ⌘V always
+//! lands in whatever app the user is dictating into, never the panel
+//! itself. [`apply_window_config`] sets `setBecomesKeyOnlyIfNeeded: true`,
+//! the `NSPanel` mechanism that accepts clicks on the tab strip, dropdowns,
+//! and buttons without ever becoming the key window. No control in the
+//! panel takes text input (`SettingsTab` is dropdowns and buttons only), so
+//! nothing legitimately needs key status; `main.rs`'s Esc/⌘, keybindings
+//! consequently stop firing while the panel isn't key, a known and accepted
+//! gap (`TODO.md`).
+//!
 //! **Deferred surgery (CONSTITUTION rule 33):** `setFrame:display:YES`,
-//! `orderFront:`, `orderOut:`, `makeKeyAndOrderFront:`, and
-//! `setIgnoresMouseEvents:` all deliver synchronous `AppKit` delegate
+//! `orderFront:`, and `orderOut:` all deliver synchronous `AppKit` delegate
 //! callbacks back into gpui (`windowDidMove:`, the content view's
 //! `setFrameSize:`) — sending them from inside a live gpui `App` borrow
-//! re-enters gpui and corrupts that borrow. `set_frame`, `set_click_through`,
-//! `order_front`, `order_out`, `make_key_and_order_front`, and
-//! `resign_key_keep_front` therefore no longer take `&mut Window` at all:
-//! they enqueue their `msg_send!` through [`main_queue::defer`], reading the
-//! `NSWindow` handle from the module's `WINDOW` `thread_local` inside the
-//! deferred body rather than from the caller's `Window` — the same
-//! borrow-discipline rule `status_bar.rs`'s module doc documents: clone the
-//! handle out of any borrow before sending an `AppKit` message.
-//! `apply_window_config`'s own static one-time config (level, collection
-//! behavior, `setHidesOnDeactivate:`, the initial `setIgnoresMouseEvents:`)
-//! stays inline — it runs once at window creation, on a window that is still
-//! hidden and has never been shown, so it triggers no delegate callback gpui
-//! could re-enter through.
+//! re-enters gpui and corrupts that borrow. `set_frame`, `order_front`, and
+//! `order_out` therefore no longer take `&mut Window` at all: they enqueue
+//! their `msg_send!` through [`main_queue::defer`], reading the `NSWindow`
+//! handle from the module's `WINDOW` `thread_local` inside the deferred
+//! body rather than from the caller's `Window` — the same borrow-discipline
+//! rule `status_bar.rs`'s module doc documents: clone the handle out of any
+//! borrow before sending an `AppKit` message. `apply_window_config`'s own
+//! static one-time config (level, collection behavior,
+//! `setHidesOnDeactivate:`, `setBecomesKeyOnlyIfNeeded:`) stays inline — it
+//! runs once at window creation, on a window that is still hidden and has
+//! never been shown, so it triggers no delegate callback gpui could
+//! re-enter through.
 
 use std::cell::RefCell;
 
@@ -49,12 +59,11 @@ thread_local! {
     /// Main-thread-only storage for the panel's `NSWindow`, retained once at
     /// [`apply_window_config`] time — `main.rs` creates exactly one panel
     /// window per process. Every surgery function below (`set_frame`,
-    /// `set_click_through`, `order_front`, `order_out`,
-    /// `make_key_and_order_front`, `resign_key_keep_front`) reads this from
-    /// inside its `main_queue::defer`red body instead of threading a
-    /// `&mut Window` all the way from its own caller, following this
-    /// module's borrow-discipline rule (below): clone the handle out of the
-    /// borrow before sending any `AppKit` message.
+    /// `order_front`, `order_out`) reads this from inside its
+    /// `main_queue::defer`red body instead of threading a `&mut Window` all
+    /// the way from its own caller, following this module's
+    /// borrow-discipline rule (below): clone the handle out of the borrow
+    /// before sending any `AppKit` message.
     static WINDOW: RefCell<Option<Retained<AnyObject>>> = const { RefCell::new(None) };
 }
 
@@ -68,10 +77,11 @@ const OVERLAY_LEVEL: i64 = 1000;
 const COLLECTION_CAN_JOIN_ALL_SPACES: NSUInteger = 1 << 8;
 const COLLECTION_FULL_SCREEN_AUXILIARY: NSUInteger = 1 << 9;
 
-/// Apply all `NSWindow` overrides required for the overlay (ADR-006).
+/// Apply all `NSWindow` overrides required for the panel (ADR-006, ADR-021).
 ///
-/// Called immediately after the GPUI window is created.
-/// Sets click-through, window level, and collection behavior.
+/// Called immediately after the GPUI window is created. Sets the
+/// click-without-key-status focus model, window level, and collection
+/// behavior.
 pub(crate) fn apply_window_config(window: &mut Window) {
     let Some(ns_window) = get_ns_window(window) else {
         log::warn!("window_config: could not obtain NSWindow handle");
@@ -85,9 +95,11 @@ pub(crate) fn apply_window_config(window: &mut Window) {
     let retained = unsafe { Retained::retain(ns_window) };
     WINDOW.with(|w| *w.borrow_mut() = retained);
 
-    // Click-through (ADR-006 criterion 2).
+    // Accept clicks without ever becoming the key window (ADR-021's
+    // replacement for click-through) — see the module doc comment's
+    // "Click/focus model" section.
     unsafe {
-        let _: () = msg_send![ns_window, setIgnoresMouseEvents: true];
+        let _: () = msg_send![ns_window, setBecomesKeyOnlyIfNeeded: true];
     }
 
     // Above menu bar / fullscreen (ADR-006 criterion 3).
@@ -140,39 +152,6 @@ pub(crate) fn order_front() {
 pub(crate) fn order_out() {
     defer_on_window(|ns_window| unsafe {
         let _: () = msg_send![ns_window, orderOut: std::ptr::null_mut::<AnyObject>()];
-    });
-}
-
-/// Toggle click-through (objc2 `setIgnoresMouseEvents:`).
-///
-/// `apply_window_config` sets this to `true` unconditionally at window
-/// creation for the panel; `panel.rs`'s presentation-surgery chokepoint
-/// flips it off for the Full presentation (which accepts clicks, e.g. the
-/// tab strip and Settings controls) and back on for the Hud presentation
-/// (click-through, like the old overlay).
-pub(crate) fn set_click_through(on: bool) {
-    defer_on_window(move |ns_window| unsafe {
-        let _: () = msg_send![ns_window, setIgnoresMouseEvents: on];
-    });
-}
-
-/// Synchronously make the window key and order it to the front (objc2
-/// `makeKeyAndOrderFront:`, nil sender).
-///
-/// Exists because GPUI's own `Window::activate_window()` is
-/// executor-deferred and races with synchronous `order_out` calls made in
-/// the same tick. Must never be paired with app activation: the app runs as
-/// an accessory (no Dock icon, never frontmost) and the panel itself is
-/// non-activating (`NSWindowStyleMaskNonactivatingPanel`, set by GPUI for
-/// `WindowKind::PopUp`) — `makeKeyAndOrderFront:` gives it key status
-/// without activating the application.
-///
-/// `panel.rs`'s presentation-surgery chokepoint calls this for the Full
-/// presentation only — the Hud presentation stays non-key (click-through,
-/// no keyboard focus stolen from whatever app the user is dictating into).
-pub(crate) fn make_key_and_order_front() {
-    defer_on_window(|ns_window| unsafe {
-        let _: () = msg_send![ns_window, makeKeyAndOrderFront: std::ptr::null_mut::<AnyObject>()];
     });
 }
 
@@ -241,34 +220,6 @@ pub(crate) fn set_frame(bounds: Bounds<Pixels>) {
             objc2_foundation::NSSize::new(width, height),
         );
         let _: () = msg_send![ns_window, setFrame: frame, display: true];
-    });
-}
-
-/// Make a currently-key window give up key status while staying visible
-/// (G3a): `orderOut:` resigns key status (`AppKit` must hand key status to
-/// some other window, or none), then a plain `orderFront:` (never
-/// `makeKeyAndOrderFront:`) re-fronts it without reclaiming key. A no-op
-/// when the window isn't currently key.
-///
-/// `panel.rs`'s `on_session_started` calls this when a dictation session
-/// starts while the Full presentation happens to be key: the nonactivating
-/// panel taking system keyboard focus is normally harmless, but a session
-/// starting means the user is about to dictate into some *other* app, and
-/// `inject_text`'s synthesized ⌘V is delivered to whatever window is key at
-/// the moment it fires — leaving the panel key would send it into Vuho's
-/// own window instead of the target app.
-///
-/// The `isKeyWindow` read happens inside the deferred body, at apply time —
-/// not a main-queue turn early — which is strictly more correct than reading
-/// it eagerly at the call site and letting it go stale before the deferred
-/// `orderOut:`/`orderFront:` pair actually runs.
-pub(crate) fn resign_key_keep_front() {
-    defer_on_window(|ns_window| unsafe {
-        let is_key: bool = msg_send![ns_window, isKeyWindow];
-        if is_key {
-            let _: () = msg_send![ns_window, orderOut: std::ptr::null_mut::<AnyObject>()];
-            let _: () = msg_send![ns_window, orderFront: std::ptr::null_mut::<AnyObject>()];
-        }
     });
 }
 

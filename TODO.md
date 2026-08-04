@@ -23,3 +23,11 @@
   - `crates/vuho-ui/src/panel.rs`'s `render_tab_button` is ~49 lines.
   - `crates/vuho-ui/src/status_bar.rs`'s `install` is ~49 lines.
   - `crates/vuho-ui/src/overlay.rs`'s `handle_event` is ~48 lines.
+- **Esc-to-close regression (ADR-021, single-presentation revision):** `Esc` and `Cmd+,` are gpui
+  *window* keybindings, dispatched only to the key window — and the panel now sets
+  `setBecomesKeyOnlyIfNeeded: true`, so it is essentially never key, meaning both bindings almost
+  never fire in practice. The panel stays closable via its tab-strip "✕" button and the tray-icon
+  toggle, so this is not a dead end, just a missing convenience. Possible follow-up: a global
+  `CGEventTap`-based `Esc` (parallel to the existing hotkey tap in
+  `vuho-os-integration/src/hotkey.rs`) that calls `panel::hide` directly instead of relying on
+  gpui's key-window-scoped action dispatch. Not built — out of scope for that revision.

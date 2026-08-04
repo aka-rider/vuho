@@ -5,8 +5,9 @@
 //! `WindowHandle<OverlayModel>` to `WindowHandle<PanelRoot>` in WP6
 //! (ARCHITECTURE.md ADR-021): events forward into `panel.overlay`, and what
 //! used to be direct `window_config::order_front`/`order_out` calls are now
-//! `panel::on_session_started`/`panel::hide_if_hud` — the presentation-aware
-//! transitions that keep the Hud/Full split intact.
+//! `panel::on_session_started`/`panel::hide_after_session` — the
+//! auto-shown-aware transitions that never close a panel the user opened
+//! deliberately.
 
 use std::time::Instant;
 
@@ -50,20 +51,19 @@ fn set_recording(status: &StatusHandle, recording: bool, cx: &mut gpui::AsyncApp
 #[allow(clippy::trivially_copy_pass_by_ref)]
 fn set_recording(_status: &StatusHandle, _recording: bool, _cx: &mut gpui::AsyncApp) {}
 
-/// G4: re-show the panel as the Hud when a finished session's outcome still
-/// needs the user's attention — `ClipboardOnly` (the user must press ⌘V
-/// themselves) or `Failed` (genuine data loss) — in case the panel was
-/// already dismissed mid-session. `panel::show_hud_for_outcome` is already a
-/// no-op while the panel is shown in either presentation, so this never
-/// needs its own visibility check first. `Inserted`/`NothingToInject` never
-/// call it: a successful (or empty) outcome needs no attention after an
-/// explicit dismiss.
+/// G4: re-show the panel on the Overlay tab when a finished session's
+/// outcome still needs the user's attention — `ClipboardOnly` (the user must
+/// press ⌘V themselves) or `Failed` (genuine data loss) — in case the panel
+/// was already dismissed mid-session. `panel::show_if_hidden` is already a
+/// no-op while the panel is shown, so this never needs its own visibility
+/// check first. `Inserted`/`NothingToInject` never call it: a successful (or
+/// empty) outcome needs no attention after an explicit dismiss.
 ///
 /// No-op under `--features demo`, which has no dismiss affordance for a
-/// user to have used in the first place (`panel::show_hud_for_outcome`
-/// isn't even compiled there — see its own `#[cfg]`).
+/// user to have used in the first place (`panel::show_if_hidden` isn't even
+/// compiled there — see its own `#[cfg]`).
 #[cfg(not(feature = "demo"))]
-fn maybe_show_hud_for_outcome(
+fn maybe_show_for_outcome(
     panel: WindowHandle<PanelRoot>,
     injection: &InjectionOutcome,
     cx: &mut gpui::AsyncApp,
@@ -73,12 +73,12 @@ fn maybe_show_hud_for_outcome(
         InjectionOutcome::ClipboardOnly { .. } | InjectionOutcome::Failed { .. }
     );
     if needs_attention {
-        let _ = cx.update(|cx| panel::show_hud_for_outcome(panel, cx));
+        let _ = cx.update(|cx| panel::show_if_hidden(panel, cx, panel::Tab::Overlay));
     }
 }
 
 #[cfg(feature = "demo")]
-fn maybe_show_hud_for_outcome(
+fn maybe_show_for_outcome(
     _panel: WindowHandle<PanelRoot>,
     _injection: &InjectionOutcome,
     _cx: &mut gpui::AsyncApp,
@@ -179,7 +179,7 @@ fn track_session(event: &DictationEvent, session_active: &mut bool) -> bool {
 /// events to the model, prompt for mic access on a mic-permission error,
 /// (re)schedule the hide timer, and re-show a dismissed panel when a
 /// `SessionCompleted`'s outcome still needs attention
-/// (`maybe_show_hud_for_outcome`, G4) — then, once every event in the batch
+/// (`maybe_show_for_outcome`, G4) — then, once every event in the batch
 /// has been forwarded, apply the one panel-level transition the batch
 /// implies (`panel::on_session_started` when `show` — `SessionStarted`, or a
 /// show-worthy `Error` — was seen). Returns the updated hide deadline.
@@ -225,7 +225,7 @@ pub(crate) fn apply_events(
                 hide_at = hide_at_for_injection(injection, Instant::now());
                 // G4: a ClipboardOnly/Failed outcome must still be seen even
                 // if the panel was dismissed mid-session — re-show it.
-                maybe_show_hud_for_outcome(panel, injection, cx);
+                maybe_show_for_outcome(panel, injection, cx);
             }
             DictationEvent::Error {
                 recoverable,
@@ -277,8 +277,8 @@ pub(crate) fn apply_events(
     hide_at
 }
 
-/// Hide the panel (if it's presenting the Hud) once the outcome-display
-/// deadline has passed.
+/// Hide the panel (if it was shown automatically — [`panel::hide_after_session`])
+/// once the outcome-display deadline has passed.
 pub(crate) fn maybe_hide(
     panel: WindowHandle<PanelRoot>,
     hide_at: &mut Option<Instant>,
@@ -288,8 +288,9 @@ pub(crate) fn maybe_hide(
         if Instant::now() >= t {
             *hide_at = None;
             // See `apply_events`'s matching comment: bridge `&mut AsyncApp`
-            // to the `&mut App` `hide_if_hud` needs via `AsyncApp::update`.
-            let _ = cx.update(|cx| panel::hide_if_hud(panel, cx));
+            // to the `&mut App` `hide_after_session` needs via
+            // `AsyncApp::update`.
+            let _ = cx.update(|cx| panel::hide_after_session(panel, cx));
         }
     }
 }
@@ -376,7 +377,7 @@ pub(crate) fn spawn_ui_drain(
                                     cx.update(|cx| panel::is_shown(panel, cx)).unwrap_or(true);
                                 if !shown {
                                     let _ = cx.update(|cx| {
-                                        panel::show_full(panel, panel::Tab::Settings, cx);
+                                        panel::show(panel, panel::Tab::Settings, cx);
                                     });
                                 }
                             }

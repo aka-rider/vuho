@@ -4,7 +4,7 @@
 //! Accessibility (for the `CapsLock` `CGEventTap`) and Microphone (for STT
 //! capture) are runtime TCC grants, not entitlements. The primary path for
 //! both is the panel opened on its Settings tab (`crate::settings_tab`,
-//! `crate::panel::show_full`) — the functions here are defensive fallbacks
+//! `crate::panel::show`) — the functions here are defensive fallbacks
 //! for the two reactive call sites where a grant is revoked **mid-session**
 //! (`wiring::start_hotkey`'s error branch, `settings_tab.rs`'s
 //! `select_hotkey` error branch), so a single native dialog (or none, if

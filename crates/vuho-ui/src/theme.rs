@@ -1,8 +1,9 @@
 //! The single visual-language chokepoint for the `vuho-ui` crate
 //! (CONSTITUTION rule 26): every color, radius, and type-scale value shared
-//! across the panel's Hud (`overlay.rs`) and Full (`panel.rs`,
-//! `settings_tab.rs`, `controls.rs`) presentations lives here, so restyling
-//! the app means editing this file, not hunting down scattered literals.
+//! across the panel's chrome (`panel.rs`), overlay content (`overlay.rs`),
+//! and the Settings tab (`settings_tab.rs`, `controls.rs`) lives here, so
+//! restyling the app means editing this file, not hunting down scattered
+//! literals.
 //!
 //! Values are derived from — not invented over — the UI's existing look:
 //! `overlay.rs`'s opacity-first white text scale (`TEXT_*`), the action-blue
@@ -11,9 +12,9 @@
 //! genuinely new semantic color, reserved for a warning status.
 //!
 //! This module is compiled under both `--features demo` and production —
-//! `overlay.rs`'s Hud chrome, which needs it, is compiled in both — but
+//! `panel.rs`'s shared chrome, which needs it, is compiled in both — but
 //! every item consumed only by production-only modules
-//! (`settings_tab.rs`/`controls.rs`/`panel.rs`'s Full-presentation code, all
+//! (`settings_tab.rs`/`controls.rs`/`panel.rs`'s tab-strip code, all
 //! `#[cfg(not(feature = "demo"))]`) is therefore genuinely dead code under a
 //! demo build. That's a module-level `#[cfg_attr(feature = "demo",
 //! allow(dead_code))]` below (CONSTITUTION rule 29: scoped to the demo
@@ -28,11 +29,11 @@
     allow(
         dead_code,
         reason = "every semantic/fill/radius/section-helper token here that's consumed only by \
-                  settings_tab.rs/controls.rs/panel.rs's Full-presentation code (all \
+                  settings_tab.rs/controls.rs/panel.rs's tab-strip code (all \
                   #[cfg(not(feature = \"demo\"))]) is genuinely dead when this module compiles \
-                  into the demo build, which never leaves Presentation::Hud (see the module doc \
-                  comment) — TEXT_XS is the one exception, dead under production too, and covered \
-                  by its own item-level allow instead"
+                  into the demo build, which has no tab strip to switch to Settings with (see \
+                  the module doc comment) — TEXT_XS is the one exception, dead under production \
+                  too, and covered by its own item-level allow instead"
     )
 )]
 
@@ -106,18 +107,14 @@ pub(crate) const ERROR_RED: Hsla = Hsla {
 
 // ── Shared panel background (F20) ──────────────────────────────────────────
 //
-// The Hud's translucent chrome (`overlay.rs`'s `color_panel_bg`) and the
-// Full presentation's near-opaque chrome (`panel.rs`'s `FULL_BG`) paint the
-// same hue/saturation/lightness — only the alpha differs (see-through vs.
-// nearly opaque, each still local to its own file) — so the three magnitudes
-// live here once instead of as two independently hand-copied literals that
-// could drift apart on a future restyle.
+// `panel.rs`'s single chrome (`PANEL_BG`) paints this hue/saturation/
+// lightness at its own opacity — the three magnitudes live here once
+// instead of as a hand-copied literal that could drift on a future
+// restyle.
 //
-// `PANEL_LIGHTNESS` is 0.12, not the near-black 0.08 it started at: the Hud
-// is meant to read as smoked glass over the desktop (see
-// `overlay.rs`'s `PANEL_BG_OPACITY`), and at 0.08 it read as a black hole
-// instead. Both presentations lift together, deliberately — one panel, one
-// surface color.
+// `PANEL_LIGHTNESS` is 0.12, not the near-black 0.08 it started at: the
+// panel is meant to read as smoked glass over the desktop, and at 0.08 it
+// read as a black hole instead.
 
 pub(crate) const PANEL_HUE: f32 = 0.7;
 pub(crate) const PANEL_SATURATION: f32 = 0.1;

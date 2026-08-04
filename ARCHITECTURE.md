@@ -40,8 +40,9 @@ what's shipped vs. still in progress. The ADRs below resolve the open architectu
   supersedes ADR-001 on this point). The GPUI overlay layer still applies decay/jitter for
   visual smoothing on top of that real signal.
 - **Partial transcript** — the live `currentText` (confirmed + unconfirmed) surfaced to the overlay.
-- **Overlay** — the always-on-top, semi-transparent, non-focus-stealing, click-through panel showing
-  the partial transcript + activity waveform. Must NOT take focus (so injection lands in the prior app).
+- **Overlay** — the always-on-top, semi-transparent, non-focus-stealing panel showing the partial
+  transcript + activity waveform; since ADR-021 it is the panel's Overlay *tab*, and the panel is
+  mouse-interactive rather than click-through. Must NOT take focus (so injection lands in the prior app).
 
 ---
 
@@ -879,7 +880,7 @@ path, regardless of which candidate produced it — the design this ADR explicit
 path, which is the DMG build, `cargo run`, `VUHO_MODEL_FOLDER`, and `test-stt-ffi` — i.e.
 everything except the one new path this ADR adds.
 
-### ADR-021 — Single-panel UI (two presentations)
+### ADR-021 — Single-panel UI
 
 **Status:** Accepted. Supersedes the three-window design; amends ADR-016 and ADR-020.
 
@@ -895,64 +896,93 @@ tracking, and reopen logic. The status bar itself had two installs (`install`/`i
 two delegate modes to match. None of the three windows shared a design system — `theme.rs` only
 ever styled the overlay.
 
-**Decision:** one window, `panel::PanelRoot`, in **one constant frame**, with two presentations
-painted into it:
-- **Hud** — the dictation overlay: click-through, no keyboard focus, shown on `SessionStarted`,
-  auto-hidden per outcome duration (`overlay::outcome_hide_delay`). It paints only the bottom
-  `overlay::HUD_CHROME_HEIGHT` (180px) band of the frame and leaves the rest transparent, so it
-  looks and sits exactly like the old standalone overlay window. Semi-transparent by design
-  (`overlay::PANEL_BG_OPACITY` = 0.65 over `theme::PANEL_LIGHTNESS` = 0.12) — the desktop stays
-  visible behind it, per the product spec's "semi-transparent overlay".
-- **Full** — a near-opaque (alpha 0.97), tabbed presentation (Overlay / Settings) filling the whole
-  frame, replacing both the old settings window and the readiness window. It stays near-opaque
-  where the Hud is see-through because it is a surface the user reads and clicks. The Settings tab
-  (`crate::settings_tab::SettingsTab`, built in WP5 but never wired to anything user-reachable
-  until this ADR) shows permission rows, speech-model provisioning, and the microphone/hotkey
-  dropdowns in one scrollable column, reading `StatusModel` for every piece of live state instead
-  of re-deriving it.
+**Decision:** one window, `panel::PanelRoot`, painted **one way** — the tabbed panel (Overlay /
+Settings) — always. There is no longer a second look the same window can take on: caps lock and
+the tray both show the identical panel, and the entry point decides only which `Tab` is active,
+never how the window is painted. This retires the ADR's original two-presentation design (`Hud`:
+click-through, no tab strip, painting only the bottom of the frame; `Full`: near-opaque, tab strip,
+filling the frame) in favor of the single presentation described below.
 
-The window itself is created once, at startup, in `Presentation::Hud`, `shown: false` — exactly
-like the old overlay was. Its frame comes from one geometry source, `panel::panel_bounds`: 460×480
-horizontally centered, 120px above the bottom of the primary display (clamped to the display's top
-edge on a display too short to hold it), used both at creation and on every presentation switch.
-The two presentations originally had their own geometries — 460×180 bottom-center for the Hud,
-460×480 screen-centered for the Full — and switching between them moved *and* resized the window
-under the user, which read as two different windows rather than one; sharing a frame is what makes
-"one window" true on screen and not just in the process.
+That original split is what caused the bug this revision exists to fix. Both presentations had
+been made to share **one constant 460×480 frame** (`PANEL_WIDTH`/`PANEL_HEIGHT`) precisely so that
+switching between them would never move the window. But the Hud arm painted only the bottom 180px
+of that frame and left the rest transparent — and gpui's transparent-window path fills the
+**entire** window rect with alpha 0.0001 regardless of what actually gets painted into it —
+deliberately, and not an implementation detail we can style around: gpui sets that background
+rather than `+[NSColor clearColor]`, its own source says, "to avoid broken shadow"
+(`gpui-0.2.2/src/platform/mac/window.rs:1268`). macOS therefore shadowed the whole 460×480 rect
+that non-zero alpha describes — painted or not — and the Hud showed a stray
+rounded-rectangle outline floating roughly 300px above the visible 180px band, because the shadow
+had no way to know the top 300px was never drawn. A window whose content always fills its own
+frame cannot produce this: the shadow always hugs exactly what's painted, because painted and
+frame are now the same rectangle.
 
-Switching presentation is one **surgery chokepoint** (`panel::apply_presentation`): it re-applies
-that same frame (not redundant — it re-resolves against whichever display is primary *now*, so the
-panel follows a display change since it was last shown), then `Hud` turns click-through on, while
-`Full` turns click-through off and — as long as a dictation session isn't currently recording —
-calls `makeKeyAndOrderFront:`
-(`window_config::make_key_and_order_front`), giving the panel keyboard focus *without* activating
-the application, since GPUI's `WindowKind::PopUp` already produces a non-activating `NSPanel`
-(`NSWindowStyleMaskNonactivatingPanel`) that can become key on its own. While recording, `Full`
-instead calls plain `orderFront:` and never grabs key status at all (`show_full`'s `grab_key`
-parameter, derived from `OverlayModel::is_recording`) — opening the panel mid-dictation (a
-`Failed` model status, a tray click) must not steal the destination of `inject_text`'s synthesized
-⌘V from the app the user is actually dictating into. The window's level stays
-`kCGScreenSaverWindowLevel` (1000, set once at creation) across both presentations, so the Full
-presentation floats above normal windows exactly like the Hud does.
+**The active tab, not the entry point, decides the window's height.** `panel::panel_height(tab:
+Tab) -> Pixels` replaces the constant `PANEL_HEIGHT`: `Tab::Overlay` is 216px (36px
+`TAB_STRIP_HEIGHT` + the 180px the old Hud's chrome band occupied — the dictation content keeps
+the footprint it always had, just now behind the same tab strip Settings uses), `Tab::Settings` is
+480px (today's constant, unchanged). `PANEL_WIDTH` (460px) is shared by both tabs and unchanged.
+`PANEL_BOTTOM_MARGIN` (120px above the primary display's bottom edge) is also unchanged in value,
+but its role is now load-bearing rather than incidental: `panel_bounds`/`bottom_center_origin`
+anchor the panel's **bottom** edge for whichever height the active tab asks for, so switching from
+Overlay to Settings grows the window **upward** — the bottom edge never moves. That invariant is
+what makes a tab switch mid-dictation (Overlay → Settings while recording, then back) read as one
+window resizing in place, not two windows swapping position, and it is verified directly:
+`both_tabs_share_a_bottom_edge` asserts `origin.y + size.height` is identical for both tabs on the
+same display.
 
-Three further transitions build on that chokepoint: `show_full` (tray click, `Cmd+,`, a `Failed`
-model status), `on_session_started` (a session beginning while the panel is hidden shows the Hud;
-while the Full presentation is already open, it only switches the active tab back to Overlay, but
-if that window happens to be key it
-resigns key status via `window_config::resign_key_keep_front` — `orderOut:` then plain
-`orderFront:` — for the same reason `show_full` withholds it above: a session starting means the
-panel is about to lose the ⌘V destination race to whatever app the user is dictating into), and
-`hide_if_hud` (the old outcome-duration auto-hide, now a no-op while the Full presentation is
-open). A finished session whose outcome still needs attention (`ClipboardOnly`/`Failed`) re-shows
-the panel as the Hud even if it was already dismissed mid-session
-(`event_loop::maybe_show_hud_for_outcome` → `panel::show_hud_for_outcome`, sharing the same
-"show as Hud if not already shown" step `on_session_started` uses).
+Applying that geometry is still one **surgery chokepoint** (`panel::apply_geometry`, replacing
+`apply_presentation`): its entire body is `window_config::set_frame(panel_bounds(cx, tab))`. It
+re-resolves against whichever display is primary *now* (so the panel follows a display change
+since it was last shown — see `window_config::set_frame`'s G2 note) and is called both when the
+panel is shown and whenever the active tab changes (the tab strip's own click handler, and the idle
+status block's "Open Settings" button) — tab-switching is now a resize trigger in its own right,
+not just a repaint.
 
-**Dismissal affordances**, all going through the one `hide`/`hide_root` implementation: the Full
-presentation's tab-strip "✕" button, `Esc` (bound to the `ClosePanel` action on both the
-permissions-blocked and production startup paths), and clicking an already-open tray icon a second
-time (`open_from_tray`'s toggle). `hide_root` also closes any open Settings dropdowns
-(`SettingsTab::close_dropdowns`) so a dismiss-then-reopen never shows a stale device list.
+**Click and focus model replaces click-through.** The panel is now always mouse-interactive:
+`window_config::apply_window_config`'s `setIgnoresMouseEvents: true` call, and the `set_click_through`
+toggle that used to flip it per presentation, are both deleted — there is no longer a presentation
+that needs the desktop to see through it. In its place, `apply_window_config` sets
+`setBecomesKeyOnlyIfNeeded: true` on the `NSPanel`: AppKit delivers clicks on the tab strip,
+dropdowns, and buttons without the panel becoming the *key* window. This is the mechanism the whole
+design leans on — key status is where AppKit routes keyboard input, and `inject_text`'s synthesized
+⌘V depends on that destination being the app the user is dictating into, never the panel itself. No
+control the panel renders takes text input (`SettingsTab` is dropdowns and buttons only), so
+nothing in it legitimately needs key status in the first place. Because the panel can no longer
+become key as a side effect of being shown or clicked, `window_config::make_key_and_order_front`
+and `resign_key_keep_front` are deleted outright, and with them the entire G3(a)/G3(c) special-
+casing `panel.rs` used to carry — a `grab_key: bool` computed from `OverlayModel::is_recording` at
+every show/re-show call site, so that opening the panel mid-dictation wouldn't steal the ⌘V
+destination. That computation is no longer meaningful: the panel is never a candidate to take key
+status, recording or not, so every show/re-show site now just calls plain `order_front`.
+
+> **Known regression, accepted deliberately:** `Esc`-to-close (`main.rs`'s `bind_close_panel`) and
+> `Cmd+,` are gpui *window* keybindings, and gpui only dispatches window keybindings to the key
+> window — so both stop firing while the panel is not key, which under `becomesKeyOnlyIfNeeded` is
+> effectively always. The bindings are left in place (they still work in the one case the panel
+> does become key) rather than deleted, because closing the gap can be revisited without touching
+> this decision. The panel stays closable through two paths that don't need key status: the tab
+> strip's "✕" button (`render_close_button`) and re-clicking an already-open tray icon
+> (`open_from_tray`'s toggle). A global `CGEventTap`-based `Esc` is recorded as a possible follow-up
+> in `TODO.md`, not built here — the plan for this revision scoped it out.
+
+`on_session_started` (a session beginning while the panel is hidden shows it on the Overlay tab; a
+session beginning while the panel is already open switches `active_tab` back to `Overlay` and
+re-applies geometry, so a panel left open on Settings shrinks back down to the Overlay height
+instead of a live transcript appearing behind a still-tall Settings frame) and `hide_after_session`
+(the old outcome-duration auto-hide, renamed from `hide_if_hud`, gated on a new `PanelRoot` field
+`auto_shown: bool` that plays the role `presentation == Hud` used to — set only when
+`show_if_hidden` actually shows the panel itself, never when the user opened it explicitly) both
+lose their key-status handling entirely, for the same reason above: there is no key status left to
+resign. A finished session whose outcome still needs attention (`ClipboardOnly`/`Failed`) re-shows
+the panel even if it was already dismissed mid-session, sharing the same `show_if_hidden` step
+`on_session_started` uses (a no-op while the panel is already shown, whichever tab).
+
+**Dismissal affordances**, all going through the one `hide`/`hide_root` implementation: the tab
+strip's "✕" button, `Esc` where it still fires (see the regression note above), and clicking an
+already-open tray icon a second time (`open_from_tray`'s toggle). `hide_root` also closes any open
+Settings dropdowns (`SettingsTab::close_dropdowns`) so a dismiss-then-reopen never shows a stale
+device list.
 
 **The permission gate is now the panel's Settings tab (amends ADR-016).** `main.rs` builds the
 settings store, the `StatusModel`/`SettingsTab` entities, and the panel itself *before* checking
@@ -1008,17 +1038,30 @@ unexercised one.
 - `app_state::UiCommand` sheds `OpenSettings`/`OpenReadiness` (both already unreachable after
   WP4's tray click-split); `OpenPanel` now resolves to `panel::open_from_tray`, which shows the
   Overlay tab while a session has live content and whichever tab was last active otherwise.
-- `overlay.rs`'s chrome and content are split (`overlay::hud_chrome` wraps
-  `OverlayModel::render_content` for the Hud arm; the Full presentation's Overlay tab embeds
-  `render_content` directly, inside the panel's own opaque chrome, never the Hud's translucent
-  one) — zero behavior change to the Hud presentation itself, verified by moving
-  `bottom_center_origin`'s two existing unit tests into `panel.rs` unmodified.
+- `overlay.rs`'s chrome and content were originally split (`overlay::hud_chrome` wrapped
+  `OverlayModel::render_content` for the Hud arm; the Full presentation's Overlay tab embedded
+  `render_content` directly, inside the panel's own opaque chrome). This revision deletes
+  `overlay::hud_chrome` and its `HUD_CHROME_HEIGHT` constant outright — the panel's own chrome
+  (`panel_chrome`, a `Div` builder shared by both the production and `--features demo` `Render`
+  impls so the two cannot drift) is now the *only* chrome anywhere, and `render_content` always
+  embeds into it. The two presentations' backgrounds (`overlay::PANEL_BG_OPACITY` = 0.65 for the
+  old Hud, `panel.rs`'s `FULL_BG` at alpha 0.97 for the old Full) collapse into one `PANEL_BG`
+  (same `theme::PANEL_HUE`/`SATURATION`/`LIGHTNESS`, alpha 0.95) plus the existing
+  `PANEL_BORDER_OPACITY` border — one surface, one opacity, chosen to keep Settings' dropdowns and
+  buttons legible while the panel still reads as a floating overlay rather than an opaque app
+  window.
 - `theme.rs` (previously overlay-only, with a blanket `dead_code` allow for the tokens
   `settings_tab.rs`/`controls.rs` were already coded against) is now the shared token set for
-  every rendered surface across both presentations; the allow stays because roughly a dozen of
-  those tokens are consumed only by production-only (`#[cfg(not(feature = "demo"))]`) modules and
-  are therefore genuinely unreachable in a `--features demo` build — a structural fact of a
-  cfg-split consumer set, not unfinished wiring.
+  every rendered surface across the panel; the allow stays because roughly a dozen of those tokens
+  are consumed only by production-only (`#[cfg(not(feature = "demo"))]`) modules and are therefore
+  genuinely unreachable in a `--features demo` build — a structural fact of a cfg-split consumer
+  set, not unfinished wiring.
+- `panel.rs`'s `hud_chrome_fits_within_the_shared_frame` test is deleted along with the subject it
+  tested; two pure tests against `panel_bounds` take its place —
+  `settings_tab_is_taller_than_overlay_tab` and `both_tabs_share_a_bottom_edge` (the latter is the
+  real invariant a tab-driven resize must never break, described above).
+  `bottom_center_origin_clamps_to_short_display` and the other `bottom_center_origin_*` tests are
+  unchanged.
 
 **Rejected alternative:** keeping the readiness window's two `ReadinessMode`s as-is and merely
 retargeting the Settings tab to open it in the appropriate mode — rejected because it would have
@@ -1067,12 +1110,12 @@ added, ADR-020; no Swift package, ADR-014):**
   fully verifies it → writes the sidecar **inside** `<dir>.partial`, only once verification has
   passed → atomically renames `<dir>.partial` to `<dir>`, promoting the verified bytes and their
   sidecar together). Depends on `vuho-model-paths` and `vuho-domain`.
-- `vuho-ui` — GPUI: a single non-activating panel (`panel::PanelRoot`, ADR-021) with two
-  presentations — Hud (the dictation overlay) and Full (a tabbed Overlay/Settings window; the
-  Settings tab holds the mic + hotkey-preset dropdowns, save-on-change, live hotkey rebind, and
-  the ADR-016/ADR-020 permission + model provisioning rows); produces the `vuho` binary.
-  Status-bar menu, quit hotkey `Cmd+Option+Shift+Q`, `Cmd+,` opens the panel on Settings
-  (`LSUIElement`, no Dock icon).
+- `vuho-ui` — GPUI: a single non-activating, always-mouse-interactive panel (`panel::PanelRoot`,
+  ADR-021) painted one way — a tabbed Overlay/Settings window whose height follows the active tab;
+  the Settings tab holds the mic + hotkey-preset dropdowns, save-on-change, live hotkey rebind, and
+  the ADR-016/ADR-020 permission + model provisioning rows; produces the `vuho` binary. Status-bar
+  menu, quit hotkey `Cmd+Option+Shift+Q`, `Cmd+,` opens the panel on Settings (`LSUIElement`, no
+  Dock icon).
 - `test-stt-ffi` — batch STT regression binary; the deterministic `PASS`-on-`jfk.wav` gate.
 
 **No Swift engine package** — the row this table used to have for one is gone; there is no

@@ -104,9 +104,9 @@ impl SettingsTab {
     /// (`refresh_devices` only re-snapshots when a dropdown is opened, and
     /// a still-open dropdown never re-opens). No `cx.notify()` here — the
     /// panel is being hidden, not re-rendered, and the next legitimate
-    /// render (`show_full`'s own `refresh_devices` call on the Settings
-    /// tab, or any other `StatusModel`-driven repaint) already picks up the
-    /// closed state.
+    /// render (`show`'s own `refresh_devices` call on the Settings tab, or
+    /// any other `StatusModel`-driven repaint) already picks up the closed
+    /// state.
     pub(crate) fn close_dropdowns(&mut self) {
         self.mic_open = false;
         self.hotkey_open = false;
