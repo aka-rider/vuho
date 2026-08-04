@@ -164,8 +164,9 @@ impl Settings {
         match serde_json::from_value(raw.clone()) {
             Ok(settings) => (settings, None),
             Err(e) => {
-                let reason =
-                    format!("settings file is malformed ({e}) — using defaults; file left untouched");
+                let reason = format!(
+                    "settings file is malformed ({e}) — using defaults; file left untouched"
+                );
                 log::warn!("{reason}");
                 (Settings::default(), Some(reason))
             }

@@ -27,8 +27,8 @@
 //! are much smaller than production's.
 
 use gpui::{
-    prelude::*, px, App, Bounds, Context, Entity, IntoElement, Pixels, Point, Render, Size,
-    Window, WindowBounds, WindowHandle, WindowKind, WindowOptions,
+    prelude::*, px, App, Bounds, Context, Entity, IntoElement, Pixels, Point, Render, Size, Window,
+    WindowBounds, WindowHandle, WindowKind, WindowOptions,
 };
 
 use crate::overlay::OverlayModel;
@@ -196,9 +196,12 @@ pub(crate) fn create_panel(
         window_config::apply_window_config(window);
         let overlay = cx.new(|cx| OverlayModel::new(window, cx));
         cx.new(|cx| {
-            cx.observe(&overlay, |_this, _overlay, cx| cx.notify()).detach();
-            cx.observe(&settings, |_this, _settings, cx| cx.notify()).detach();
-            cx.observe(&status, |_this, _status, cx| cx.notify()).detach();
+            cx.observe(&overlay, |_this, _overlay, cx| cx.notify())
+                .detach();
+            cx.observe(&settings, |_this, _settings, cx| cx.notify())
+                .detach();
+            cx.observe(&status, |_this, _status, cx| cx.notify())
+                .detach();
             PanelRoot {
                 presentation: Presentation::Hud,
                 active_tab: Tab::Overlay,
@@ -224,7 +227,8 @@ pub(crate) fn create_panel(cx: &mut App) -> WindowHandle<PanelRoot> {
         window_config::apply_window_config(window);
         let overlay = cx.new(|cx| OverlayModel::new(window, cx));
         cx.new(|cx| {
-            cx.observe(&overlay, |_this, _overlay, cx| cx.notify()).detach();
+            cx.observe(&overlay, |_this, _overlay, cx| cx.notify())
+                .detach();
             PanelRoot {
                 presentation: Presentation::Hud,
                 active_tab: Tab::Overlay,
@@ -620,10 +624,8 @@ impl Render for PanelRoot {
 impl Render for PanelRoot {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         match self.presentation {
-            Presentation::Hud => {
-                crate::overlay::hud_chrome(self.overlay.read(cx).render_content())
-                    .into_any_element()
-            }
+            Presentation::Hud => crate::overlay::hud_chrome(self.overlay.read(cx).render_content())
+                .into_any_element(),
             Presentation::Full => self.render_full(cx).into_any_element(),
         }
     }
@@ -666,8 +668,20 @@ impl PanelRoot {
             .gap_1()
             .border_b_1()
             .border_color(theme::SEPARATOR)
-            .child(self.render_tab_button(Tab::Overlay, WAVEFORM_ICON, "Overlay", "panel-tab-overlay", cx))
-            .child(self.render_tab_button(Tab::Settings, GEAR_ICON, "Settings", "panel-tab-settings", cx))
+            .child(self.render_tab_button(
+                Tab::Overlay,
+                WAVEFORM_ICON,
+                "Overlay",
+                "panel-tab-overlay",
+                cx,
+            ))
+            .child(self.render_tab_button(
+                Tab::Settings,
+                GEAR_ICON,
+                "Settings",
+                "panel-tab-settings",
+                cx,
+            ))
             .child(div().flex_1())
             .child(Self::render_close_button(cx))
     }
@@ -825,16 +839,12 @@ impl PanelRoot {
         let (headline, sub) = status.idle_headline();
         let composite = status.composite();
 
-        let mut column = div()
-            .flex()
-            .flex_col()
-            .gap_2()
-            .child(
-                div()
-                    .text_size(px(theme::TEXT_LG))
-                    .text_color(theme::TEXT_PRIMARY)
-                    .child(headline),
-            );
+        let mut column = div().flex().flex_col().gap_2().child(
+            div()
+                .text_size(px(theme::TEXT_LG))
+                .text_color(theme::TEXT_PRIMARY)
+                .child(headline),
+        );
 
         if let Some(sub) = sub {
             column = column.child(

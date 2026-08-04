@@ -360,10 +360,8 @@ pub(crate) fn spawn_ui_drain(
                             let _ = cx.update(|cx| panel::open_from_tray(panel, cx));
                         }
                         crate::app_state::UiCommand::ModelStatus(model_status) => {
-                            let failed = matches!(
-                                model_status,
-                                vuho_domain::ModelStatus::Failed { .. }
-                            );
+                            let failed =
+                                matches!(model_status, vuho_domain::ModelStatus::Failed { .. });
                             let _ = status.update(&mut cx, |model, cx| {
                                 model.model = Some(model_status.clone());
                                 cx.notify();

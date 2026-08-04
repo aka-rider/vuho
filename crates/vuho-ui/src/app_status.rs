@@ -174,9 +174,7 @@ impl StatusModel {
                 SharedString::from("Downloading speech model…"),
                 Some(SharedString::from(format!("{pct}% complete"))),
             ),
-            CompositeStatus::Verifying => {
-                (SharedString::from("Verifying speech model…"), None)
-            }
+            CompositeStatus::Verifying => (SharedString::from("Verifying speech model…"), None),
             CompositeStatus::EngineFailed => engine_failed_headline(&self.engine),
             // F7: distinct from the menu title ("Loading model…", unchanged
             // in `CompositeStatus::menu_title` below) — the matrix calls for
@@ -376,7 +374,9 @@ mod tests {
     #[test]
     fn model_missing_from_missing_variant() {
         let mut model = base_model();
-        model.model = Some(ModelStatus::Missing { total_bytes: 474_000_000 });
+        model.model = Some(ModelStatus::Missing {
+            total_bytes: 474_000_000,
+        });
         assert_eq!(model.composite(), CompositeStatus::ModelMissing);
     }
 

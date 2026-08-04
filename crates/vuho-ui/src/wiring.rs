@@ -204,8 +204,9 @@ fn open_dictation_channels() -> (
     // keyboard-language watcher here, on the main thread, so the pipeline
     // thread reads its cache instead of ever touching TIS itself.
     vuho_os_integration::install_language_watcher(
-        objc2::MainThreadMarker::new()
-            .expect("open_dictation_channels runs on the main thread (called from wire_production)"),
+        objc2::MainThreadMarker::new().expect(
+            "open_dictation_channels runs on the main thread (called from wire_production)",
+        ),
     );
 
     let (event_tx, event_rx) = unbounded::<DictationEvent>();

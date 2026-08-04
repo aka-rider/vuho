@@ -81,21 +81,23 @@ fn main() {
     {
         log::warn!("vuho: failed to init logger: {e}");
     }
-    Application::new().with_assets(assets::Assets).run(move |cx: &mut App| {
-        bind_quit_hotkey(cx);
+    Application::new()
+        .with_assets(assets::Assets)
+        .run(move |cx: &mut App| {
+            bind_quit_hotkey(cx);
 
-        // Set accessory activation policy: no Dock icon, non-activating.
-        window_config::set_accessory_activation_policy();
+            // Set accessory activation policy: no Dock icon, non-activating.
+            window_config::set_accessory_activation_policy();
 
-        #[cfg(feature = "demo")]
-        {
-            let panel = panel::create_panel(cx);
-            demo::run_demo_mode(panel, cx);
-        }
+            #[cfg(feature = "demo")]
+            {
+                let panel = panel::create_panel(cx);
+                demo::run_demo_mode(panel, cx);
+            }
 
-        #[cfg(not(feature = "demo"))]
-        run_production(cx);
-    });
+            #[cfg(not(feature = "demo"))]
+            run_production(cx);
+        });
 }
 
 /// Bind the Cmd+Option+Shift+Q quit action.

@@ -75,7 +75,8 @@ impl SettingsTab {
         // Repaint whenever the shared status model changes — the provisioning
         // loop, the permission poll, and this view's own hotkey rebind all
         // write to it independently of this view's own render cycle.
-        cx.observe(&status, |_this, _status, cx| cx.notify()).detach();
+        cx.observe(&status, |_this, _status, cx| cx.notify())
+            .detach();
         let devices = list_devices();
         Self {
             status,
@@ -206,7 +207,12 @@ impl SettingsTab {
     /// [`ModelStatus::Ready`] — dispatched on [`EngineState`]. Split out of
     /// [`Self::render_speech_model_section`] to keep it under the 40-line
     /// render-helper limit (CONSTITUTION rule 28).
-    fn render_speech_model_ready(&self, card: Div, engine: &EngineState, cx: &mut Context<Self>) -> Div {
+    fn render_speech_model_ready(
+        &self,
+        card: Div,
+        engine: &EngineState,
+        cx: &mut Context<Self>,
+    ) -> Div {
         match engine {
             EngineState::Loading => card.child(model_status_line(
                 "Warming up the speech engine…",
@@ -227,7 +233,12 @@ impl SettingsTab {
     /// [`Self::render_speech_model_section`] (CONSTITUTION rule 28); `model`
     /// is never [`ModelStatus::Ready`] here — that arm is
     /// [`Self::render_speech_model_ready`]'s.
-    fn render_speech_model_provisioning(&self, card: Div, model: &ModelStatus, cx: &mut Context<Self>) -> Div {
+    fn render_speech_model_provisioning(
+        &self,
+        card: Div,
+        model: &ModelStatus,
+        cx: &mut Context<Self>,
+    ) -> Div {
         match model {
             ModelStatus::Ready => card,
             ModelStatus::Missing { .. } => card
@@ -266,7 +277,11 @@ impl SettingsTab {
     /// already dispatches a `Download` command differently depending on the
     /// current `Phase` (re-download vs. retry-the-engine-load-only), so this
     /// view doesn't need to know which one applies.
-    fn download_retry_button(&self, label: &'static str, cx: &mut Context<Self>) -> gpui::AnyElement {
+    fn download_retry_button(
+        &self,
+        label: &'static str,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
         let provision_tx = self.provision_tx.clone();
         controls::action_button(
             label,
@@ -363,7 +378,11 @@ impl SettingsTab {
     /// The hotkey row: label + dropdown over every [`HotkeySetting`] preset,
     /// plus a persistent error row while the configured preset failed to
     /// bind (`HotkeyState::Failed`).
-    fn render_hotkey_row(&self, hotkey_state: HotkeyState, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_hotkey_row(
+        &self,
+        hotkey_state: HotkeyState,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         let mut column = div()
             .flex()
             .flex_col()
@@ -424,7 +443,14 @@ impl SettingsTab {
 
 impl Render for SettingsTab {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let (model, engine, hotkey_state, permissions_missing, launch_blocked, settings_load_warning) = {
+        let (
+            model,
+            engine,
+            hotkey_state,
+            permissions_missing,
+            launch_blocked,
+            settings_load_warning,
+        ) = {
             let status = self.status.read(cx);
             (
                 status.model.clone(),
@@ -642,7 +668,10 @@ fn render_permissions_section(
 /// [`Access::Granted`] when it's absent from that list — every permission
 /// not currently missing is, definitionally, granted.
 #[must_use]
-fn permission_access(permissions_missing: &[(Permission, Access)], permission: Permission) -> Access {
+fn permission_access(
+    permissions_missing: &[(Permission, Access)],
+    permission: Permission,
+) -> Access {
     permissions_missing
         .iter()
         .find_map(|&(p, access)| (p == permission).then_some(access))
@@ -684,7 +713,11 @@ fn render_permission_row(
 /// Accessibility specifically, while not yet granted — the relaunch-after-
 /// granting note. Split out of [`render_permission_row`] to keep it under
 /// the 40-line render-helper limit (CONSTITUTION rule 28).
-fn render_permission_row_header(permission: Permission, access: Access, is_accessibility: bool) -> Div {
+fn render_permission_row_header(
+    permission: Permission,
+    access: Access,
+    is_accessibility: bool,
+) -> Div {
     let mut row = div()
         .flex()
         .flex_col()
@@ -695,7 +728,10 @@ fn render_permission_row_header(permission: Permission, access: Access, is_acces
                 .text_color(theme::TEXT_PRIMARY)
                 .child(permission.label()),
         )
-        .child(model_status_line(permission.description(), theme::TEXT_TERTIARY));
+        .child(model_status_line(
+            permission.description(),
+            theme::TEXT_TERTIARY,
+        ));
 
     if is_accessibility && access != Access::Granted {
         row = row.child(model_status_line(
