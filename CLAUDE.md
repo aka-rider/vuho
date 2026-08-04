@@ -23,7 +23,7 @@ MacOS Silicon ONLY. ANE. Metal.
 
 - Build: `cargo build --release -p vuho-ui` — no Swift toolchain required (native CoreML via `objc2-core-ml`).
 - Run overlay demo (no mic, no engine): `cargo run -p vuho-ui --features demo`
-- Test: `cargo test` (workspace). Single test: `cargo test -p vuho-os-integration map_en_us`. Note: nextest was planned but is NOT installed — use plain `cargo test`.
+- Test: `cargo test` (workspace). Single test: `cargo test -p vuho-os-integration map_en_us`. `vuho-ui`'s demo-feature build has its own, separately-compiled test set (different `#[cfg]` surface, e.g. `panel::PanelRoot`'s demo-only `Render` impl and `create_panel` overload) — also run `cargo test -p vuho-ui --features demo` to cover it; plain `cargo test` alone does not. Note: nextest was planned but is NOT installed — use plain `cargo test`.
 - Lint: `cargo clippy --workspace --all-targets` (workspace lints enable `clippy::pedantic` at `warn`).
 - STT batch regression gate: `cargo run -p test-stt-ffi` must print `PASS` (transcribes `jfk.wav`
   via `ParakeetEngine`; override the audio with `JFK_WAV`). Green as of the Parakeet-TDT rewrite.

@@ -16,7 +16,7 @@ use gpui::SharedString;
 use vuho_domain::ModelStatus;
 use vuho_settings::HotkeySetting;
 
-use crate::readiness::{self, Permission};
+use crate::readiness::{self, Access, Permission};
 
 /// STT engine warmup state (`wiring::load_engine_and_session`'s outcome),
 /// mirrored here so `StatusModel` doesn't need a reference to the engine
@@ -60,7 +60,24 @@ pub(crate) struct StatusModel {
     pub engine: EngineState,
     pub recording: bool,
     pub hotkey: HotkeyState,
-    pub permissions_missing: Vec<Permission>,
+    /// Every permission still missing, each with its live [`Access`] —
+    /// derived exclusively by `readiness::missing_permissions()` (F6), the
+    /// identical call [`crate::panel::start_permissions_poll`]'s every-tick
+    /// write and this field's one-time gate-path seed
+    /// (`main.rs`'s `run_gate_blocked`) both go through, so the two writers
+    /// can never disagree in shape. Two writers, one derivation: the seed
+    /// exists only so the tray's very first paint — which happens
+    /// synchronously in `main.rs`, before the poll's `cx.spawn`'d task has
+    /// had a chance to run even its own immediate first tick — already
+    /// shows the correct composite state instead of one visibly wrong frame
+    /// (`launch_blocked` true with an empty `permissions_missing` derives
+    /// [`CompositeStatus::RelaunchRequired`], not
+    /// [`CompositeStatus::PermissionsMissing`]); every write after that one
+    /// seed is the poll's alone. `settings_tab.rs`'s permission rows render
+    /// purely from this field (plus [`Permission::ALL`] for the granted
+    /// rows) — never a fresh `Permission::access()` call at render time,
+    /// which used to race the poll's own 500 ms tick.
+    pub permissions_missing: Vec<(Permission, Access)>,
     /// `true` when the app started on the permission-gate path — a relaunch
     /// is required after granting for the new process identity to carry
     /// the TCC grant (see `readiness.rs`'s module doc comment).
@@ -74,12 +91,17 @@ pub(crate) struct StatusModel {
 /// The one composite state derived from every [`StatusModel`] field, in
 /// strict priority order (highest first): a higher-priority condition being
 /// true always wins, regardless of what a lower-priority field says —
-/// e.g. a `Recording` session with a missing permission still reports
-/// [`CompositeStatus::PermissionsMissing`], since a permission revoked
-/// mid-session (A5, `readiness.rs`) is more urgent than the fact that a
-/// session happens to be running.
+/// e.g. a live session with a missing permission still reports
+/// [`CompositeStatus::Recording`], not [`CompositeStatus::PermissionsMissing`]
+/// (F8/F18): a live session's Stop control must stay reachable and visible
+/// no matter what else is going on; a permission revoked mid-session (A5,
+/// `readiness.rs`) surfaces once the session actually ends, not by yanking
+/// the Stop control out from under a user who is still mid-dictation.
 #[derive(Clone, PartialEq, Debug)]
 pub(crate) enum CompositeStatus {
+    /// A dictation session is in progress — outranks everything else (see
+    /// this enum's doc comment).
+    Recording,
     PermissionsMissing,
     /// `launch_blocked` and every permission is now granted — the process
     /// itself needs to be relaunched (a TCC grant is a process-identity
@@ -94,7 +116,6 @@ pub(crate) enum CompositeStatus {
     Verifying,
     EngineFailed,
     EngineLoading,
-    Recording,
     Ready,
 }
 
@@ -103,6 +124,9 @@ impl StatusModel {
     /// [`CompositeStatus`].
     #[must_use]
     pub(crate) fn composite(&self) -> CompositeStatus {
+        if self.recording {
+            return CompositeStatus::Recording;
+        }
         if !self.permissions_missing.is_empty() {
             return CompositeStatus::PermissionsMissing;
         }
@@ -117,11 +141,7 @@ impl StatusModel {
             EngineState::Loading => return CompositeStatus::EngineLoading,
             EngineState::Ready => {}
         }
-        if self.recording {
-            CompositeStatus::Recording
-        } else {
-            CompositeStatus::Ready
-        }
+        CompositeStatus::Ready
     }
 
     /// Headline + optional sub-line for the panel's idle status block, one
@@ -130,6 +150,7 @@ impl StatusModel {
     #[must_use]
     pub(crate) fn idle_headline(&self) -> (SharedString, Option<SharedString>) {
         match self.composite() {
+            CompositeStatus::Recording => (SharedString::from("Listening…"), None),
             CompositeStatus::PermissionsMissing => (
                 SharedString::from("Permissions needed"),
                 Some(SharedString::from(
@@ -151,8 +172,15 @@ impl StatusModel {
                 (SharedString::from("Verifying speech model…"), None)
             }
             CompositeStatus::EngineFailed => engine_failed_headline(&self.engine),
-            CompositeStatus::EngineLoading => (SharedString::from("Loading model…"), None),
-            CompositeStatus::Recording => (SharedString::from("Listening…"), None),
+            // F7: distinct from the menu title ("Loading model…", unchanged
+            // in `CompositeStatus::menu_title` below) — the matrix calls for
+            // separate copy here, since "Loading model…" during ANE warmup
+            // (no bytes moving, no percent to show) reads like a stalled
+            // download rather than what it actually is.
+            CompositeStatus::EngineLoading => (
+                SharedString::from("Getting ready"),
+                Some(SharedString::from("Warming up the speech engine…")),
+            ),
             CompositeStatus::Ready => ready_headline(self.hotkey),
         }
     }
@@ -245,13 +273,24 @@ impl CompositeStatus {
     }
 
     /// Whether the tray toggle / panel's dictate control should accept a
-    /// click — only once an engine exists to drive ([`CompositeStatus::Recording`]
-    /// to stop it, [`CompositeStatus::Ready`] to start it). Every other
-    /// state has a blocking requirement (permission, relaunch, model,
-    /// engine failure) that a toggle click can't resolve.
+    /// click — [`CompositeStatus::Recording`] (to stop it),
+    /// [`CompositeStatus::Ready`] (to start it), and, since F18,
+    /// [`CompositeStatus::PermissionsMissing`] too: the Stop control must
+    /// stay reachable for a session already running when a permission gets
+    /// revoked mid-session (A5, `readiness.rs`), and a fresh attempt should
+    /// still be allowed to *try* — if a permission genuinely blocks it,
+    /// `ParakeetEngine::start_stream`'s own precheck (or the pipeline's
+    /// error path) surfaces that, rather than a disabled toggle silently
+    /// refusing to even try. Every other state has a blocking requirement
+    /// (relaunch, model, engine failure) that a toggle click can't resolve.
     #[must_use]
     pub(crate) fn toggle_enabled(&self) -> bool {
-        matches!(self, CompositeStatus::Recording | CompositeStatus::Ready)
+        matches!(
+            self,
+            CompositeStatus::Recording
+                | CompositeStatus::Ready
+                | CompositeStatus::PermissionsMissing
+        )
     }
 }
 
@@ -275,16 +314,32 @@ mod tests {
 
     // ── composite() priority table ─────────────────────────────────────
 
+    /// F8/F18's direct regression: a live session outranks a missing
+    /// permission (and, transitively, everything else — see
+    /// `CompositeStatus`'s own doc comment) — the Stop control must stay
+    /// reachable no matter what else is going on.
     #[test]
-    fn permissions_missing_outranks_everything_else() {
+    fn recording_outranks_every_other_state() {
         let mut model = base_model();
-        model.permissions_missing = vec![Permission::Microphone];
+        model.recording = true;
+        model.permissions_missing = vec![(Permission::Microphone, Access::Denied)];
         model.launch_blocked = true;
         model.model = Some(ModelStatus::Failed {
             message: "boom".to_owned(),
         });
         model.engine = EngineState::Failed("boom".to_owned());
-        model.recording = true;
+        assert_eq!(model.composite(), CompositeStatus::Recording);
+    }
+
+    #[test]
+    fn permissions_missing_outranks_relaunch_model_and_engine() {
+        let mut model = base_model();
+        model.permissions_missing = vec![(Permission::Microphone, Access::Denied)];
+        model.launch_blocked = true;
+        model.model = Some(ModelStatus::Failed {
+            message: "boom".to_owned(),
+        });
+        model.engine = EngineState::Failed("boom".to_owned());
         assert_eq!(model.composite(), CompositeStatus::PermissionsMissing);
     }
 
@@ -308,7 +363,7 @@ mod tests {
     fn launch_blocked_with_permissions_missing_is_still_permissions_missing() {
         let mut model = base_model();
         model.launch_blocked = true;
-        model.permissions_missing = vec![Permission::Accessibility];
+        model.permissions_missing = vec![(Permission::Accessibility, Access::Promptable)];
         assert_eq!(model.composite(), CompositeStatus::PermissionsMissing);
     }
 
@@ -332,11 +387,12 @@ mod tests {
     fn model_missing_outranks_downloading_verifying_and_engine() {
         // Only one `model` field exists, so exercise the priority against
         // engine state directly: a `Missing`/`Failed` model must win over
-        // any engine state.
+        // any engine state. `recording` is deliberately left `false` here —
+        // since F8/F18, `Recording` outranks everything (including this),
+        // so it would defeat the point of this test to set it.
         let mut model = base_model();
         model.model = Some(ModelStatus::Missing { total_bytes: 100 });
         model.engine = EngineState::Failed("boom".to_owned());
-        model.recording = true;
         assert_eq!(model.composite(), CompositeStatus::ModelMissing);
     }
 
@@ -397,19 +453,25 @@ mod tests {
     }
 
     #[test]
-    fn engine_failed_outranks_recording() {
+    fn recording_outranks_engine_failed() {
+        // Since F8/F18, `Recording` outranks every other state (see
+        // `CompositeStatus`'s doc comment) — this replaces the old
+        // `engine_failed_outranks_recording`, whose expectation was the
+        // opposite.
         let mut model = base_model();
         model.engine = EngineState::Failed("boom".to_owned());
         model.recording = true;
-        assert_eq!(model.composite(), CompositeStatus::EngineFailed);
+        assert_eq!(model.composite(), CompositeStatus::Recording);
     }
 
     #[test]
-    fn engine_loading_outranks_recording() {
+    fn recording_outranks_engine_loading() {
+        // Replaces the old `engine_loading_outranks_recording` — see
+        // `recording_outranks_engine_failed`'s comment.
         let mut model = base_model();
         model.engine = EngineState::Loading;
         model.recording = true;
-        assert_eq!(model.composite(), CompositeStatus::EngineLoading);
+        assert_eq!(model.composite(), CompositeStatus::Recording);
     }
 
     #[test]
@@ -464,7 +526,7 @@ mod tests {
     // ── toggle_enabled() totality ───────────────────────────────────────
 
     #[test]
-    fn toggle_enabled_true_exactly_for_recording_and_ready() {
+    fn toggle_enabled_true_exactly_for_recording_ready_and_permissions_missing() {
         let all = [
             CompositeStatus::PermissionsMissing,
             CompositeStatus::RelaunchRequired,
@@ -477,7 +539,12 @@ mod tests {
             CompositeStatus::Ready,
         ];
         for status in all {
-            let expected = matches!(status, CompositeStatus::Recording | CompositeStatus::Ready);
+            let expected = matches!(
+                status,
+                CompositeStatus::Recording
+                    | CompositeStatus::Ready
+                    | CompositeStatus::PermissionsMissing
+            );
             assert_eq!(
                 status.toggle_enabled(),
                 expected,
@@ -537,6 +604,28 @@ mod tests {
         assert!(
             sub.contains(&readiness::format_mb(474_000_000)),
             "expected size in sub-line: {sub:?}"
+        );
+    }
+
+    /// F7: the idle block's headline for `EngineLoading` must read as
+    /// engine warmup ("Getting ready" / "Warming up the speech engine…"),
+    /// distinct from the tray's menu title, which intentionally keeps the
+    /// older "Loading model…" wording (`CompositeStatus::menu_title`'s own
+    /// space is tighter, and the model is in fact already loaded by this
+    /// point — only the engine warmup is in progress).
+    #[test]
+    fn idle_headline_engine_loading_is_distinct_from_menu_title() {
+        let mut model = base_model();
+        model.engine = EngineState::Loading;
+        let (headline, sub) = model.idle_headline();
+        assert_eq!(headline.as_ref(), "Getting ready");
+        assert_eq!(
+            sub.as_ref().map(SharedString::as_ref),
+            Some("Warming up the speech engine…")
+        );
+        assert_eq!(
+            CompositeStatus::EngineLoading.menu_title(),
+            "Loading model…"
         );
     }
 }

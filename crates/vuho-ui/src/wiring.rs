@@ -129,15 +129,22 @@ enum DownloadOutcome {
 /// drain, around the panel/settings/status entities `main.rs` already
 /// built.
 ///
-/// Kept short (CONSTITUTION rule 28) by delegating hotkey startup to
-/// [`start_hotkey`].
+/// Kept short (CONSTITUTION rule 28) by delegating channel setup to
+/// [`open_dictation_channels`] and hotkey startup to [`start_hotkey`].
 ///
 /// No `provision_tx` parameter: unlike the old `VuhoState`-global design,
 /// `main.rs` hands the Download/Retry button's sender directly to
 /// [`SettingsTab::new`] when it builds `settings_tab`, so this function has
 /// no need to see it — only `provision_rx`, which the provisioning thread
 /// owns.
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "each parameter is a distinct piece main.rs already built and must hand off \
+              exactly once — the panel handle, the settings store, three channel halves, and \
+              two shared entities. Bundling them into a struct would just move the same eight \
+              fields into a second place, one call site, without reducing what this function \
+              actually needs to wire up"
+)]
 pub(crate) fn wire_production(
     panel: WindowHandle<PanelRoot>,
     settings: &Arc<SettingsStore>,
@@ -148,35 +155,18 @@ pub(crate) fn wire_production(
     settings_tab: &Entity<SettingsTab>,
     cx: &mut App,
 ) {
-    // TIS is main-thread-only (uncatchable SIGTRAP off-main): install the
-    // keyboard-language watcher here, on the main thread, so the pipeline
-    // thread reads its cache instead of ever touching TIS itself.
-    vuho_os_integration::install_language_watcher(
-        objc2::MainThreadMarker::new().expect("wire_production runs on the main thread"),
-    );
-
-    let (event_tx, event_rx) = unbounded::<DictationEvent>();
-    // Clone before passing to session so the bridge thread also owns a sender.
-    // Without this, `event_tx` is moved into the session and dropped at the
-    // end of `wire_production`, killing the pipeline thread instantly.
+    let (event_tx, event_rx, cmd_tx, cmd_rx) = open_dictation_channels();
+    // Clone before moving `event_tx` into the bridge below, or dropping it
+    // at the end of this function kills the pipeline thread.
     let event_tx_bridge = event_tx.clone();
-    let (cmd_tx, cmd_rx) = unbounded::<DictationCommand>();
 
-    // Request microphone permission proactively on the main thread.
-    // macOS TCC dialogs only appear reliably from the main run-loop;
-    // if we wait until vuho_start_stream (called from a background thread),
-    // the dialog may never appear and the stream fails silently.
-    request_mic_permission_on_startup(&event_tx);
-
-    // Menu-bar status item (click-split button + toggle/Open/Quit menu)
-    // shares the command channel and gets its own channel to reach the GPUI
-    // foreground task that owns window creation (the status item has no
-    // GPUI handle). The only other `install` call site (`main.rs`'s
-    // permissions/relaunch-blocked path, `cmd_tx: None`) `return`s before
-    // ever reaching `wire_production`, so this is always the sole call for
-    // a given process.
-    status_bar::install(Some(cmd_tx.clone()), ui_tx.clone());
-    status_bar::sync(&status.read(cx).composite());
+    // The sole `install` call reaching production (the other, `main.rs`'s
+    // gate path, always `return`s first); paints the tray itself (F21).
+    status_bar::install(
+        Some(cmd_tx.clone()),
+        ui_tx.clone(),
+        &status.read(cx).composite(),
+    );
 
     spawn_warmup_and_bridge(
         cmd_rx,
@@ -194,6 +184,40 @@ pub(crate) fn wire_production(
 
     spawn_event_drain(panel, event_rx, status.clone(), cx);
     spawn_ui_drain(panel, ui_rx, status, cx);
+}
+
+/// Open the two channel pairs [`wire_production`]'s pipeline runs on — a
+/// `DictationEvent` channel (the pipeline's own progress feed) and a
+/// `DictationCommand` channel (hotkey/menu → pipeline) — install the TIS
+/// keyboard-language watcher, and fire the proactive microphone-permission
+/// prompt on the freshly opened event channel. Split out of
+/// [`wire_production`] (CONSTITUTION rule 28).
+///
+/// Returns `(event_tx, event_rx, cmd_tx, cmd_rx)`.
+fn open_dictation_channels() -> (
+    Sender<DictationEvent>,
+    Receiver<DictationEvent>,
+    Sender<DictationCommand>,
+    Receiver<DictationCommand>,
+) {
+    // TIS is main-thread-only (uncatchable SIGTRAP off-main): install the
+    // keyboard-language watcher here, on the main thread, so the pipeline
+    // thread reads its cache instead of ever touching TIS itself.
+    vuho_os_integration::install_language_watcher(
+        objc2::MainThreadMarker::new()
+            .expect("open_dictation_channels runs on the main thread (called from wire_production)"),
+    );
+
+    let (event_tx, event_rx) = unbounded::<DictationEvent>();
+    let (cmd_tx, cmd_rx) = unbounded::<DictationCommand>();
+
+    // Request microphone permission proactively on the main thread.
+    // macOS TCC dialogs only appear reliably from the main run-loop;
+    // if we wait until vuho_start_stream (called from a background thread),
+    // the dialog may never appear and the stream fails silently.
+    request_mic_permission_on_startup(&event_tx);
+
+    (event_tx, event_rx, cmd_tx, cmd_rx)
 }
 
 /// Check microphone permission status at app startup.
@@ -518,9 +542,14 @@ enum ProvisionOutcome {
     /// on this thread, in place — win or lose, `cmd_rx` needs draining.
     RetriedBlocking,
     /// The command was ignored: already [`Phase::Downloading`], or
-    /// [`Phase::Ready`] (unreachable in the shipped UI — the readiness
-    /// window closes itself on `Ready` — but handled rather than left an
-    /// unspecified match arm).
+    /// [`Phase::Ready`] (unreachable in the shipped UI in practice — once
+    /// model and engine are both `Ready`, `settings_tab::should_show_speech_model_section`
+    /// hides the Speech Model card, and its Download/Retry button along
+    /// with it, so there is nothing left to click that could send this —
+    /// but handled rather than left an unspecified match arm). F23: this
+    /// does *not* close any window — there is no separate readiness window
+    /// left to self-close (ADR-021); the panel (`crate::panel`) simply stays
+    /// open on whichever tab the user left it on.
     Ignored,
 }
 
