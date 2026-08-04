@@ -12,3 +12,14 @@
   drive-by refactor outside that finding's scope — needs the same kind of split
   `render_speech_model_section`/`render_mic_row`/`render_permission_row` got in this same pass
   (e.g. extracting the headline/sub-line block and the Downloading-progress-bar block).
+- WP8 (final re-review pass, G9) found the rest of the rule-28 ledger incomplete; appending the
+  remaining offenders it found rather than silently leaving them off, per the same finding class
+  as F19 above. None of these were touched beyond what WP8's other fixes (G1-G8) required — no
+  drive-by refactor:
+  - `crates/vuho-ui/src/event_loop.rs`'s `apply_events` is ~85 lines (already ~79 before WP8; G4
+    added `maybe_show_hud_for_outcome`'s call).
+  - `crates/vuho-ui/src/event_loop.rs`'s `spawn_ui_drain` is ~64 lines.
+  - `crates/vuho-ui/src/settings_tab.rs`'s `render_hotkey_row` is ~57 lines.
+  - `crates/vuho-ui/src/panel.rs`'s `render_tab_button` is ~49 lines.
+  - `crates/vuho-ui/src/status_bar.rs`'s `install` is ~49 lines.
+  - `crates/vuho-ui/src/overlay.rs`'s `handle_event` is ~48 lines.

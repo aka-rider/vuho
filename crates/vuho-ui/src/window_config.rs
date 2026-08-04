@@ -5,15 +5,19 @@
 //!
 //! We use raw `msg_send!` with [`objc2::runtime::AnyObject`] (the `id` type)
 //! rather than objc2 wrapper types, because the wrapper crates have
-//! granular feature flags that don't cover every selector we need. The one
-//! exception is [`set_accessory_activation_policy`], which uses the typed
+//! granular feature flags that don't cover every selector we need. The two
+//! exceptions are [`set_accessory_activation_policy`], which uses the typed
 //! `NSApplication::setActivationPolicy` — the raw `objc_msgSend` workaround
-//! it used to need is gone (see that function's doc comment history).
+//! it used to need is gone (see that function's doc comment history) — and
+//! [`set_frame`]'s screen resolution, which uses the typed
+//! `NSScreen::screens`/`mainScreen`/`frame` (G2) rather than raw
+//! `msg_send!` because the array/`Option` return shapes are awkward to
+//! thread through untyped `AnyObject` pointers.
 
 use gpui::{Bounds, Pixels, Window};
 use objc2::ffi::{NSInteger, NSUInteger};
+use objc2::msg_send;
 use objc2::runtime::AnyObject;
-use objc2::{class, msg_send};
 use objc2_foundation::NSRect;
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 
@@ -127,46 +131,90 @@ pub(crate) fn make_key_and_order_front(window: &mut Window) {
 /// Move and resize the window in one atomic `setFrame:display:` call.
 ///
 /// `bounds` is in GPUI's coordinate space: top-left origin, relative to the
-/// window's own screen (the same space `Window::bounds()` reads back, and
-/// the same space GPUI's window-creation path accepts — vendored gpui
+/// *primary* display (the same space `Window::bounds()` reads back, and the
+/// same space GPUI's window-creation path accepts — vendored gpui
 /// mac/window.rs:653-659 for creation, mac/window.rs:515-530 for the
-/// matching read-back). This function converts to Cocoa's bottom-left
-/// origin, screen-absolute space using the window's own current screen
-/// (`[[ns_window screen] frame]`, falling back to `[NSScreen mainScreen]`
-/// if the window isn't currently on any screen), so a `bounds()` call
-/// immediately after this one reads back the same value that was set.
+/// matching read-back; every caller of this function derives `bounds` from
+/// `cx.primary_display()` — `panel.rs`'s `hud_bounds`/`full_bounds`/
+/// `centered_on_primary`). This function converts to Cocoa's bottom-left
+/// origin, screen-absolute space using the **primary** screen's frame
+/// (`[[NSScreen screens] firstObject]`, falling back to `[NSScreen
+/// mainScreen]` only if that array is somehow empty).
 ///
-/// `panel.rs`'s presentation-surgery chokepoint is the one caller: it
-/// re-frames the panel between the Hud's bottom-center bounds and the Full
-/// presentation's centered bounds on every presentation change.
+/// G2: this deliberately never resolves the flip against `[ns_window
+/// screen]` (the window's own current screen) — that pointer is `nil`
+/// while the window is ordered out (which `panel.rs`'s `hide_root` now
+/// triggers a `set_frame` call during, on every dismiss), and even when
+/// non-nil it reflects whatever screen the window's *previous* frame
+/// happened to overlap, not the screen `bounds` was actually computed
+/// against. GPUI's global coordinate space is anchored to the primary
+/// display's top-left, and in Cocoa's screen-absolute space the primary
+/// screen always sits at origin `(0, 0)` (macOS convention: every other
+/// screen's origin is expressed relative to it) — so the primary screen's
+/// frame is the one flip reference that is always correct for a
+/// primary-anchored `bounds`, regardless of which screen the window
+/// currently happens to be on or whether it's on screen at all. Resolving
+/// against the wrong screen on a multi-monitor setup silently reinterprets
+/// `bounds` in that screen's coordinate space, placing the window offset or
+/// off-screen.
 pub(crate) fn set_frame(window: &mut Window, bounds: Bounds<Pixels>) {
     let Some(ns_window) = get_ns_window(window) else {
         return;
     };
-    unsafe {
-        let mut screen: *mut AnyObject = msg_send![ns_window, screen];
-        if screen.is_null() {
-            screen = msg_send![class!(NSScreen), mainScreen];
-        }
-        if screen.is_null() {
-            log::warn!("window_config: no screen available to place the window on");
-            return;
-        }
-        let screen_frame: NSRect = msg_send![screen, frame];
+    let Some(mtm) = objc2::MainThreadMarker::new() else {
+        log::warn!("window_config: set_frame called off the main thread");
+        return;
+    };
+    let screens = objc2_app_kit::NSScreen::screens(mtm);
+    let screen = screens
+        .firstObject()
+        .or_else(|| objc2_app_kit::NSScreen::mainScreen(mtm));
+    let Some(screen) = screen else {
+        log::warn!("window_config: no screen available to place the window on");
+        return;
+    };
+    let screen_frame = screen.frame();
 
-        let (cocoa_x, cocoa_y) = gpui_origin_to_cocoa(
-            bounds.origin.x.to_f64(),
-            bounds.origin.y.to_f64(),
-            bounds.size.height.to_f64(),
-            screen_frame.origin.x,
-            screen_frame.origin.y,
-            screen_frame.size.height,
-        );
-        let frame = NSRect::new(
-            objc2_foundation::NSPoint::new(cocoa_x, cocoa_y),
-            objc2_foundation::NSSize::new(bounds.size.width.to_f64(), bounds.size.height.to_f64()),
-        );
+    let (cocoa_x, cocoa_y) = gpui_origin_to_cocoa(
+        bounds.origin.x.to_f64(),
+        bounds.origin.y.to_f64(),
+        bounds.size.height.to_f64(),
+        screen_frame.origin.x,
+        screen_frame.origin.y,
+        screen_frame.size.height,
+    );
+    let frame = NSRect::new(
+        objc2_foundation::NSPoint::new(cocoa_x, cocoa_y),
+        objc2_foundation::NSSize::new(bounds.size.width.to_f64(), bounds.size.height.to_f64()),
+    );
+    unsafe {
         let _: () = msg_send![ns_window, setFrame: frame, display: true];
+    }
+}
+
+/// Make a currently-key window give up key status while staying visible
+/// (G3a): `orderOut:` resigns key status (`AppKit` must hand key status to
+/// some other window, or none), then a plain `orderFront:` (never
+/// `makeKeyAndOrderFront:`) re-fronts it without reclaiming key. A no-op
+/// when the window isn't currently key.
+///
+/// `panel.rs`'s `on_session_started` calls this when a dictation session
+/// starts while the Full presentation happens to be key: the nonactivating
+/// panel taking system keyboard focus is normally harmless, but a session
+/// starting means the user is about to dictate into some *other* app, and
+/// `inject_text`'s synthesized ⌘V is delivered to whatever window is key at
+/// the moment it fires — leaving the panel key would send it into Vuho's
+/// own window instead of the target app.
+pub(crate) fn resign_key_keep_front(window: &mut Window) {
+    let Some(ns_window) = get_ns_window(window) else {
+        return;
+    };
+    unsafe {
+        let is_key: bool = msg_send![ns_window, isKeyWindow];
+        if is_key {
+            let _: () = msg_send![ns_window, orderOut: std::ptr::null_mut::<AnyObject>()];
+            let _: () = msg_send![ns_window, orderFront: std::ptr::null_mut::<AnyObject>()];
+        }
     }
 }
 

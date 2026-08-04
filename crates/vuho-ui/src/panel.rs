@@ -120,9 +120,20 @@ pub(crate) struct PanelRoot {
     active_tab: Tab,
     /// Whether the window is currently ordered in (visible on screen).
     shown: bool,
-    /// Spawned by [`show_full`], dropped by [`hide_if_hud`] — see
-    /// `start_permissions_poll`'s doc comment. `None` under `--features
-    /// demo`, which never reaches [`Presentation::Full`].
+    /// Spawned by [`show_full`] (guarded against a duplicate spawn — see its
+    /// doc comment), self-terminating inside [`start_permissions_poll`]'s
+    /// own loop once `!shown && permissions_missing.is_empty()` (G1) —
+    /// **not** bounded to the panel's own visibility. Invariant: whenever
+    /// `StatusModel::permissions_missing` is non-empty, a poll must keep
+    /// running until it observes that list empty, regardless of whether the
+    /// panel is currently shown — otherwise a permission granted after the
+    /// user dismisses the panel would leave the tray/menu stuck on
+    /// `CompositeStatus::PermissionsMissing` forever, since nothing else
+    /// ever re-derives that field. [`hide_root`] therefore only clears this
+    /// field early when `permissions_missing` is already empty; otherwise
+    /// it leaves the task running past dismissal, to be cleaned up by its
+    /// own self-termination once permissions converge. `None` under
+    /// `--features demo`, which never reaches [`Presentation::Full`].
     #[cfg(not(feature = "demo"))]
     permissions_poll: Option<gpui::Task<()>>,
     pub(crate) overlay: Entity<OverlayModel>,
@@ -293,7 +304,16 @@ fn full_bounds(cx: &App) -> Bounds<Pixels> {
 /// frame, click-through, and (Full only) key status. The **only** place
 /// either transition's window-level effects are applied — every public
 /// transition function below goes through this.
-fn apply_presentation(window: &mut Window, cx: &App, presentation: Presentation) {
+///
+/// `grab_key` only matters for the [`Presentation::Full`] arm — the Hud arm
+/// never takes key status regardless of this parameter, so a Hud-bound
+/// caller may pass either value. G3(c): [`show_full`] passes `false` when a
+/// session is currently recording, so opening the panel mid-dictation
+/// (e.g. a `Failed` model status, or the user clicking the tray icon) plain
+/// `order_front`s the window instead of stealing key status — and with it,
+/// the destination of `inject_text`'s synthesized ⌘V — from the app the
+/// user is dictating into.
+fn apply_presentation(window: &mut Window, cx: &App, presentation: Presentation, grab_key: bool) {
     match presentation {
         Presentation::Hud => {
             window_config::set_frame(window, hud_bounds(cx));
@@ -302,33 +322,52 @@ fn apply_presentation(window: &mut Window, cx: &App, presentation: Presentation)
         Presentation::Full => {
             window_config::set_frame(window, full_bounds(cx));
             window_config::set_click_through(window, false);
-            window_config::make_key_and_order_front(window);
+            if grab_key {
+                window_config::make_key_and_order_front(window);
+            } else {
+                window_config::order_front(window);
+            }
         }
     }
 }
 
 // ── Public transitions ─────────────────────────────────────────────────────
 
-/// Show the Full presentation on `tab`, re-fronting the panel and giving it
-/// key status. Starts the permissions poll and, when opening on the
-/// Settings tab, refreshes its device list (a device plugged in since the
-/// tab was last shown should already be there).
+/// Show the Full presentation on `tab`, re-fronting the panel and — unless a
+/// session is currently recording (G3(c)) — giving it key status. Seeds
+/// `StatusModel::permissions_missing` synchronously (G7) so the Settings
+/// tab's very first paint is already truthful, then starts the permissions
+/// poll (guarded against a duplicate: a no-op if one is already running —
+/// G1), and, when opening on the Settings tab, refreshes its device list (a
+/// device plugged in since the tab was last shown should already be there).
 #[cfg(not(feature = "demo"))]
 pub(crate) fn show_full(panel: WindowHandle<PanelRoot>, tab: Tab, cx: &mut App) {
-    let _ = panel.update(cx, |root, window, cx| {
-        root.presentation = Presentation::Full;
-        root.active_tab = tab;
-        apply_presentation(window, cx, Presentation::Full);
-        root.shown = true;
-        if tab == Tab::Settings {
-            root.settings.update(cx, SettingsTab::refresh_devices);
-        }
-        cx.notify();
-    });
-    let task = start_permissions_poll(panel, cx);
-    let _ = panel.update(cx, |root, _window, _cx| {
-        root.permissions_poll = Some(task);
-    });
+    let needs_poll = panel
+        .update(cx, |root, window, cx| {
+            root.presentation = Presentation::Full;
+            root.active_tab = tab;
+            let grab_key = !root.overlay.read(cx).is_recording();
+            apply_presentation(window, cx, Presentation::Full, grab_key);
+            root.shown = true;
+            if tab == Tab::Settings {
+                root.settings.update(cx, SettingsTab::refresh_devices);
+            }
+            // G7: seed synchronously, through the same derivation the poll
+            // itself uses, so the Settings tab's first paint (right here,
+            // via `cx.notify()` below) is never one frame stale — the
+            // poll's own cx.spawn'd task hasn't had a chance to run its
+            // first tick yet at this point.
+            refresh_permissions_missing(&root.status, cx);
+            cx.notify();
+            root.permissions_poll.is_none()
+        })
+        .unwrap_or(false);
+    if needs_poll {
+        let task = start_permissions_poll(panel, cx);
+        let _ = panel.update(cx, |root, _window, _cx| {
+            root.permissions_poll = Some(task);
+        });
+    }
 }
 
 /// The tray icon's plain-click / "Open Vuho" action: hide the panel if it's
@@ -355,22 +394,57 @@ pub(crate) fn open_from_tray(panel: WindowHandle<PanelRoot>, cx: &mut App) {
     }
 }
 
+/// Show the panel as the Hud if it isn't currently visible at all — the
+/// shared "make sure something is on screen" step behind both
+/// [`on_session_started`] (a session actually beginning) and G4's
+/// [`show_hud_for_outcome`] (a `SessionCompleted` outcome that still needs
+/// the user's attention, arriving after the panel was already dismissed).
+/// No-op while the panel is already shown, in either presentation — never
+/// re-frames or steals focus from a window already on screen.
+fn show_hud_if_hidden(root: &mut PanelRoot, window: &mut Window, cx: &App) {
+    if root.shown {
+        return;
+    }
+    root.presentation = Presentation::Hud;
+    apply_presentation(window, cx, Presentation::Hud, false);
+    window_config::order_front(window);
+    root.shown = true;
+}
+
 /// React to a dictation session actually starting (`event_loop`'s
 /// `SessionStarted`/show-worthy-`Error` handling): show the panel as the Hud
-/// if it wasn't visible at all, or switch a currently-open Full presentation
-/// back to the Overlay tab so the live transcript is never hidden behind
-/// Settings — but never re-frame or steal key status from an open Full
-/// presentation, which would be jarring mid-click.
+/// if it wasn't visible at all ([`show_hud_if_hidden`]), or switch a
+/// currently-open Full presentation back to the Overlay tab so the live
+/// transcript is never hidden behind Settings — but never re-frame a panel
+/// the user already has open. G3(a): if that already-open Full presentation
+/// happens to be key, it yields key status
+/// (`window_config::resign_key_keep_front`) — a session starting means the
+/// user is about to dictate into some *other* app, and the panel keeping
+/// key status would send `inject_text`'s synthesized ⌘V into itself
+/// instead.
 pub(crate) fn on_session_started(panel: WindowHandle<PanelRoot>, cx: &mut App) {
     let _ = panel.update(cx, |root, window, cx| {
-        if !root.shown {
-            root.presentation = Presentation::Hud;
-            apply_presentation(window, cx, Presentation::Hud);
-            window_config::order_front(window);
-            root.shown = true;
-        } else if root.presentation == Presentation::Full {
+        let was_shown = root.shown;
+        show_hud_if_hidden(root, window, cx);
+        if was_shown && root.presentation == Presentation::Full {
             root.active_tab = Tab::Overlay;
+            window_config::resign_key_keep_front(window);
         }
+        cx.notify();
+    });
+}
+
+/// G4: re-show the panel as the Hud when a `SessionCompleted` whose outcome
+/// still needs the user's attention (`InjectionOutcome::ClipboardOnly`/
+/// `Failed`) arrives after the panel was already dismissed mid-session —
+/// otherwise "Copied to clipboard — ⌘V to paste" or a failure message would
+/// flash into a hidden window and never be seen. Shares
+/// [`show_hud_if_hidden`] with [`on_session_started`], so it's a no-op while
+/// the panel is already shown, in either presentation.
+#[cfg(not(feature = "demo"))]
+pub(crate) fn show_hud_for_outcome(panel: WindowHandle<PanelRoot>, cx: &mut App) {
+    let _ = panel.update(cx, |root, window, cx| {
+        show_hud_if_hidden(root, window, cx);
         cx.notify();
     });
 }
@@ -397,12 +471,18 @@ pub(crate) fn hide_if_hud(panel: WindowHandle<PanelRoot>, cx: &mut App) {
         }
         window_config::order_out(window);
         root.shown = false;
-        // No `permissions_poll = None` here (F4): reaching this point
-        // already means `presentation == Hud`, and the only two ways to get
-        // there are (a) the panel never left `Presentation::Hud` at all —
-        // the poll, which only [`show_full`] ever starts, was never
-        // spawned — or (b) [`hide`] already ran and cleared it. Either way
-        // the field is already `None`; a second clear here was dead code.
+        // permissions_poll is deliberately left untouched here (F4, amended
+        // G1): reaching this point already means `presentation == Hud`, and
+        // the only two ways to get there are (a) the panel never left
+        // `Presentation::Hud` at all — the poll, which only [`show_full`]
+        // ever starts, was never spawned — or (b) [`hide`] already ran
+        // (`hide_root`). In case (b), G1 means `hide_root` may have
+        // deliberately left a still-running poll alive (permissions were
+        // still missing at dismissal time) rather than clearing the field —
+        // see `permissions_poll`'s own doc comment for the invariant this
+        // preserves. Either way, this function has nothing new to decide:
+        // it's not the one responsible for the field either at rest (`None`)
+        // or while a poll is legitimately still converging.
         cx.notify();
     });
 }
@@ -421,7 +501,11 @@ pub(crate) fn hide(panel: WindowHandle<PanelRoot>, cx: &mut App) {
 }
 
 /// The shared body of "unconditionally close the panel": order the window
-/// out, drop the permissions poll, and reset to [`Presentation::Hud`]
+/// out, close any open Settings dropdowns (G6 — a stale mic/hotkey list
+/// left open across a dismiss/reopen is never useful), drop the permissions
+/// poll only if it has nothing left to converge on (G1 — see
+/// `permissions_poll`'s own doc comment for the invariant a still-missing
+/// poll must keep running past dismissal), and reset to [`Presentation::Hud`]
 /// (re-applying Hud surgery — re-frame + click-through — while hidden, so
 /// the next [`on_session_started`] shows a correctly-framed, click-through
 /// Hud instead of whatever frame/click-through state the Full presentation
@@ -433,51 +517,85 @@ pub(crate) fn hide(panel: WindowHandle<PanelRoot>, cx: &mut App) {
 /// entry point used by `event_loop`/the tray/Esc) and the tab strip's close
 /// button (already inside a `PanelRoot` update, with no need to re-enter
 /// through a `WindowHandle`) call, so there is exactly one hide
-/// implementation, not two.
+/// implementation, not two. Takes `cx: &mut App` (not the read-only `&App`
+/// this used before G6) because closing the Settings dropdowns goes through
+/// `Entity::update`, which requires mutable access.
 #[cfg(not(feature = "demo"))]
-fn hide_root(root: &mut PanelRoot, window: &mut Window, cx: &App) {
+fn hide_root(root: &mut PanelRoot, window: &mut Window, cx: &mut App) {
     window_config::order_out(window);
     root.shown = false;
-    root.permissions_poll = None;
+    if root.status.read(cx).permissions_missing.is_empty() {
+        root.permissions_poll = None;
+    }
+    root.settings
+        .update(cx, |settings, _cx| settings.close_dropdowns());
     root.presentation = Presentation::Hud;
-    apply_presentation(window, cx, Presentation::Hud);
+    apply_presentation(window, cx, Presentation::Hud, false);
 }
 
 // ── Permissions poll ─────────────────────────────────────────────────────
 
-/// Re-check [`readiness::missing_permissions`] immediately, then every
-/// [`PERMISSIONS_POLL_INTERVAL`] thereafter, while the Full presentation is
-/// open, and write the result into `StatusModel::permissions_missing` —
-/// only when it actually changed, so a granted-permission tick that changes
-/// nothing never triggers a spurious repaint. Sanctioned pull-only TCC
-/// polling (no wall-clock ordering of events), bounded to the panel's own
-/// visibility by [`show_full`] spawning it and [`hide`]/[`hide_if_hud`]
-/// dropping it — mirrors the old readiness window's `spawn_poll_loop`
-/// (studied, then reimplemented minimally against `StatusModel` instead of
-/// a bespoke view field).
+/// Refresh `StatusModel::permissions_missing` from
+/// [`readiness::missing_permissions`], writing only when the value actually
+/// changed (so a granted-permission tick that changes nothing never
+/// triggers a spurious repaint) — returns whether the freshly-read list is
+/// empty. The single derivation every writer goes through (G7/F6):
+/// [`show_full`]'s synchronous first-paint seed and
+/// [`start_permissions_poll`]'s own tick both call this and can therefore
+/// never disagree in shape (`main.rs`'s `run_gate_blocked` seed is the one
+/// remaining writer that predates the panel existing at all and so can't
+/// call it — see that function's own doc comment).
+#[cfg(not(feature = "demo"))]
+fn refresh_permissions_missing(status: &Entity<StatusModel>, cx: &mut App) -> bool {
+    let missing = readiness::missing_permissions();
+    let is_empty = missing.is_empty();
+    status.update(cx, |status, cx| {
+        if status.permissions_missing != missing {
+            status.permissions_missing = missing;
+            cx.notify();
+        }
+    });
+    is_empty
+}
+
+/// Re-check permissions immediately (via [`refresh_permissions_missing`]),
+/// then every [`PERMISSIONS_POLL_INTERVAL`] thereafter. Sanctioned
+/// pull-only TCC polling (no wall-clock ordering of events).
+///
+/// G1: self-terminates once `!shown && missing.is_empty()` — **not**
+/// bounded to the panel's own visibility. A poll spawned while the Full
+/// presentation was open must keep running even after the user dismisses
+/// the panel, for as long as permissions are still missing: only this loop
+/// ever clears `StatusModel::permissions_missing`, so a poll that stopped
+/// the moment the panel was hidden would leave the tray/menu stuck
+/// reporting `CompositeStatus::PermissionsMissing` forever once the grant
+/// actually lands with nobody watching for it. [`show_full`] guards against
+/// a duplicate spawn (only starts a new poll when `permissions_poll` is
+/// `None`); [`hide_root`] mirrors this loop's own termination condition,
+/// only clearing the field early when permissions are already granted.
 ///
 /// The immediate first tick (F4) runs *before* the first wait, not after —
 /// without it, `StatusModel::permissions_missing` would sit on whatever
-/// `show_full`'s caller seeded it with for a full [`PERMISSIONS_POLL_INTERVAL`]
-/// before this task ever wrote anything, even though the Settings tab is
-/// already on screen and the user may already be mid-grant.
+/// `show_full`'s own G7 seed left it at for a full
+/// [`PERMISSIONS_POLL_INTERVAL`] before this task's first write.
 #[cfg(not(feature = "demo"))]
 fn start_permissions_poll(panel: WindowHandle<PanelRoot>, cx: &mut App) -> gpui::Task<()> {
     cx.spawn(move |cx: &mut AsyncApp| {
         let mut cx = cx.clone();
         async move {
             loop {
-                let missing = readiness::missing_permissions();
-                let updated = panel.update(&mut cx, |root, _window, cx| {
-                    root.status.update(cx, |status, cx| {
-                        if status.permissions_missing != missing {
-                            status.permissions_missing = missing;
-                            cx.notify();
-                        }
-                    });
+                let result = panel.update(&mut cx, |root, _window, cx| {
+                    let is_empty = refresh_permissions_missing(&root.status, cx);
+                    (root.shown, is_empty)
                 });
-                if updated.is_err() {
+                let Ok((shown, is_empty)) = result else {
                     log::info!("panel: permissions poll stopping — panel window gone");
+                    return;
+                };
+                if !shown && is_empty {
+                    log::info!(
+                        "panel: permissions poll stopping — panel hidden and permissions granted"
+                    );
                     return;
                 }
                 cx.background_executor()
@@ -636,9 +754,14 @@ impl PanelRoot {
     }
 
     /// The active tab's body, filling the remaining space below the strip.
-    /// `.p_4()` here is the one padding chokepoint (F16) both tabs share, so
-    /// neither insets differently (the idle status block used to carry its
-    /// own divergent `.p_6()`, removed — see [`Self::render_idle_status`]).
+    ///
+    /// `.p_4()` here is the Settings tab's own padding chokepoint (G5:
+    /// previously shared with the Overlay tab too, which double-padded
+    /// whenever a session was live — `OverlayModel::render_content` already
+    /// carries its own `px_6`/`py_4` inset, since it's also embedded
+    /// unpadded in the Hud presentation's chrome). The Overlay tab now
+    /// insets nowhere here; [`Self::render_overlay_tab`] applies padding
+    /// only to its idle-status branch, which has none of its own.
     ///
     /// The Settings tab additionally scrolls (F2 — its content routinely
     /// overflows [`FULL_HEIGHT`]): `.id(..)` + `.overflow_y_scroll()` is
@@ -652,7 +775,6 @@ impl PanelRoot {
         match self.active_tab {
             Tab::Overlay => div()
                 .flex_1()
-                .p_4()
                 .overflow_hidden()
                 .child(self.render_overlay_tab(cx))
                 .into_any_element(),
@@ -669,11 +791,22 @@ impl PanelRoot {
     /// The Overlay tab's body: the live overlay content while a session is
     /// actually in progress or its outcome is still flashing, otherwise an
     /// idle status block driven by `StatusModel`.
+    ///
+    /// G5: the two branches pad differently, deliberately.
+    /// `OverlayModel::render_content` already carries its own `px_6`/`py_4`
+    /// inset (shared with the Hud presentation, which embeds it unpadded —
+    /// see that method's doc comment), so wrapping it in another `.p_4()`
+    /// here would double-pad it; [`Self::render_idle_status`] has no inset
+    /// of its own, so this is the one place that supplies it.
     fn render_overlay_tab(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
         if self.overlay.read(cx).has_session_content() {
             return self.overlay.read(cx).render_content();
         }
-        self.render_idle_status(cx).into_any_element()
+        div()
+            .size_full()
+            .p_4()
+            .child(self.render_idle_status(cx))
+            .into_any_element()
     }
 
     /// The idle status block: `StatusModel::idle_headline`'s headline/
@@ -682,9 +815,12 @@ impl PanelRoot {
     /// button that switches to the Settings tab. Never a disabled dead
     /// button: the button simply doesn't render for every other state.
     ///
-    /// No outer padding of its own (F16) — [`Self::render_tab_body`]'s
-    /// `.p_4()` is the shared chokepoint both tabs inset from; this used to
-    /// carry its own `.p_6()`, diverging from the Settings tab's padding.
+    /// No outer padding of its own (F16, amended G5) —
+    /// [`Self::render_overlay_tab`]'s idle branch is the padding chokepoint
+    /// this inherits from now (`render_tab_body`'s own `.p_4()` applies to
+    /// the Settings tab only, since G5 found live overlay content
+    /// double-padded under the old shared chokepoint); this used to carry
+    /// its own `.p_6()`, diverging from the Settings tab's padding.
     fn render_idle_status(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let status = self.status.read(cx);
         let (headline, sub) = status.idle_headline();

@@ -96,6 +96,21 @@ impl SettingsTab {
         cx.notify();
     }
 
+    /// Close both dropdowns without touching anything else (G6) — called by
+    /// `panel::hide_root` so dismissing the panel mid-selection doesn't
+    /// silently leave a dropdown open, which would otherwise show a
+    /// microphone list that's gone stale by the time the panel reopens
+    /// (`refresh_devices` only re-snapshots when a dropdown is opened, and
+    /// a still-open dropdown never re-opens). No `cx.notify()` here — the
+    /// panel is being hidden, not re-rendered, and the next legitimate
+    /// render (`show_full`'s own `refresh_devices` call on the Settings
+    /// tab, or any other `StatusModel`-driven repaint) already picks up the
+    /// closed state.
+    pub(crate) fn close_dropdowns(&mut self) {
+        self.mic_open = false;
+        self.hotkey_open = false;
+    }
+
     /// Connect a just-started production hotkey listener into this tab —
     /// called once by `wiring::wire_production`, right after
     /// `wiring::start_hotkey` succeeds, so the hotkey dropdown can

@@ -11,7 +11,7 @@
 use std::time::Instant;
 
 use gpui::{App, WindowHandle};
-use vuho_domain::{DictationEvent, ErrorKind};
+use vuho_domain::{DictationEvent, ErrorKind, InjectionOutcome};
 
 use crate::panel::{self, PanelRoot};
 use crate::{overlay, permissions};
@@ -49,6 +49,41 @@ fn set_recording(status: &StatusHandle, recording: bool, cx: &mut gpui::AsyncApp
 #[cfg(feature = "demo")]
 #[allow(clippy::trivially_copy_pass_by_ref)]
 fn set_recording(_status: &StatusHandle, _recording: bool, _cx: &mut gpui::AsyncApp) {}
+
+/// G4: re-show the panel as the Hud when a finished session's outcome still
+/// needs the user's attention — `ClipboardOnly` (the user must press ⌘V
+/// themselves) or `Failed` (genuine data loss) — in case the panel was
+/// already dismissed mid-session. `panel::show_hud_for_outcome` is already a
+/// no-op while the panel is shown in either presentation, so this never
+/// needs its own visibility check first. `Inserted`/`NothingToInject` never
+/// call it: a successful (or empty) outcome needs no attention after an
+/// explicit dismiss.
+///
+/// No-op under `--features demo`, which has no dismiss affordance for a
+/// user to have used in the first place (`panel::show_hud_for_outcome`
+/// isn't even compiled there — see its own `#[cfg]`).
+#[cfg(not(feature = "demo"))]
+fn maybe_show_hud_for_outcome(
+    panel: WindowHandle<PanelRoot>,
+    injection: &InjectionOutcome,
+    cx: &mut gpui::AsyncApp,
+) {
+    let needs_attention = matches!(
+        injection,
+        InjectionOutcome::ClipboardOnly { .. } | InjectionOutcome::Failed { .. }
+    );
+    if needs_attention {
+        let _ = cx.update(|cx| panel::show_hud_for_outcome(panel, cx));
+    }
+}
+
+#[cfg(feature = "demo")]
+fn maybe_show_hud_for_outcome(
+    _panel: WindowHandle<PanelRoot>,
+    _injection: &InjectionOutcome,
+    _cx: &mut gpui::AsyncApp,
+) {
+}
 
 /// Poll interval for both the demo and production event drains (~60 Hz).
 pub(crate) const DRAIN_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(16);
@@ -141,10 +176,12 @@ fn track_session(event: &DictationEvent, session_active: &mut bool) -> bool {
 }
 
 /// Apply one drained batch to the panel's overlay entity: forward non-stale
-/// events to the model, prompt for mic access on a mic-permission error, and
-/// (re)schedule the hide timer — then, once every event in the batch has
-/// been forwarded, apply the one panel-level transition the batch implies
-/// (`panel::on_session_started` when `show` — `SessionStarted`, or a
+/// events to the model, prompt for mic access on a mic-permission error,
+/// (re)schedule the hide timer, and re-show a dismissed panel when a
+/// `SessionCompleted`'s outcome still needs attention
+/// (`maybe_show_hud_for_outcome`, G4) — then, once every event in the batch
+/// has been forwarded, apply the one panel-level transition the batch
+/// implies (`panel::on_session_started` when `show` — `SessionStarted`, or a
 /// show-worthy `Error` — was seen). Returns the updated hide deadline.
 ///
 /// `session_active` persists across calls (like `hide_at`) so a stale
@@ -186,6 +223,9 @@ pub(crate) fn apply_events(
                 );
                 set_recording(status, false, cx);
                 hide_at = hide_at_for_injection(injection, Instant::now());
+                // G4: a ClipboardOnly/Failed outcome must still be seen even
+                // if the panel was dismissed mid-session — re-show it.
+                maybe_show_hud_for_outcome(panel, injection, cx);
             }
             DictationEvent::Error {
                 recoverable,
@@ -368,7 +408,6 @@ pub(crate) fn spawn_ui_drain(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use vuho_domain::InjectionOutcome;
 
     // ── Bug 2 / finding 6 fix: stale `SessionCompleted` detection ───────────
 

@@ -234,16 +234,17 @@ fn run_gate_blocked(
     status.update(cx, |model, cx| {
         model.launch_blocked = true;
         // Seeded with the same derivation (`readiness::missing_permissions()`)
-        // `panel::start_permissions_poll` writes on every tick — see
-        // `StatusModel::permissions_missing`'s doc comment for why this one
-        // synchronous write coexists with the poll instead of leaving the
-        // field to the poll alone (F4): without it, the tray's very first
-        // paint (below, via `status_bar::install`) would see an empty
-        // `permissions_missing` and derive `RelaunchRequired` instead of
-        // `PermissionsMissing` for one visible frame, since the poll's own
-        // (now-immediate) first tick hasn't run yet at this point — it's
-        // spawned by `panel::show_full` further down, and `cx.spawn`'d tasks
-        // don't run synchronously inline.
+        // `panel::start_permissions_poll`/`panel::show_full` (G7) both write
+        // through — see `StatusModel::permissions_missing`'s doc comment for
+        // the full list of writer sites and why this one synchronous write
+        // coexists with them instead of leaving the field to the async ones
+        // alone (F4): without it, the tray's very first paint (below, via
+        // `status_bar::install`) would see an empty `permissions_missing`
+        // and derive `RelaunchRequired` instead of `PermissionsMissing` for
+        // one visible frame — `status_bar::install` runs *before*
+        // `panel::show_full` further down (whose own G7 seed would
+        // otherwise be the first write), and neither it nor a `cx.spawn`'d
+        // poll task runs synchronously inline at this point.
         model.permissions_missing = missing;
         cx.notify();
     });

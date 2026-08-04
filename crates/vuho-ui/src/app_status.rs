@@ -61,22 +61,28 @@ pub(crate) struct StatusModel {
     pub recording: bool,
     pub hotkey: HotkeyState,
     /// Every permission still missing, each with its live [`Access`] —
-    /// derived exclusively by `readiness::missing_permissions()` (F6), the
-    /// identical call [`crate::panel::start_permissions_poll`]'s every-tick
-    /// write and this field's one-time gate-path seed
-    /// (`main.rs`'s `run_gate_blocked`) both go through, so the two writers
-    /// can never disagree in shape. Two writers, one derivation: the seed
-    /// exists only so the tray's very first paint — which happens
-    /// synchronously in `main.rs`, before the poll's `cx.spawn`'d task has
-    /// had a chance to run even its own immediate first tick — already
-    /// shows the correct composite state instead of one visibly wrong frame
-    /// (`launch_blocked` true with an empty `permissions_missing` derives
+    /// derived exclusively by `readiness::missing_permissions()` (F6).
+    /// Three writer *sites*, one derivation (G7 added the second of them):
+    /// `main.rs`'s `run_gate_blocked` one-time gate-path seed (writes
+    /// `readiness::missing_permissions()` inline — it runs before the panel
+    /// exists, so it can't call the shared helper below), and
+    /// `crate::panel`'s `show_full` (a synchronous seed on every Full-
+    /// presentation open, through the private `refresh_permissions_missing`
+    /// helper) and `start_permissions_poll` (that same helper, on every
+    /// tick) — the latter two are the same derivation by construction, so
+    /// they can never disagree in shape with each other, and all three read
+    /// the identical `readiness::missing_permissions()` call. The seeds
+    /// exist only so a Settings-tab-showing first paint — the tray's, via
+    /// `run_gate_blocked` (`main.rs`), or the panel's own, via `show_full`
+    /// (G7) — never renders one visibly wrong frame from a field the async
+    /// poll hasn't had a chance to write to yet (`launch_blocked` true with
+    /// an empty `permissions_missing` derives
     /// [`CompositeStatus::RelaunchRequired`], not
-    /// [`CompositeStatus::PermissionsMissing`]); every write after that one
-    /// seed is the poll's alone. `settings_tab.rs`'s permission rows render
-    /// purely from this field (plus [`Permission::ALL`] for the granted
-    /// rows) — never a fresh `Permission::access()` call at render time,
-    /// which used to race the poll's own 500 ms tick.
+    /// [`CompositeStatus::PermissionsMissing`]); every write after a seed is
+    /// the poll's alone. `settings_tab.rs`'s permission rows render purely
+    /// from this field (plus [`Permission::ALL`] for the granted rows) —
+    /// never a fresh `Permission::access()` call at render time, which used
+    /// to race the poll's own 500 ms tick.
     pub permissions_missing: Vec<(Permission, Access)>,
     /// `true` when the app started on the permission-gate path — a relaunch
     /// is required after granting for the new process identity to carry
