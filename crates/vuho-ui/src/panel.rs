@@ -1,14 +1,24 @@
 //! The unified panel (ARCHITECTURE.md ADR-021): one non-activating,
-//! always-on-top `NSPanel` with two presentations —
+//! always-on-top `NSPanel` occupying **one constant frame**
+//! ([`panel_bounds`] — bottom-center on the primary display, never moved and
+//! never resized), with two presentations painted into it:
 //!
-//! - [`Presentation::Hud`]: the dictation overlay, unchanged from the old
-//!   standalone overlay window — bottom-center, click-through, shown on
-//!   `SessionStarted`, auto-hidden per outcome.
-//! - [`Presentation::Full`]: a centered, opaque, tabbed window (Overlay /
-//!   Settings) that replaces the old lazy settings window *and* the
-//!   permission/model readiness window — the Settings tab shows permission
-//!   rows and speech-model provisioning exactly like the old gate window
-//!   did, so opening the panel on the Settings tab at launch *is* the gate.
+//! - [`Presentation::Hud`]: the dictation overlay — click-through, shown on
+//!   `SessionStarted`, auto-hidden per outcome. Paints only the bottom
+//!   [`crate::overlay::HUD_CHROME_HEIGHT`] of the frame (see
+//!   [`crate::overlay::hud_chrome`]) and leaves the rest transparent, so it
+//!   looks and sits exactly like the old standalone overlay window.
+//! - [`Presentation::Full`]: a near-opaque, tabbed presentation (Overlay /
+//!   Settings) filling the whole frame, replacing the old lazy settings
+//!   window *and* the permission/model readiness window — the Settings tab
+//!   shows permission rows and speech-model provisioning exactly like the old
+//!   gate window did, so opening the panel on the Settings tab at launch *is*
+//!   the gate.
+//!
+//! The two presentations deliberately share one frame: when they had their
+//! own (460×180 bottom-center vs. 460×480 screen-centered), starting
+//! dictation and then opening the panel moved *and* resized the window under
+//! the user, which read as two different windows rather than one.
 //!
 //! Compiled under both `--features demo` and production: the demo build's
 //! [`PanelRoot`] never leaves [`Presentation::Hud`] (there is no
@@ -45,22 +55,22 @@ use crate::theme;
 #[cfg(not(feature = "demo"))]
 use vuho_domain::ModelStatus;
 
-/// Distance from the bottom of the display to the Hud's bottom edge.
-/// Unchanged from the old overlay window's `OVERLAY_BOTTOM_MARGIN`.
-const HUD_BOTTOM_MARGIN: Pixels = px(120.0);
+/// Distance from the bottom of the display to the panel's bottom edge.
+/// Unchanged from the old overlay window's `OVERLAY_BOTTOM_MARGIN`, so the
+/// Hud chrome — which the [`Presentation::Hud`] arm pins to that same bottom
+/// edge — sits exactly where it always did.
+const PANEL_BOTTOM_MARGIN: Pixels = px(120.0);
 
-/// Hud presentation dimensions — unchanged from the old overlay window's
-/// `OVERLAY_WIDTH`/`OVERLAY_HEIGHT`.
-const HUD_WIDTH: Pixels = px(460.0);
-const HUD_HEIGHT: Pixels = px(180.0);
-
-/// Full presentation dimensions: ~460×480, centered on the primary display.
-/// Raised from 420 (F2) — the Settings tab's content routinely exceeds 420px
-/// even before a Speech Model card is showing; the tab body now scrolls
-/// (see [`PanelRoot::render_tab_body`]) as the general fix, and the taller
-/// default keeps a first-launch scroll less likely for the common case.
-const FULL_WIDTH: Pixels = px(460.0);
-const FULL_HEIGHT: Pixels = px(480.0);
+/// The panel's one and only frame size, shared by both presentations.
+///
+/// The height is the Full presentation's requirement (the Settings tab's
+/// content routinely exceeds 420px even before a Speech Model card is
+/// showing; the tab body scrolls — see [`PanelRoot::render_tab_body`] — but
+/// the taller default keeps a first-launch scroll less likely). The Hud
+/// needs far less and simply leaves the upper part of the frame unpainted
+/// and click-through, rather than resizing the window.
+const PANEL_WIDTH: Pixels = px(460.0);
+const PANEL_HEIGHT: Pixels = px(480.0);
 
 /// Poll interval for re-checking permissions while the panel is open on the
 /// Full presentation. Matches the old readiness window's `GATE_POLL_INTERVAL`
@@ -81,9 +91,11 @@ const TAB_LABEL_SIZE: Pixels = px(13.0);
 
 /// Same hue/saturation/lightness as the Hud's translucent chrome
 /// (`overlay.rs`'s `color_panel_bg`) — both draw from `theme::PANEL_HUE`/
-/// `PANEL_SATURATION`/`PANEL_LIGHTNESS` (F20) — but opaque: the Full
-/// presentation is a real, focusable window surface, not a floating
-/// overlay, so content behind it must never show through.
+/// `PANEL_SATURATION`/`PANEL_LIGHTNESS` (F20) — but near-opaque, where the
+/// Hud is deliberately see-through: this is a surface the user reads and
+/// clicks (permission rows, dropdowns, buttons), and desktop content showing
+/// through form controls costs legibility the floating overlay can afford to
+/// spend.
 #[cfg(not(feature = "demo"))]
 const FULL_BG: gpui::Hsla = gpui::Hsla {
     h: theme::PANEL_HUE,
@@ -92,13 +104,17 @@ const FULL_BG: gpui::Hsla = gpui::Hsla {
     a: 0.97,
 };
 
-/// Which shape the panel currently renders as.
+/// Which shape the panel currently renders as. Both share one frame — see
+/// the module doc comment; a presentation decides what is *painted* into
+/// that frame, plus click-through and key status, never where the window is
+/// or how big it is.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Presentation {
-    /// The dictation overlay: bottom-center, click-through, no keyboard
-    /// focus.
+    /// The dictation overlay: click-through, no keyboard focus, painting
+    /// only the bottom of the frame.
     Hud,
-    /// The tabbed Overlay/Settings window: centered, opaque, focusable.
+    /// The tabbed Overlay/Settings presentation: near-opaque, focusable,
+    /// filling the frame.
     Full,
 }
 
@@ -174,7 +190,7 @@ pub(crate) fn create_panel(
     settings: Entity<SettingsTab>,
     cx: &mut App,
 ) -> WindowHandle<PanelRoot> {
-    let bounds = hud_bounds(cx);
+    let bounds = panel_bounds(cx);
     cx.open_window(panel_window_options(bounds), move |window, cx| {
         window.set_window_title("Vuho");
         window_config::apply_window_config(window);
@@ -202,7 +218,7 @@ pub(crate) fn create_panel(
 /// permissions to show).
 #[cfg(feature = "demo")]
 pub(crate) fn create_panel(cx: &mut App) -> WindowHandle<PanelRoot> {
-    let bounds = hud_bounds(cx);
+    let bounds = panel_bounds(cx);
     cx.open_window(panel_window_options(bounds), |window, cx| {
         window.set_window_title("Vuho");
         window_config::apply_window_config(window);
@@ -222,25 +238,21 @@ pub(crate) fn create_panel(cx: &mut App) -> WindowHandle<PanelRoot> {
 
 // ── Geometry (pure, unit-tested) ───────────────────────────────────────────
 
-fn hud_size() -> Size<Pixels> {
+fn panel_size() -> Size<Pixels> {
     Size {
-        width: HUD_WIDTH,
-        height: HUD_HEIGHT,
+        width: PANEL_WIDTH,
+        height: PANEL_HEIGHT,
     }
 }
 
-fn full_size() -> Size<Pixels> {
-    Size {
-        width: FULL_WIDTH,
-        height: FULL_HEIGHT,
-    }
-}
-
-/// Compute the Hud's top-left origin so it sits horizontally centered and
-/// `bottom_margin` above the bottom edge of the given display bounds.
+/// Compute the panel's top-left origin so it sits horizontally centered and
+/// `bottom_margin` above the bottom edge of the given display bounds —
+/// clamped so a display too short to hold `size` above `bottom_margin` pins
+/// the panel to the display's top edge instead of pushing it off-screen
+/// (the frame reaches `PANEL_HEIGHT + PANEL_BOTTOM_MARGIN` = 600px up from
+/// the bottom, which does not fit every external display).
 ///
-/// Pure helper (unit-tested); [`hud_bounds`] handles the display lookup.
-/// Moved verbatim from the old `main.rs::bottom_center_origin`.
+/// Pure helper (unit-tested); [`panel_bounds`] handles the display lookup.
 fn bottom_center_origin(
     display: Bounds<Pixels>,
     size: Size<Pixels>,
@@ -248,24 +260,27 @@ fn bottom_center_origin(
 ) -> Point<Pixels> {
     Point {
         x: display.origin.x + (display.size.width - size.width) * 0.5,
-        y: display.origin.y + display.size.height - size.height - bottom_margin,
+        y: (display.origin.y + display.size.height - size.height - bottom_margin)
+            .max(display.origin.y),
     }
 }
 
-/// `size` centered on the primary display, or at the origin if there is no
-/// display (matches `WindowBounds::centered`'s no-display fallback in
-/// spirit — this crate needs the plain `Bounds<Pixels>` shape for
-/// [`window_config::set_frame`], not the `WindowBounds` enum).
-fn centered_on_primary(size: Size<Pixels>, cx: &App) -> Bounds<Pixels> {
+/// The panel's frame: bottom-center on the primary display, at the origin if
+/// there is no display at all (matching `WindowBounds::centered`'s
+/// no-display fallback in spirit — this crate needs the plain
+/// `Bounds<Pixels>` shape for [`window_config::set_frame`], not the
+/// `WindowBounds` enum).
+///
+/// The single source of the panel's geometry: window creation and every
+/// [`apply_presentation`] call resolve through here, so no presentation, and
+/// no transition, can place the window anywhere else.
+fn panel_bounds(cx: &App) -> Bounds<Pixels> {
+    let size = panel_size();
     match cx.primary_display() {
-        Some(display) => {
-            let display_bounds = display.bounds();
-            let origin = Point {
-                x: display_bounds.origin.x + (display_bounds.size.width - size.width) * 0.5,
-                y: display_bounds.origin.y + (display_bounds.size.height - size.height) * 0.5,
-            };
-            Bounds { origin, size }
-        }
+        Some(display) => Bounds {
+            origin: bottom_center_origin(display.bounds(), size, PANEL_BOTTOM_MARGIN),
+            size,
+        },
         None => Bounds {
             origin: Point {
                 x: px(0.0),
@@ -276,34 +291,21 @@ fn centered_on_primary(size: Size<Pixels>, cx: &App) -> Bounds<Pixels> {
     }
 }
 
-/// Bottom-center bounds on the primary display; falls back to screen-centered
-/// when no display is available. Used both for the panel's initial creation
-/// bounds and for the Hud arm of [`apply_presentation`].
-fn hud_bounds(cx: &App) -> Bounds<Pixels> {
-    let size = hud_size();
-    match cx.primary_display() {
-        Some(display) => Bounds {
-            origin: bottom_center_origin(display.bounds(), size, HUD_BOTTOM_MARGIN),
-            size,
-        },
-        None => centered_on_primary(size, cx),
-    }
-}
-
-/// Centered bounds for the Full presentation. Compiled under both features
-/// even though only production ever constructs `Presentation::Full` — see
-/// [`apply_presentation`], whose `match` must stay exhaustive over
-/// [`Presentation`] regardless of `--features demo`.
-fn full_bounds(cx: &App) -> Bounds<Pixels> {
-    centered_on_primary(full_size(), cx)
-}
-
 // ── Presentation surgery (the one chokepoint — CONSTITUTION rule 26) ──────
 
 /// Apply every `NSWindow` change implied by switching to `presentation`:
-/// frame, click-through, and (Full only) key status. The **only** place
-/// either transition's window-level effects are applied — every public
-/// transition function below goes through this.
+/// click-through, and (Full only) key status. The **only** place either
+/// transition's window-level effects are applied — every public transition
+/// function below goes through this.
+///
+/// The frame is re-applied here too, but *outside* the match and identically
+/// for both presentations ([`panel_bounds`]): switching presentation must
+/// never move or resize the window. The call is not redundant — it
+/// re-resolves the frame against whichever display is primary *now*, so the
+/// panel follows a display change (a monitor unplugged, a new primary chosen
+/// in System Settings) that happened since the last time it was shown. See
+/// `window_config::set_frame`'s G2 note for why that resolution is always
+/// against the primary display.
 ///
 /// `grab_key` only matters for the [`Presentation::Full`] arm — the Hud arm
 /// never takes key status regardless of this parameter, so a Hud-bound
@@ -314,13 +316,12 @@ fn full_bounds(cx: &App) -> Bounds<Pixels> {
 /// the destination of `inject_text`'s synthesized ⌘V — from the app the
 /// user is dictating into.
 fn apply_presentation(cx: &App, presentation: Presentation, grab_key: bool) {
+    window_config::set_frame(panel_bounds(cx));
     match presentation {
         Presentation::Hud => {
-            window_config::set_frame(hud_bounds(cx));
             window_config::set_click_through(true);
         }
         Presentation::Full => {
-            window_config::set_frame(full_bounds(cx));
             window_config::set_click_through(false);
             if grab_key {
                 window_config::make_key_and_order_front();
@@ -400,7 +401,7 @@ pub(crate) fn open_from_tray(panel: WindowHandle<PanelRoot>, cx: &mut App) {
 /// [`show_hud_for_outcome`] (a `SessionCompleted` outcome that still needs
 /// the user's attention, arriving after the panel was already dismissed).
 /// No-op while the panel is already shown, in either presentation — never
-/// re-frames or steals focus from a window already on screen.
+/// steals focus from a window already on screen.
 fn show_hud_if_hidden(root: &mut PanelRoot, cx: &App) {
     if root.shown {
         return;
@@ -415,8 +416,7 @@ fn show_hud_if_hidden(root: &mut PanelRoot, cx: &App) {
 /// `SessionStarted`/show-worthy-`Error` handling): show the panel as the Hud
 /// if it wasn't visible at all ([`show_hud_if_hidden`]), or switch a
 /// currently-open Full presentation back to the Overlay tab so the live
-/// transcript is never hidden behind Settings — but never re-frame a panel
-/// the user already has open. G3(a): if that already-open Full presentation
+/// transcript is never hidden behind Settings. G3(a): if that already-open Full presentation
 /// happens to be key, it yields key status
 /// (`window_config::resign_key_keep_front`) — a session starting means the
 /// user is about to dictate into some *other* app, and the panel keeping
@@ -453,7 +453,7 @@ pub(crate) fn show_hud_for_outcome(panel: WindowHandle<PanelRoot>, cx: &mut App)
 /// `false` if the window is gone. `event_loop`'s `ModelStatus::Failed`
 /// handling uses this to decide whether a `Failed` status should surface
 /// the panel — routine ticks must never do so, but a `Failed` one should
-/// still not steal focus/re-frame a panel the user already has open.
+/// still not steal focus from a panel the user already has open.
 #[cfg(not(feature = "demo"))]
 pub(crate) fn is_shown(panel: WindowHandle<PanelRoot>, cx: &mut App) -> bool {
     panel
@@ -506,10 +506,9 @@ pub(crate) fn hide(panel: WindowHandle<PanelRoot>, cx: &mut App) {
 /// poll only if it has nothing left to converge on (G1 — see
 /// `permissions_poll`'s own doc comment for the invariant a still-missing
 /// poll must keep running past dismissal), and reset to [`Presentation::Hud`]
-/// (re-applying Hud surgery — re-frame + click-through — while hidden, so
-/// the next [`on_session_started`] shows a correctly-framed, click-through
-/// Hud instead of whatever frame/click-through state the Full presentation
-/// left behind). `active_tab` is deliberately left as-is — what tab a
+/// (re-applying Hud surgery — click-through — while hidden, so the next
+/// [`on_session_started`] shows a click-through Hud instead of the
+/// mouse-capturing state the Full presentation left behind). `active_tab` is deliberately left as-is — what tab a
 /// reopened Full presentation lands on is [`open_from_tray`]'s decision
 /// (session-content check first), not something closing needs to reset.
 ///
@@ -764,7 +763,7 @@ impl PanelRoot {
     /// only to its idle-status branch, which has none of its own.
     ///
     /// The Settings tab additionally scrolls (F2 — its content routinely
-    /// overflows [`FULL_HEIGHT`]): `.id(..)` + `.overflow_y_scroll()` is
+    /// overflows [`PANEL_HEIGHT`]): `.id(..)` + `.overflow_y_scroll()` is
     /// gpui 0.2's stateful-scroll idiom (`StatefulInteractiveElement`,
     /// vendored `gpui-0.2.2/src/elements/div.rs`) for the simple case that
     /// needs no explicit `ScrollHandle`. The Overlay tab stays
@@ -898,12 +897,40 @@ mod tests {
                 height: px(800.0),
             },
         };
-        let size = hud_size();
+        let size = panel_size();
         let origin = bottom_center_origin(display, size, px(120.0));
         // Horizontally centered: (1000 - 460) / 2 = 270.
         assert_eq!(origin.x, px(270.0));
-        // Bottom-anchored: 800 - 180 - 120 = 500.
-        assert_eq!(origin.y, px(500.0));
+        // Bottom-anchored: 800 - 480 - 120 = 200.
+        assert_eq!(origin.y, px(200.0));
+    }
+
+    /// The Hud paints a band pinned to the bottom of the shared frame rather
+    /// than sizing the window to itself, so that band has to fit inside the
+    /// frame — otherwise `hud_chrome`'s fixed height would overflow the
+    /// window and clip.
+    #[test]
+    fn hud_chrome_fits_within_the_shared_frame() {
+        assert!(crate::overlay::HUD_CHROME_HEIGHT <= PANEL_HEIGHT);
+    }
+
+    /// A display too short to fit the frame above the bottom margin pins the
+    /// panel to the display's top edge rather than pushing it off-screen.
+    #[test]
+    fn bottom_center_origin_clamps_to_short_display() {
+        let display = Bounds {
+            origin: Point {
+                x: px(0.0),
+                y: px(0.0),
+            },
+            size: Size {
+                width: px(1024.0),
+                height: px(500.0),
+            },
+        };
+        let origin = bottom_center_origin(display, panel_size(), PANEL_BOTTOM_MARGIN);
+        // Unclamped this would be 500 - 480 - 120 = -100, off the top edge.
+        assert_eq!(origin.y, px(0.0));
     }
 
     #[test]

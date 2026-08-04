@@ -107,15 +107,21 @@ pub(crate) const ERROR_RED: Hsla = Hsla {
 // ── Shared panel background (F20) ──────────────────────────────────────────
 //
 // The Hud's translucent chrome (`overlay.rs`'s `color_panel_bg`) and the
-// Full presentation's opaque chrome (`panel.rs`'s `FULL_BG`) paint the same
-// hue/saturation/lightness — only the alpha differs (translucent vs. nearly
-// opaque, each still local to its own file) — so the three magnitudes live
-// here once instead of as two independently hand-copied literals that could
-// drift apart on a future restyle.
+// Full presentation's near-opaque chrome (`panel.rs`'s `FULL_BG`) paint the
+// same hue/saturation/lightness — only the alpha differs (see-through vs.
+// nearly opaque, each still local to its own file) — so the three magnitudes
+// live here once instead of as two independently hand-copied literals that
+// could drift apart on a future restyle.
+//
+// `PANEL_LIGHTNESS` is 0.12, not the near-black 0.08 it started at: the Hud
+// is meant to read as smoked glass over the desktop (see
+// `overlay.rs`'s `PANEL_BG_OPACITY`), and at 0.08 it read as a black hole
+// instead. Both presentations lift together, deliberately — one panel, one
+// surface color.
 
 pub(crate) const PANEL_HUE: f32 = 0.7;
 pub(crate) const PANEL_SATURATION: f32 = 0.1;
-pub(crate) const PANEL_LIGHTNESS: f32 = 0.08;
+pub(crate) const PANEL_LIGHTNESS: f32 = 0.12;
 
 // ── Fills (white-alpha) ─────────────────────────────────────────────────────
 

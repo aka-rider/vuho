@@ -183,8 +183,7 @@ pub(crate) fn make_key_and_order_front() {
 /// same space GPUI's window-creation path accepts — vendored gpui
 /// mac/window.rs:653-659 for creation, mac/window.rs:515-530 for the
 /// matching read-back; every caller of this function derives `bounds` from
-/// `cx.primary_display()` — `panel.rs`'s `hud_bounds`/`full_bounds`/
-/// `centered_on_primary`). This function converts to Cocoa's bottom-left
+/// `cx.primary_display()` — `panel.rs`'s `panel_bounds`). This function converts to Cocoa's bottom-left
 /// origin, screen-absolute space using the **primary** screen's frame
 /// (`[[NSScreen screens] firstObject]`, falling back to `[NSScreen
 /// mainScreen]` only if that array is somehow empty).

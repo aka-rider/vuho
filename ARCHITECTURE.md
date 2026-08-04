@@ -895,22 +895,36 @@ tracking, and reopen logic. The status bar itself had two installs (`install`/`i
 two delegate modes to match. None of the three windows shared a design system — `theme.rs` only
 ever styled the overlay.
 
-**Decision:** one window, `panel::PanelRoot`, with two presentations:
-- **Hud** — the old dictation overlay, unchanged behavior: bottom-center, click-through, no
-  keyboard focus, shown on `SessionStarted`, auto-hidden per outcome duration
-  (`overlay::outcome_hide_delay`).
-- **Full** — a centered, opaque, tabbed window (Overlay / Settings) that replaces both the old
-  settings window and the readiness window. The Settings tab
+**Decision:** one window, `panel::PanelRoot`, in **one constant frame**, with two presentations
+painted into it:
+- **Hud** — the dictation overlay: click-through, no keyboard focus, shown on `SessionStarted`,
+  auto-hidden per outcome duration (`overlay::outcome_hide_delay`). It paints only the bottom
+  `overlay::HUD_CHROME_HEIGHT` (180px) band of the frame and leaves the rest transparent, so it
+  looks and sits exactly like the old standalone overlay window. Semi-transparent by design
+  (`overlay::PANEL_BG_OPACITY` = 0.65 over `theme::PANEL_LIGHTNESS` = 0.12) — the desktop stays
+  visible behind it, per the product spec's "semi-transparent overlay".
+- **Full** — a near-opaque (alpha 0.97), tabbed presentation (Overlay / Settings) filling the whole
+  frame, replacing both the old settings window and the readiness window. It stays near-opaque
+  where the Hud is see-through because it is a surface the user reads and clicks. The Settings tab
   (`crate::settings_tab::SettingsTab`, built in WP5 but never wired to anything user-reachable
   until this ADR) shows permission rows, speech-model provisioning, and the microphone/hotkey
   dropdowns in one scrollable column, reading `StatusModel` for every piece of live state instead
   of re-deriving it.
 
 The window itself is created once, at startup, in `Presentation::Hud`, `shown: false` — exactly
-like the old overlay was. Switching presentation is one **surgery chokepoint**
-(`panel::apply_presentation`): `Hud` sets the window's frame to the bottom-center bounds and turns
-click-through on; `Full` sets the frame to the centered bounds, turns click-through off, and — as
-long as a dictation session isn't currently recording — calls `makeKeyAndOrderFront:`
+like the old overlay was. Its frame comes from one geometry source, `panel::panel_bounds`: 460×480
+horizontally centered, 120px above the bottom of the primary display (clamped to the display's top
+edge on a display too short to hold it), used both at creation and on every presentation switch.
+The two presentations originally had their own geometries — 460×180 bottom-center for the Hud,
+460×480 screen-centered for the Full — and switching between them moved *and* resized the window
+under the user, which read as two different windows rather than one; sharing a frame is what makes
+"one window" true on screen and not just in the process.
+
+Switching presentation is one **surgery chokepoint** (`panel::apply_presentation`): it re-applies
+that same frame (not redundant — it re-resolves against whichever display is primary *now*, so the
+panel follows a display change since it was last shown), then `Hud` turns click-through on, while
+`Full` turns click-through off and — as long as a dictation session isn't currently recording —
+calls `makeKeyAndOrderFront:`
 (`window_config::make_key_and_order_front`), giving the panel keyboard focus *without* activating
 the application, since GPUI's `WindowKind::PopUp` already produces a non-activating `NSPanel`
 (`NSWindowStyleMaskNonactivatingPanel`) that can become key on its own. While recording, `Full`
@@ -923,8 +937,8 @@ presentation floats above normal windows exactly like the Hud does.
 
 Three further transitions build on that chokepoint: `show_full` (tray click, `Cmd+,`, a `Failed`
 model status), `on_session_started` (a session beginning while the panel is hidden shows the Hud;
-while the Full presentation is already open, it only switches the active tab back to Overlay —
-never re-frames a window the user opened deliberately, but if that window happens to be key it
+while the Full presentation is already open, it only switches the active tab back to Overlay, but
+if that window happens to be key it
 resigns key status via `window_config::resign_key_keep_front` — `orderOut:` then plain
 `orderFront:` — for the same reason `show_full` withholds it above: a session starting means the
 panel is about to lose the ⌘V destination race to whatever app the user is dictating into), and
