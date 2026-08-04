@@ -607,7 +607,13 @@ impl OverlayModel {
 /// `overflow_hidden`, `justify_end`, fade-masked at the top. Both the live
 /// transcript paragraph and the end-of-session outcome line render as
 /// `content` here — the *same* frame, not two differently-positioned slots —
-/// so swapping between them never shifts where the text sits.
+/// so swapping between them never shifts where the text sits. The `content`
+/// child is wrapped `flex_shrink_0` so an over-tall wrapped paragraph
+/// overflows past the top of the fixed-height flex container (masked by
+/// `fade_strip`) instead of being shrunk to fit — taffy's default
+/// `flex_shrink: 1.0` would otherwise squash the whole paragraph down to
+/// `TRANSCRIPT_HEIGHT`, clipping it to just the first ~3 lines and hiding
+/// the newest text instead of keeping it pinned at the bottom.
 fn render_transcript_viewport(content: AnyElement) -> AnyElement {
     div()
         .relative()
@@ -617,7 +623,7 @@ fn render_transcript_viewport(content: AnyElement) -> AnyElement {
         .flex()
         .flex_col()
         .justify_end()
-        .child(content)
+        .child(div().w_full().flex_shrink_0().child(content))
         .child(fade_strip())
         .into_any_element()
 }
