@@ -22,7 +22,9 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use crossbeam_channel::Sender;
-use gpui::{div, prelude::*, px, Context, Entity, Hsla, IntoElement, Render, SharedString, Window};
+use gpui::{
+    div, prelude::*, px, Context, Div, Entity, Hsla, IntoElement, Render, SharedString, Window,
+};
 use vuho_domain::{DictationCommand, ModelStatus};
 use vuho_os_integration::HotkeyListener;
 use vuho_settings::{HotkeySetting, SettingsStore};
@@ -35,6 +37,18 @@ use crate::readiness::{self, Access, Permission};
 use crate::theme;
 use crate::wiring::ProvisionCommand;
 
+/// A live, production-only hotkey listener + the command sender
+/// `HotkeyListener::start` requires — paired 1:1 by construction (F22).
+/// Before this type existed, the listener and its sender were two
+/// independently-`Option`al fields on [`SettingsTab`], which allowed a
+/// half-set state (a listener with no sender, or vice versa) that nothing
+/// ever legitimately produced — this makes that state unrepresentable.
+#[derive(Clone)]
+struct LiveHotkey {
+    listener: Rc<RefCell<HotkeyListener>>,
+    cmd_tx: Sender<DictationCommand>,
+}
+
 /// The Settings tab's root view.
 pub(crate) struct SettingsTab {
     status: Entity<StatusModel>,
@@ -42,10 +56,8 @@ pub(crate) struct SettingsTab {
     provision_tx: Sender<ProvisionCommand>,
     /// `None` in gate mode / before production wiring — the hotkey dropdown
     /// still persists a selection then, it just can't live-rebind anything.
-    hotkey: Option<Rc<RefCell<HotkeyListener>>>,
-    /// `HotkeyListener::start`'s required sender, paired 1:1 with `hotkey`
-    /// in production wiring.
-    cmd_tx: Option<Sender<DictationCommand>>,
+    /// `Some` only via [`Self::connect_hotkey`], never at construction.
+    hotkey: Option<LiveHotkey>,
     /// Input device names, snapshotted by [`Self::refresh_devices`] (called
     /// at construction and whenever the microphone dropdown opens).
     devices: Vec<String>,
@@ -58,8 +70,6 @@ impl SettingsTab {
         status: Entity<StatusModel>,
         settings: Arc<SettingsStore>,
         provision_tx: Sender<ProvisionCommand>,
-        hotkey: Option<Rc<RefCell<HotkeyListener>>>,
-        cmd_tx: Option<Sender<DictationCommand>>,
         cx: &mut Context<Self>,
     ) -> Self {
         // Repaint whenever the shared status model changes — the provisioning
@@ -71,8 +81,7 @@ impl SettingsTab {
             status,
             settings,
             provision_tx,
-            hotkey,
-            cmd_tx,
+            hotkey: None,
             devices,
             mic_open: false,
             hotkey_open: false,
@@ -96,11 +105,10 @@ impl SettingsTab {
     /// rebinding anything.
     pub(crate) fn connect_hotkey(
         &mut self,
-        hotkey: Rc<RefCell<HotkeyListener>>,
+        listener: Rc<RefCell<HotkeyListener>>,
         cmd_tx: Sender<DictationCommand>,
     ) {
-        self.hotkey = Some(hotkey);
-        self.cmd_tx = Some(cmd_tx);
+        self.hotkey = Some(LiveHotkey { listener, cmd_tx });
     }
 
     /// Persist the chosen microphone (`None` = system default) and close the
@@ -130,15 +138,15 @@ impl SettingsTab {
 
         // Gate mode (no live listener injected): persist only, nothing to
         // rebind or report back to `StatusModel`.
-        let (Some(hotkey), Some(cmd_tx)) = (self.hotkey.clone(), self.cmd_tx.clone()) else {
+        let Some(live) = self.hotkey.clone() else {
             cx.notify();
             return;
         };
 
         let start_result = {
-            let mut listener = hotkey.borrow_mut();
+            let mut listener = live.listener.borrow_mut();
             listener.stop();
-            listener.start(&cmd_tx, hotkey_presets::to_hotkey_config(preset))
+            listener.start(&live.cmd_tx, hotkey_presets::to_hotkey_config(preset))
         };
 
         let new_state = if start_result.is_ok() {
@@ -176,17 +184,39 @@ impl SettingsTab {
             .child(theme::section_label("Speech Model"));
 
         match model {
-            ModelStatus::Ready => match engine {
-                EngineState::Loading => {
-                    card.child(model_status_line("Warming up the speech engine…", theme::TEXT_SECONDARY))
-                }
-                EngineState::Failed(message) => card
-                    .child(model_status_line(message, theme::ERROR_RED))
-                    .child(self.download_retry_button("Retry", cx)),
-                // Unreachable — `should_show_speech_model_section` excludes
-                // `Ready`+`Ready` from ever reaching this function.
-                EngineState::Ready => card,
-            },
+            ModelStatus::Ready => self.render_speech_model_ready(card, engine, cx),
+            _ => self.render_speech_model_provisioning(card, model, cx),
+        }
+    }
+
+    /// The Speech Model card's content once the model itself is
+    /// [`ModelStatus::Ready`] — dispatched on [`EngineState`]. Split out of
+    /// [`Self::render_speech_model_section`] to keep it under the 40-line
+    /// render-helper limit (CONSTITUTION rule 28).
+    fn render_speech_model_ready(&self, card: Div, engine: &EngineState, cx: &mut Context<Self>) -> Div {
+        match engine {
+            EngineState::Loading => card.child(model_status_line(
+                "Warming up the speech engine…",
+                theme::TEXT_SECONDARY,
+            )),
+            EngineState::Failed(message) => card
+                .child(model_status_line(message, theme::ERROR_RED))
+                .child(self.download_retry_button("Retry", cx)),
+            // Unreachable — `should_show_speech_model_section` excludes
+            // `Ready`+`Ready` from ever reaching this function.
+            EngineState::Ready => card,
+        }
+    }
+
+    /// The Speech Model card's content for every non-`Ready` [`ModelStatus`]
+    /// (`Missing`/`Downloading`/`Verifying`/`Failed`) — the model itself
+    /// isn't ready yet, so `engine` doesn't enter into it. Split out of
+    /// [`Self::render_speech_model_section`] (CONSTITUTION rule 28); `model`
+    /// is never [`ModelStatus::Ready`] here — that arm is
+    /// [`Self::render_speech_model_ready`]'s.
+    fn render_speech_model_provisioning(&self, card: Div, model: &ModelStatus, cx: &mut Context<Self>) -> Div {
+        match model {
+            ModelStatus::Ready => card,
             ModelStatus::Missing { .. } => card
                 .child(model_status_line(
                     readiness::model_status_text(model),
@@ -241,11 +271,7 @@ impl SettingsTab {
     /// device that's no longer connected — see [`mic_display`]) when open.
     fn render_mic_row(&self, persisted: Option<&str>, cx: &mut Context<Self>) -> impl IntoElement {
         let display = mic_display(persisted, &self.devices);
-        let (label, label_color): (SharedString, Hsla) = match &display {
-            MicDisplay::SystemDefault => ("System Default".into(), theme::TEXT_PRIMARY),
-            MicDisplay::Connected(name) => (name.clone().into(), theme::TEXT_PRIMARY),
-            MicDisplay::Missing(name) => (name.clone().into(), theme::WARN_AMBER),
-        };
+        let (label, label_color) = mic_label(&display);
 
         let mut column = div()
             .flex()
@@ -276,42 +302,49 @@ impl SettingsTab {
         }
 
         if self.mic_open {
-            let mut options = controls::dropdown_option_list();
-            options = options.child(controls::dropdown_option(
-                "System Default",
-                theme::TEXT_PRIMARY,
-                ("settings-tab-mic-opt", 0usize),
-                cx.listener(|view, _event, _window, cx| view.select_microphone(None, cx)),
-            ));
-            for (ix, device) in self.devices.iter().cloned().enumerate() {
-                let device_for_click = device.clone();
-                options = options.child(controls::dropdown_option(
-                    device,
-                    theme::TEXT_PRIMARY,
-                    ("settings-tab-mic-opt", ix + 1),
-                    cx.listener(move |view, _event, _window, cx| {
-                        view.select_microphone(Some(device_for_click.clone()), cx);
-                    }),
-                ));
-            }
-            // The persisted-but-disconnected device (if any): greyed out,
-            // still clickable to keep it selected — never cleared
-            // automatically (see `mic_display`'s doc comment).
-            if let MicDisplay::Missing(name) = &display {
-                let name_for_click = name.clone();
-                options = options.child(controls::dropdown_option(
-                    name.clone(),
-                    theme::TEXT_DISABLED,
-                    ("settings-tab-mic-opt", self.devices.len() + 1),
-                    cx.listener(move |view, _event, _window, cx| {
-                        view.select_microphone(Some(name_for_click.clone()), cx);
-                    }),
-                ));
-            }
-            column = column.child(options);
+            column = column.child(self.render_mic_options(&display, cx));
         }
 
         column
+    }
+
+    /// The mic dropdown's expanded option list: "System Default", every
+    /// enumerated device, and — if any — the persisted-but-disconnected
+    /// device, greyed out but still clickable (never cleared automatically,
+    /// see [`mic_display`]'s doc comment). Split out of
+    /// [`Self::render_mic_row`] to keep it under the 40-line render-helper
+    /// limit (CONSTITUTION rule 28).
+    fn render_mic_options(&self, display: &MicDisplay, cx: &mut Context<Self>) -> impl IntoElement {
+        let mut options = controls::dropdown_option_list();
+        options = options.child(controls::dropdown_option(
+            "System Default",
+            theme::TEXT_PRIMARY,
+            ("settings-tab-mic-opt", 0usize),
+            cx.listener(|view, _event, _window, cx| view.select_microphone(None, cx)),
+        ));
+        for (ix, device) in self.devices.iter().cloned().enumerate() {
+            let device_for_click = device.clone();
+            options = options.child(controls::dropdown_option(
+                device,
+                theme::TEXT_PRIMARY,
+                ("settings-tab-mic-opt", ix + 1),
+                cx.listener(move |view, _event, _window, cx| {
+                    view.select_microphone(Some(device_for_click.clone()), cx);
+                }),
+            ));
+        }
+        if let MicDisplay::Missing(name) = display {
+            let name_for_click = name.clone();
+            options = options.child(controls::dropdown_option(
+                name.clone(),
+                theme::TEXT_DISABLED,
+                ("settings-tab-mic-opt", self.devices.len() + 1),
+                cx.listener(move |view, _event, _window, cx| {
+                    view.select_microphone(Some(name_for_click.clone()), cx);
+                }),
+            ));
+        }
+        options
     }
 
     /// The hotkey row: label + dropdown over every [`HotkeySetting`] preset,
@@ -514,6 +547,18 @@ fn mic_display(persisted: Option<&str>, devices: &[String]) -> MicDisplay {
     }
 }
 
+/// The mic dropdown's current-value label + color for a given [`MicDisplay`]
+/// — pure, split out of [`SettingsTab::render_mic_row`] purely to help keep
+/// that function short (CONSTITUTION rule 28).
+#[must_use]
+fn mic_label(display: &MicDisplay) -> (SharedString, Hsla) {
+    match display {
+        MicDisplay::SystemDefault => ("System Default".into(), theme::TEXT_PRIMARY),
+        MicDisplay::Connected(name) => (name.clone().into(), theme::TEXT_PRIMARY),
+        MicDisplay::Missing(name) => (name.clone().into(), theme::WARN_AMBER),
+    }
+}
+
 // ── Rendering helpers (CONSTITUTION rule 28: split, ≤40 lines each) ───────
 
 /// The settings-load-warning banner: only rendered when
@@ -544,8 +589,15 @@ fn model_status_line(text: impl Into<SharedString>, color: Hsla) -> impl IntoEle
 /// [`Permission::ALL`] plus (independently) the launch-blocked relaunch card
 /// — see this module's doc comment on why those two conditions don't
 /// exclude each other.
+///
+/// `permissions_missing` carries each non-granted permission's live
+/// [`Access`] (F6) — every row below renders purely from it (falling back to
+/// [`Access::Granted`] for a permission not present in the list), never a
+/// fresh [`Permission::access`] call at render time, which used to race
+/// `panel::start_permissions_poll`'s own 500 ms tick (the collapsed header
+/// could disagree with a row for up to that long).
 fn render_permissions_section(
-    permissions_missing: &[Permission],
+    permissions_missing: &[(Permission, Access)],
     launch_blocked: bool,
     hotkey: HotkeyState,
     cx: &mut Context<SettingsTab>,
@@ -561,7 +613,8 @@ fn render_permissions_section(
     } else {
         let hotkey_failed = matches!(hotkey, HotkeyState::Failed(_));
         for permission in Permission::ALL {
-            card = card.child(render_permission_row(permission, hotkey_failed, cx));
+            let access = permission_access(permissions_missing, permission);
+            card = card.child(render_permission_row(permission, access, hotkey_failed, cx));
         }
     }
 
@@ -570,6 +623,17 @@ fn render_permissions_section(
     }
 
     card
+}
+
+/// `permission`'s [`Access`] as carried by `permissions_missing` (F6), or
+/// [`Access::Granted`] when it's absent from that list — every permission
+/// not currently missing is, definitionally, granted.
+#[must_use]
+fn permission_access(permissions_missing: &[(Permission, Access)], permission: Permission) -> Access {
+    permissions_missing
+        .iter()
+        .find_map(|&(p, access)| (p == permission).then_some(access))
+        .unwrap_or(Access::Granted)
 }
 
 /// The compact "everything's fine" permissions row: a green check + one line
@@ -587,16 +651,27 @@ fn render_all_granted_row() -> impl IntoElement {
 }
 
 /// One permission row: label, description, an Accessibility-only relaunch
-/// note, and an action driven by [`permission_row_kind`].
+/// note, and an action driven by [`permission_row_kind`]. `access` is the
+/// caller's already-derived [`Access`] (F6) — this function never calls
+/// [`Permission::access`] itself.
 fn render_permission_row(
     permission: Permission,
+    access: Access,
     hotkey_failed: bool,
     cx: &mut Context<SettingsTab>,
 ) -> impl IntoElement {
-    let access = permission.access();
     let is_accessibility = matches!(permission, Permission::Accessibility);
     let kind = permission_row_kind(access, is_accessibility, hotkey_failed);
 
+    let row = render_permission_row_header(permission, access, is_accessibility);
+    append_permission_action(row, permission, kind, cx)
+}
+
+/// One permission row's header: label, description, and — for
+/// Accessibility specifically, while not yet granted — the relaunch-after-
+/// granting note. Split out of [`render_permission_row`] to keep it under
+/// the 40-line render-helper limit (CONSTITUTION rule 28).
+fn render_permission_row_header(permission: Permission, access: Access, is_accessibility: bool) -> Div {
     let mut row = div()
         .flex()
         .flex_col()
@@ -615,11 +690,20 @@ fn render_permission_row(
             theme::TEXT_TERTIARY,
         ));
     }
+    row
+}
 
-    row = match kind {
-        RowKind::Granted => {
-            row.child(model_status_line("✓ Granted", theme::OK_GREEN))
-        }
+/// Append the [`RowKind`]-driven action (✓ Granted / relaunch button /
+/// Allow button / Open System Settings button) to a permission row's
+/// header. Split out of [`render_permission_row`] (CONSTITUTION rule 28).
+fn append_permission_action(
+    row: Div,
+    permission: Permission,
+    kind: RowKind,
+    cx: &mut Context<SettingsTab>,
+) -> Div {
+    match kind {
+        RowKind::Granted => row.child(model_status_line("✓ Granted", theme::OK_GREEN)),
         RowKind::GrantedNeedsRelaunch => row
             .child(model_status_line(
                 "Granted — relaunch required",
@@ -647,9 +731,7 @@ fn render_permission_row(
                     permissions::open_url(permission.settings_url());
                 }),
             )),
-    };
-
-    row
+    }
 }
 
 /// The launch-blocked relaunch card: shown whenever every permission is

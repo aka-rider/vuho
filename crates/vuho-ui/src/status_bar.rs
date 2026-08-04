@@ -129,6 +129,10 @@ fn apply_icon(button: &NSStatusBarButton, icon: TrayIcon) {
         }
     }
     log::warn!("status_bar: no SF Symbol available for {icon:?}, falling back to text title");
+    // F14: clear any previously-set image first — otherwise a stale icon
+    // from an earlier, successful `apply_icon` call could keep showing
+    // beside the text glyph `setTitle` is about to add.
+    button.setImage(None);
     button.setTitle(&NSString::from_str("𝗏"));
 }
 
@@ -267,10 +271,26 @@ thread_local! {
 /// where it sends [`DictationCommand::Toggle`] — the same channel the
 /// `CapsLock` hotkey uses. Both "Open Vuho" and a plain click send
 /// [`UiCommand::OpenPanel`] on `ui_tx`, drained by the GPUI foreground task
-/// that owns window creation. Nothing here reflects live app state — call
-/// [`sync`] once right after installing, then again on every `StatusModel`
-/// change.
-pub(crate) fn install(cmd_tx: Option<Sender<DictationCommand>>, ui_tx: Sender<UiCommand>) {
+/// that owns window creation.
+///
+/// Paints the tray's first frame itself, from `initial` (F21) — the caller
+/// does **not** need to follow this with its own [`sync`] call. This isn't
+/// just convenience: the `cx.observe(&status, ..)` observer both `main.rs`
+/// call sites register calls [`sync`] on every `StatusModel` change, and
+/// that observer is set up *before* `install` ever runs — so any change
+/// observed in that window hits [`sync`]'s own `STATE`-not-yet-populated
+/// early return and is silently dropped from the tray's perspective. Folding
+/// the first paint into `install` itself (reading whatever `initial` is at
+/// the moment `install` actually runs, past all of that) is what closes that
+/// gap, rather than relying on the caller to duplicate a `sync` call right
+/// after — a pairing that was easy to get right at each of two call sites
+/// today, but load-bearing in a way a future third call site could silently
+/// get wrong.
+pub(crate) fn install(
+    cmd_tx: Option<Sender<DictationCommand>>,
+    ui_tx: Sender<UiCommand>,
+    initial: &CompositeStatus,
+) {
     let Some(mtm) = MainThreadMarker::new() else {
         log::error!("status_bar::install must be called on the main thread");
         return;
@@ -312,6 +332,8 @@ pub(crate) fn install(cmd_tx: Option<Sender<DictationCommand>>, ui_tx: Sender<Ui
             last_icon: Cell::new(None),
         });
     });
+
+    sync(initial);
 }
 
 /// Pop the production menu synchronously via the modern status-item trick:
@@ -341,25 +363,21 @@ fn pop_menu() {
     item.setMenu(None);
 }
 
-/// Set the status-item button's initial icon: an SF Symbol template image,
-/// with a plain-text fallback if the symbol is unavailable — the waveform
-/// icon is how the user recognizes Vuho is running at all, before `install`'s
-/// caller ever calls [`sync`]. Returns the button so callers can build the
-/// rest of [`StatusState`] around it.
+/// Set the status-item button's initial icon — the waveform icon is how the
+/// user recognizes Vuho is running at all, before `install`'s caller ever
+/// calls [`sync`]. Returns the button so callers can build the rest of
+/// [`StatusState`] around it.
+///
+/// Goes through [`apply_icon`]'s own `TrayIcon::Idle` fallback chain (F9)
+/// rather than hardcoding a second, independent "waveform" symbol lookup +
+/// "𝗏" text fallback here — one source of truth for how a symbol name
+/// resolves to an actual icon, not two that could drift apart.
 fn configure_status_button(
     item: &NSStatusItem,
     mtm: MainThreadMarker,
 ) -> Option<Retained<NSStatusBarButton>> {
     let button = item.button(mtm)?;
-    if let Some(image) = NSImage::imageWithSystemSymbolName_accessibilityDescription(
-        &NSString::from_str("waveform"),
-        Some(&NSString::from_str("Vuho")),
-    ) {
-        image.setTemplate(true);
-        button.setImage(Some(&image));
-    } else {
-        button.setTitle(&NSString::from_str("𝗏"));
-    }
+    apply_icon(&button, TrayIcon::Idle);
     Some(button)
 }
 
@@ -520,5 +538,14 @@ mod tests {
         // completely unavailable preferred name never leaves the button
         // with no image at all.
         assert_eq!(TrayIcon::Recording.symbol_names().last(), Some(&"waveform"));
+        // F13: `Maintenance`'s chain doesn't end in `waveform` — it ends in
+        // `exclamationmark.triangle`, documented (`TrayIcon::symbol_names`)
+        // as 12.0+ and thus safe on this app's 14.0 floor too. Pinning its
+        // exact name here catches an accidental reorder/typo the same way
+        // the `Recording` assertion above does.
+        assert_eq!(
+            TrayIcon::Maintenance.symbol_names().last(),
+            Some(&"exclamationmark.triangle")
+        );
     }
 }

@@ -42,6 +42,8 @@ use crate::readiness;
 use crate::settings_tab::SettingsTab;
 #[cfg(not(feature = "demo"))]
 use crate::theme;
+#[cfg(not(feature = "demo"))]
+use vuho_domain::ModelStatus;
 
 /// Distance from the bottom of the display to the Hud's bottom edge.
 /// Unchanged from the old overlay window's `OVERLAY_BOTTOM_MARGIN`.
@@ -52,9 +54,13 @@ const HUD_BOTTOM_MARGIN: Pixels = px(120.0);
 const HUD_WIDTH: Pixels = px(460.0);
 const HUD_HEIGHT: Pixels = px(180.0);
 
-/// Full presentation dimensions: ~460×420, centered on the primary display.
+/// Full presentation dimensions: ~460×480, centered on the primary display.
+/// Raised from 420 (F2) — the Settings tab's content routinely exceeds 420px
+/// even before a Speech Model card is showing; the tab body now scrolls
+/// (see [`PanelRoot::render_tab_body`]) as the general fix, and the taller
+/// default keeps a first-launch scroll less likely for the common case.
 const FULL_WIDTH: Pixels = px(460.0);
-const FULL_HEIGHT: Pixels = px(420.0);
+const FULL_HEIGHT: Pixels = px(480.0);
 
 /// Poll interval for re-checking permissions while the panel is open on the
 /// Full presentation. Matches the old readiness window's `GATE_POLL_INTERVAL`
@@ -74,14 +80,15 @@ const TAB_ICON_SIZE: Pixels = px(16.0);
 const TAB_LABEL_SIZE: Pixels = px(13.0);
 
 /// Same hue/saturation/lightness as the Hud's translucent chrome
-/// (`overlay.rs`'s `PANEL_HUE`/`PANEL_SATURATION`/`PANEL_LIGHTNESS`), but
-/// opaque: the Full presentation is a real, focusable window surface, not a
-/// floating overlay, so content behind it must never show through.
+/// (`overlay.rs`'s `color_panel_bg`) — both draw from `theme::PANEL_HUE`/
+/// `PANEL_SATURATION`/`PANEL_LIGHTNESS` (F20) — but opaque: the Full
+/// presentation is a real, focusable window surface, not a floating
+/// overlay, so content behind it must never show through.
 #[cfg(not(feature = "demo"))]
 const FULL_BG: gpui::Hsla = gpui::Hsla {
-    h: 0.7,
-    s: 0.1,
-    l: 0.08,
+    h: theme::PANEL_HUE,
+    s: theme::PANEL_SATURATION,
+    l: theme::PANEL_LIGHTNESS,
     a: 0.97,
 };
 
@@ -324,22 +331,28 @@ pub(crate) fn show_full(panel: WindowHandle<PanelRoot>, tab: Tab, cx: &mut App) 
     });
 }
 
-/// The tray icon's plain-click / "Open Vuho" action: show the Full
-/// presentation on the Overlay tab while a session is actually live (so a
-/// click during dictation never buries the transcript behind whatever tab
-/// was last open), or on whichever tab was last active otherwise.
+/// The tray icon's plain-click / "Open Vuho" action: hide the panel if it's
+/// already showing the Full presentation (F1 — the standard menu-bar-app
+/// toggle: clicking an already-open app's icon closes it) — otherwise show
+/// the Full presentation on the Overlay tab while a session is actually live
+/// (so a click during dictation never buries the transcript behind whatever
+/// tab was last open), or on whichever tab was last active.
 #[cfg(not(feature = "demo"))]
 pub(crate) fn open_from_tray(panel: WindowHandle<PanelRoot>, cx: &mut App) {
-    let tab = panel
-        .update(cx, |root, _window, cx| {
-            if root.overlay.read(cx).has_session_content() {
-                Tab::Overlay
-            } else {
-                root.active_tab
-            }
-        })
-        .unwrap_or(Tab::Overlay);
-    show_full(panel, tab, cx);
+    let next = panel.update(cx, |root, _window, cx| {
+        if root.shown && root.presentation == Presentation::Full {
+            None
+        } else if root.overlay.read(cx).has_session_content() {
+            Some(Tab::Overlay)
+        } else {
+            Some(root.active_tab)
+        }
+    });
+    match next {
+        Ok(Some(tab)) => show_full(panel, tab, cx),
+        Ok(None) => hide(panel, cx),
+        Err(_) => {}
+    }
 }
 
 /// React to a dictation session actually starting (`event_loop`'s
@@ -384,34 +397,76 @@ pub(crate) fn hide_if_hud(panel: WindowHandle<PanelRoot>, cx: &mut App) {
         }
         window_config::order_out(window);
         root.shown = false;
-        #[cfg(not(feature = "demo"))]
-        {
-            root.permissions_poll = None;
-        }
+        // No `permissions_poll = None` here (F4): reaching this point
+        // already means `presentation == Hud`, and the only two ways to get
+        // there are (a) the panel never left `Presentation::Hud` at all —
+        // the poll, which only [`show_full`] ever starts, was never
+        // spawned — or (b) [`hide`] already ran and cleared it. Either way
+        // the field is already `None`; a second clear here was dead code.
         cx.notify();
     });
 }
 
+/// Hide the panel unconditionally, regardless of presentation (F1) — the
+/// tab strip's "✕" button, Esc, and re-clicking an already-open tray icon
+/// all go through this, unlike [`hide_if_hud`] (which only a finished
+/// dictation session's auto-hide calls, and which deliberately leaves an
+/// open Full presentation alone).
+#[cfg(not(feature = "demo"))]
+pub(crate) fn hide(panel: WindowHandle<PanelRoot>, cx: &mut App) {
+    let _ = panel.update(cx, |root, window, cx| {
+        hide_root(root, window, cx);
+        cx.notify();
+    });
+}
+
+/// The shared body of "unconditionally close the panel": order the window
+/// out, drop the permissions poll, and reset to [`Presentation::Hud`]
+/// (re-applying Hud surgery — re-frame + click-through — while hidden, so
+/// the next [`on_session_started`] shows a correctly-framed, click-through
+/// Hud instead of whatever frame/click-through state the Full presentation
+/// left behind). `active_tab` is deliberately left as-is — what tab a
+/// reopened Full presentation lands on is [`open_from_tray`]'s decision
+/// (session-content check first), not something closing needs to reset.
+///
+/// The one implementation both [`hide`] (the public `WindowHandle`-based
+/// entry point used by `event_loop`/the tray/Esc) and the tab strip's close
+/// button (already inside a `PanelRoot` update, with no need to re-enter
+/// through a `WindowHandle`) call, so there is exactly one hide
+/// implementation, not two.
+#[cfg(not(feature = "demo"))]
+fn hide_root(root: &mut PanelRoot, window: &mut Window, cx: &App) {
+    window_config::order_out(window);
+    root.shown = false;
+    root.permissions_poll = None;
+    root.presentation = Presentation::Hud;
+    apply_presentation(window, cx, Presentation::Hud);
+}
+
 // ── Permissions poll ─────────────────────────────────────────────────────
 
-/// Re-check [`readiness::missing_permissions`] every
-/// [`PERMISSIONS_POLL_INTERVAL`] while the Full presentation is open, and
-/// write the result into `StatusModel::permissions_missing` — only when it
-/// actually changed, so a granted-permission tick that changes nothing never
-/// triggers a spurious repaint. Sanctioned pull-only TCC polling (no
-/// wall-clock ordering of events), bounded to the panel's own visibility by
-/// [`show_full`] spawning it and [`hide_if_hud`] dropping it — mirrors the
-/// old readiness window's `spawn_poll_loop` (studied, then reimplemented
-/// minimally against `StatusModel` instead of a bespoke view field).
+/// Re-check [`readiness::missing_permissions`] immediately, then every
+/// [`PERMISSIONS_POLL_INTERVAL`] thereafter, while the Full presentation is
+/// open, and write the result into `StatusModel::permissions_missing` —
+/// only when it actually changed, so a granted-permission tick that changes
+/// nothing never triggers a spurious repaint. Sanctioned pull-only TCC
+/// polling (no wall-clock ordering of events), bounded to the panel's own
+/// visibility by [`show_full`] spawning it and [`hide`]/[`hide_if_hud`]
+/// dropping it — mirrors the old readiness window's `spawn_poll_loop`
+/// (studied, then reimplemented minimally against `StatusModel` instead of
+/// a bespoke view field).
+///
+/// The immediate first tick (F4) runs *before* the first wait, not after —
+/// without it, `StatusModel::permissions_missing` would sit on whatever
+/// `show_full`'s caller seeded it with for a full [`PERMISSIONS_POLL_INTERVAL`]
+/// before this task ever wrote anything, even though the Settings tab is
+/// already on screen and the user may already be mid-grant.
 #[cfg(not(feature = "demo"))]
 fn start_permissions_poll(panel: WindowHandle<PanelRoot>, cx: &mut App) -> gpui::Task<()> {
     cx.spawn(move |cx: &mut AsyncApp| {
         let mut cx = cx.clone();
         async move {
             loop {
-                cx.background_executor()
-                    .timer(PERMISSIONS_POLL_INTERVAL)
-                    .await;
                 let missing = readiness::missing_permissions();
                 let updated = panel.update(&mut cx, |root, _window, cx| {
                     root.status.update(cx, |status, cx| {
@@ -425,6 +480,9 @@ fn start_permissions_poll(panel: WindowHandle<PanelRoot>, cx: &mut App) -> gpui:
                     log::info!("panel: permissions poll stopping — panel window gone");
                     return;
                 }
+                cx.background_executor()
+                    .timer(PERMISSIONS_POLL_INTERVAL)
+                    .await;
             }
         }
     })
@@ -458,6 +516,14 @@ impl Render for PanelRoot {
 impl PanelRoot {
     /// The Full presentation's outer chrome (opaque, rounded) + tab strip +
     /// active tab's body.
+    ///
+    /// `.text_color(theme::TEXT_PRIMARY)` here (F3) is the single chokepoint
+    /// for the Full presentation's default text color — every descendant
+    /// glyph that doesn't set its own `text_color` (gpui's cascading
+    /// `text_style_stack`, e.g. the tab strip's "▾"/"✕" glyphs and
+    /// `controls::action_button`'s label) inherits it, instead of falling
+    /// through to gpui's black default on this dark chrome (CONSTITUTION
+    /// rule 26 — one chokepoint, not a per-glyph patch at every call site).
     fn render_full(&self, cx: &mut Context<Self>) -> impl IntoElement {
         div()
             .relative()
@@ -465,13 +531,15 @@ impl PanelRoot {
             .flex()
             .flex_col()
             .bg(FULL_BG)
+            .text_color(theme::TEXT_PRIMARY)
             .rounded(px(theme::RADIUS_PANEL))
             .shadow_lg()
             .child(self.render_tab_strip(cx))
             .child(self.render_tab_body(cx))
     }
 
-    /// The 36px tab strip: Overlay / Settings, bottom `SEPARATOR` hairline.
+    /// The 36px tab strip: Overlay / Settings, a trailing spacer, the "✕"
+    /// close button (F1), bottom `SEPARATOR` hairline.
     fn render_tab_strip(&self, cx: &mut Context<Self>) -> impl IntoElement {
         div()
             .flex()
@@ -483,6 +551,33 @@ impl PanelRoot {
             .border_color(theme::SEPARATOR)
             .child(self.render_tab_button(Tab::Overlay, WAVEFORM_ICON, "Overlay", "panel-tab-overlay", cx))
             .child(self.render_tab_button(Tab::Settings, GEAR_ICON, "Settings", "panel-tab-settings", cx))
+            .child(div().flex_1())
+            .child(Self::render_close_button(cx))
+    }
+
+    /// The "✕" close button at the tab strip's right end (F1) — hides the
+    /// panel via [`hide_root`] (the same implementation [`hide`] itself
+    /// calls). 24×24px hit target, `TEXT_TERTIARY` at rest, `FILL_HOVER` +
+    /// `TEXT_PRIMARY` on hover — mirrors the tab buttons' own hover
+    /// treatment, `RADIUS_CONTROL` rounding. An associated function, not a
+    /// method: it renders purely from `cx`'s listener plumbing, touching no
+    /// `&self` field.
+    fn render_close_button(cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .id("panel-close")
+            .flex()
+            .items_center()
+            .justify_center()
+            .size(px(24.0))
+            .rounded(px(theme::RADIUS_CONTROL))
+            .cursor_pointer()
+            .text_color(theme::TEXT_TERTIARY)
+            .hover(|style| style.bg(theme::FILL_HOVER).text_color(theme::TEXT_PRIMARY))
+            .child("✕")
+            .on_click(cx.listener(|this, _event, window, cx| {
+                hide_root(this, window, cx);
+                cx.notify();
+            }))
     }
 
     /// One tab button: icon + label, a `FILL_SELECTED` pill when active,
@@ -541,14 +636,34 @@ impl PanelRoot {
     }
 
     /// The active tab's body, filling the remaining space below the strip.
+    /// `.p_4()` here is the one padding chokepoint (F16) both tabs share, so
+    /// neither insets differently (the idle status block used to carry its
+    /// own divergent `.p_6()`, removed — see [`Self::render_idle_status`]).
+    ///
+    /// The Settings tab additionally scrolls (F2 — its content routinely
+    /// overflows [`FULL_HEIGHT`]): `.id(..)` + `.overflow_y_scroll()` is
+    /// gpui 0.2's stateful-scroll idiom (`StatefulInteractiveElement`,
+    /// vendored `gpui-0.2.2/src/elements/div.rs`) for the simple case that
+    /// needs no explicit `ScrollHandle`. The Overlay tab stays
+    /// `overflow_hidden` instead — its idle block/live transcript are
+    /// already height-bounded, and scrolling live transcript would be
+    /// actively wrong.
     fn render_tab_body(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        div()
-            .flex_1()
-            .overflow_hidden()
-            .child(match self.active_tab {
-                Tab::Overlay => self.render_overlay_tab(cx).into_any_element(),
-                Tab::Settings => self.settings.clone().into_any_element(),
-            })
+        match self.active_tab {
+            Tab::Overlay => div()
+                .flex_1()
+                .p_4()
+                .overflow_hidden()
+                .child(self.render_overlay_tab(cx))
+                .into_any_element(),
+            Tab::Settings => div()
+                .id("panel-settings-scroll")
+                .flex_1()
+                .p_4()
+                .overflow_y_scroll()
+                .child(self.settings.clone())
+                .into_any_element(),
+        }
     }
 
     /// The Overlay tab's body: the live overlay content while a session is
@@ -566,6 +681,10 @@ impl PanelRoot {
     /// three states a click here can actually resolve — an "Open Settings"
     /// button that switches to the Settings tab. Never a disabled dead
     /// button: the button simply doesn't render for every other state.
+    ///
+    /// No outer padding of its own (F16) — [`Self::render_tab_body`]'s
+    /// `.p_4()` is the shared chokepoint both tabs inset from; this used to
+    /// carry its own `.p_6()`, diverging from the Settings tab's padding.
     fn render_idle_status(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let status = self.status.read(cx);
         let (headline, sub) = status.idle_headline();
@@ -575,7 +694,6 @@ impl PanelRoot {
             .flex()
             .flex_col()
             .gap_2()
-            .p_6()
             .child(
                 div()
                     .text_size(px(theme::TEXT_LG))
@@ -592,8 +710,18 @@ impl PanelRoot {
             );
         }
 
-        if let CompositeStatus::Downloading(pct) = composite {
-            column = column.child(theme::progress_bar(f32::from(pct) / 100.0));
+        // F11: read `status.model`'s own `fraction()` directly — the same
+        // derivation `settings_tab.rs`'s Speech Model card uses — instead of
+        // re-deriving a fraction from the rounded `u8` percent the tray/menu
+        // display, which loses precision `progress_bar`'s width doesn't need
+        // to lose.
+        if matches!(composite, CompositeStatus::Downloading(_)) {
+            let fraction = status
+                .model
+                .as_ref()
+                .and_then(ModelStatus::fraction)
+                .unwrap_or(0.0);
+            column = column.child(theme::progress_bar(fraction));
         }
 
         if matches!(

@@ -160,14 +160,24 @@ impl Permission {
     }
 }
 
-/// The preflight check: every currently-missing permission, in
-/// [`Permission::ALL`] order. Side-effect-free — safe to call before any
-/// other startup work, and repeatedly from the panel's permissions poll.
+/// The preflight check: every currently-missing permission with its live
+/// [`Access`], in [`Permission::ALL`] order. Side-effect-free — safe to call
+/// before any other startup work, and repeatedly from the panel's
+/// permissions poll.
+///
+/// Carries `Access` alongside each `Permission` (not just the permission
+/// itself) so this one call is the **entire** derivation `StatusModel::
+/// permissions_missing` is ever written from (F6) — `settings_tab.rs`'s
+/// permission rows then render purely from that stored data instead of each
+/// calling [`Permission::access`] again at render time, which raced the
+/// poll's own 500 ms tick (the collapsed header could disagree with the
+/// rows for up to that long).
 #[must_use]
-pub(crate) fn missing_permissions() -> Vec<Permission> {
+pub(crate) fn missing_permissions() -> Vec<(Permission, Access)> {
     Permission::ALL
         .into_iter()
-        .filter(|p| p.access() != Access::Granted)
+        .map(|permission| (permission, permission.access()))
+        .filter(|(_, access)| *access != Access::Granted)
         .collect()
 }
 

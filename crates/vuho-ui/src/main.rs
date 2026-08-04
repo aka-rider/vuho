@@ -54,19 +54,20 @@ mod wiring;
 
 use gpui::{App, Application};
 #[cfg(not(feature = "demo"))]
-use gpui::AppContext as _;
+use gpui::{AppContext as _, Entity};
 
 // `gpui::actions!` generates unit-struct action markers with no way to
 // attach doc comments per-item through the macro — the names (`Quit`,
-// `SelectSettingsTab`) are self-explanatory, so this is scoped in its own
-// module with a single module-level `allow` (narrower than a crate-wide one)
-// rather than threading doc text through a macro that doesn't support it.
+// `SelectSettingsTab`, `ClosePanel`) are self-explanatory, so this is
+// scoped in its own module with a single module-level `allow` (narrower
+// than a crate-wide one) rather than threading doc text through a macro
+// that doesn't support it.
 // Not `pub(crate)`: a crate-root-level `mod` (private or not) is already
 // visible to every module in this binary crate, so `crate::actions::Quit`
 // resolves fine from `wiring.rs` without needing to widen this further.
 #[allow(missing_docs)]
 mod actions {
-    gpui::actions!(vuho, [Quit, SelectSettingsTab]);
+    gpui::actions!(vuho, [Quit, SelectSettingsTab, ClosePanel]);
 }
 use actions::Quit;
 
@@ -124,13 +125,15 @@ fn bind_quit_hotkey(cx: &mut App) {
 /// wiring runs, the dictation session), and the panel itself. See
 /// ARCHITECTURE.md ADR-021 — this is the merged preflight-gate-into-panel
 /// design that replaces the old `run_preflight_gate_and_check_if_blocked`.
+///
+/// Kept short (CONSTITUTION rule 28) by delegating the `StatusModel` build
+/// to [`build_status_model`] and the permissions/relaunch-blocked path to
+/// [`run_gate_blocked`].
 #[cfg(not(feature = "demo"))]
 fn run_production(cx: &mut App) {
     use std::sync::Arc;
 
     use crossbeam_channel::unbounded;
-
-    use app_status::{EngineState, HotkeyState, StatusModel};
 
     // Single owner of the settings file for the process (CONSTITUTION rule 1).
     let settings = Arc::new(vuho_settings::SettingsStore::load_or_default());
@@ -138,72 +141,15 @@ fn run_production(cx: &mut App) {
     let (ui_tx, ui_rx) = unbounded::<app_state::UiCommand>();
     let (provision_tx, provision_rx) = unbounded::<wiring::ProvisionCommand>();
 
-    // Read up front, not inside the `cx.new` closure below: `cx.new`
-    // requires its builder closure to be `'static`, which a closure
-    // borrowing `settings` (still needed by value further down) cannot
-    // satisfy.
-    let initial_hotkey = settings.get().hotkey;
-    // `SharedString::from(&str)` requires the borrow to be `'static`
-    // (`SharedString` wraps `ArcCow<'static, str>`) — `load_warning()`'s
-    // `&str` is borrowed from `settings` itself, so it must be turned into
-    // an owned `String` first.
-    let settings_load_warning = settings
-        .load_warning()
-        .map(|warning| gpui::SharedString::from(warning.to_owned()));
-
-    // Initial `hotkey` is `Active(preset)`, corrected to `Failed` by
-    // `wiring::start_hotkey` if the listener actually fails to start — a
-    // transient over-optimistic read for however long that takes. Never
-    // reached on the permissions-blocked path below (`wire_production`
-    // never runs there), so that transience is production-only.
-    let status = cx.new(|_| StatusModel {
-        model: None,
-        engine: EngineState::Loading,
-        recording: false,
-        hotkey: HotkeyState::Active(initial_hotkey),
-        permissions_missing: Vec::new(),
-        launch_blocked: false,
-        settings_load_warning,
-    });
-    // Keep the tray in sync with every future `StatusModel` change — cheap
-    // no-op until `status_bar::install` actually runs (either branch below).
-    cx.observe(&status, |status, cx| {
-        status_bar::sync(&status.read(cx).composite());
-    })
-    .detach();
-
+    let status = build_status_model(&settings, cx);
     let settings_tab = cx.new(|cx| {
-        settings_tab::SettingsTab::new(
-            status.clone(),
-            settings.clone(),
-            provision_tx,
-            None,
-            None,
-            cx,
-        )
+        settings_tab::SettingsTab::new(status.clone(), settings.clone(), provision_tx, cx)
     });
-
     let panel = panel::create_panel(status.clone(), settings_tab.clone(), cx);
 
     let missing = readiness::missing_permissions();
     if !missing.is_empty() {
-        // Permissions/relaunch-blocked path (ADR-021, amending ADR-016): no
-        // dictation session is possible yet, so `wire_production` never
-        // runs this launch — the user must grant everything and relaunch.
-        // The panel opened on its Settings tab *is* the gate: permission
-        // rows live there, and once every grant lands the composite status
-        // becomes `RelaunchRequired`, whose relaunch row (also in the
-        // Settings tab) is the way forward.
-        status.update(cx, |model, cx| {
-            model.launch_blocked = true;
-            model.permissions_missing = missing;
-            cx.notify();
-        });
-        status_bar::install(None, ui_tx);
-        status_bar::sync(&status.read(cx).composite());
-        panel::show_full(panel, panel::Tab::Settings, cx);
-        event_loop::spawn_ui_drain(panel, ui_rx, status, cx);
-        bind_select_settings_tab(cx, panel);
+        run_gate_blocked(cx, panel, &status, missing, ui_tx, ui_rx);
         return;
     }
 
@@ -218,6 +164,94 @@ fn run_production(cx: &mut App) {
         cx,
     );
     bind_select_settings_tab(cx, panel);
+    bind_close_panel(cx, panel);
+}
+
+/// Build the shared `StatusModel` entity and wire the tray-sync observer.
+/// Split out of [`run_production`] (CONSTITUTION rule 28).
+///
+/// `initial_hotkey`/`settings_load_warning` are read from `settings` up
+/// front, not inside the `cx.new` builder closure below: `cx.new` requires
+/// its builder closure to be `'static`, which a closure borrowing `settings`
+/// (still needed by value further down in `run_production`) cannot satisfy.
+///
+/// Initial `hotkey` is `Active(preset)`, corrected to `Failed` by
+/// `wiring::start_hotkey` if the listener actually fails to start — a
+/// transient over-optimistic read for however long that takes. Never
+/// reached on the permissions-blocked path (`wire_production` never runs
+/// there), so that transience is production-only.
+#[cfg(not(feature = "demo"))]
+fn build_status_model(
+    settings: &vuho_settings::SettingsStore,
+    cx: &mut App,
+) -> Entity<app_status::StatusModel> {
+    use app_status::{EngineState, HotkeyState, StatusModel};
+
+    let initial_hotkey = settings.get().hotkey;
+    // `SharedString::from(&str)` requires the borrow to be `'static`
+    // (`SharedString` wraps `ArcCow<'static, str>`) — `load_warning()`'s
+    // `&str` is borrowed from `settings` itself, so it must be turned into
+    // an owned `String` first.
+    let settings_load_warning = settings
+        .load_warning()
+        .map(|warning| gpui::SharedString::from(warning.to_owned()));
+
+    let status = cx.new(|_| StatusModel {
+        model: None,
+        engine: EngineState::Loading,
+        recording: false,
+        hotkey: HotkeyState::Active(initial_hotkey),
+        permissions_missing: Vec::new(),
+        launch_blocked: false,
+        settings_load_warning,
+    });
+    // Keep the tray in sync with every future `StatusModel` change — cheap
+    // no-op until `status_bar::install` actually runs (`run_gate_blocked` or
+    // `wiring::wire_production`, whichever branch `run_production` takes).
+    cx.observe(&status, |status, cx| {
+        status_bar::sync(&status.read(cx).composite());
+    })
+    .detach();
+    status
+}
+
+/// The permissions/relaunch-blocked startup path (ADR-021, amending
+/// ADR-016): no dictation session is possible yet, so `wiring::wire_production`
+/// never runs this launch — the user must grant everything and relaunch.
+/// The panel opened on its Settings tab *is* the gate: permission rows live
+/// there, and once every grant lands the composite status becomes
+/// `RelaunchRequired`, whose relaunch row (also in the Settings tab) is the
+/// way forward. Split out of [`run_production`] (CONSTITUTION rule 28).
+#[cfg(not(feature = "demo"))]
+fn run_gate_blocked(
+    cx: &mut App,
+    panel: gpui::WindowHandle<panel::PanelRoot>,
+    status: &Entity<app_status::StatusModel>,
+    missing: Vec<(readiness::Permission, readiness::Access)>,
+    ui_tx: crossbeam_channel::Sender<app_state::UiCommand>,
+    ui_rx: crossbeam_channel::Receiver<app_state::UiCommand>,
+) {
+    status.update(cx, |model, cx| {
+        model.launch_blocked = true;
+        // Seeded with the same derivation (`readiness::missing_permissions()`)
+        // `panel::start_permissions_poll` writes on every tick — see
+        // `StatusModel::permissions_missing`'s doc comment for why this one
+        // synchronous write coexists with the poll instead of leaving the
+        // field to the poll alone (F4): without it, the tray's very first
+        // paint (below, via `status_bar::install`) would see an empty
+        // `permissions_missing` and derive `RelaunchRequired` instead of
+        // `PermissionsMissing` for one visible frame, since the poll's own
+        // (now-immediate) first tick hasn't run yet at this point — it's
+        // spawned by `panel::show_full` further down, and `cx.spawn`'d tasks
+        // don't run synchronously inline.
+        model.permissions_missing = missing;
+        cx.notify();
+    });
+    status_bar::install(None, ui_tx, &status.read(cx).composite());
+    panel::show_full(panel, panel::Tab::Settings, cx);
+    event_loop::spawn_ui_drain(panel, ui_rx, status.clone(), cx);
+    bind_select_settings_tab(cx, panel);
+    bind_close_panel(cx, panel);
 }
 
 /// Bind Cmd+, to open the panel on its Settings tab — the reliable,
@@ -234,5 +268,24 @@ fn bind_select_settings_tab(cx: &mut App, panel: gpui::WindowHandle<panel::Panel
     )]);
     cx.on_action(move |_action: &actions::SelectSettingsTab, cx: &mut App| {
         panel::show_full(panel, panel::Tab::Settings, cx);
+    });
+}
+
+/// Bind Esc to close the Full presentation (`panel::hide`, F1) — the
+/// keyboard-reachable dismiss path alongside the tab strip's own "✕"
+/// button. Bound on both the permissions-blocked and production paths
+/// (mirrors [`bind_select_settings_tab`] immediately above), so it works
+/// from the very first launch.
+///
+/// Bindings only fire while a GPUI window is key; the panel's Full
+/// presentation is the only window in this app that ever takes key status
+/// (`window_config::make_key_and_order_front`'s doc comment — the Hud stays
+/// non-key/click-through), so this can never intercept Esc from some other
+/// context.
+#[cfg(not(feature = "demo"))]
+fn bind_close_panel(cx: &mut App, panel: gpui::WindowHandle<panel::PanelRoot>) {
+    cx.bind_keys([gpui::KeyBinding::new("escape", actions::ClosePanel, None)]);
+    cx.on_action(move |_action: &actions::ClosePanel, cx: &mut App| {
+        panel::hide(panel, cx);
     });
 }

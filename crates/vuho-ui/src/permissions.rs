@@ -22,15 +22,16 @@ const NS_ALERT_FIRST_BUTTON: isize = 1000;
 
 /// System Settings deep-link anchors (ADR-016) — the one place every
 /// permission's settings-pane URL lives (CONSTITUTION rule 26). `pub(crate)`
-/// so `permission_gate.rs`'s denied-state "Open System Settings" buttons
-/// reuse these instead of duplicating URL strings.
+/// so `readiness.rs`'s `Permission::settings_url` (in turn rendered by
+/// `settings_tab.rs`'s denied-state "Open System Settings" button) reuses
+/// these instead of duplicating URL strings.
 pub(crate) const MICROPHONE_SETTINGS_URL: &str =
     "x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone";
 
 /// Confirmed via `AXIsProcessTrustedWithOptions`'s own dialog and widely
 /// documented `x-apple.systempreferences` anchor conventions. Only consumed
-/// by `permission_gate.rs` — cfg-gated so it isn't dead code under
-/// `--features demo`, which never builds that module.
+/// via `readiness.rs`'s `Permission::settings_url` — cfg-gated so it isn't
+/// dead code under `--features demo`, which never builds that module.
 #[cfg(not(feature = "demo"))]
 pub(crate) const ACCESSIBILITY_SETTINGS_URL: &str =
     "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility";
@@ -41,9 +42,9 @@ pub(crate) const ACCESSIBILITY_SETTINGS_URL: &str =
 /// anchor from directly, unlike Microphone/Accessibility — this anchor was
 /// verified against public macOS deep-link references, not driven
 /// end-to-end on this development machine; re-confirm by clicking through
-/// once a permission is actually in the Denied state). Only consumed by
-/// `permission_gate.rs` — cfg-gated for the same reason as
-/// `ACCESSIBILITY_SETTINGS_URL` above.
+/// once a permission is actually in the Denied state). Only consumed via
+/// `readiness.rs`'s `Permission::settings_url` — cfg-gated for the same
+/// reason as `ACCESSIBILITY_SETTINGS_URL` above.
 #[cfg(not(feature = "demo"))]
 pub(crate) const INPUT_MONITORING_SETTINGS_URL: &str =
     "x-apple.systempreferences:com.apple.preference.security?Privacy_ListenEvent";
@@ -102,8 +103,7 @@ pub(crate) fn show_microphone_denied() {
     }
 }
 
-/// Bring the accessory app forward so a modal alert (or a focused window,
-/// such as the permission gate) appears frontmost.
+/// Bring the accessory app forward so a modal alert appears frontmost.
 ///
 /// R2: `activate` is inherited (not overridden) on GPUI's `NSApplication`
 /// subclass, so the typed call is safe here — unlike `setActivationPolicy:` in
@@ -111,10 +111,10 @@ pub(crate) fn show_microphone_denied() {
 /// encoding and thus requires raw `objc_msgSend`. (`activateIgnoringOtherApps:`
 /// is deprecated; `activate` is the modern equivalent.)
 ///
-/// `pub(crate)`: also the chokepoint `permission_gate` uses to front its
-/// window on launch (and again on every "Permissions…" menu click) — the app
-/// runs under `NSApplicationActivationPolicyAccessory`, so a focused window
-/// alone does not bring the app forward without this.
+/// `pub(crate)`, but currently only called from [`show_microphone_denied`]
+/// above (in this same module) — the app runs under
+/// `NSApplicationActivationPolicyAccessory`, so a focused window alone does
+/// not bring the app forward without this.
 pub(crate) fn activate_app(mtm: MainThreadMarker) {
     let app = NSApplication::sharedApplication(mtm);
     app.activate();
@@ -122,8 +122,9 @@ pub(crate) fn activate_app(mtm: MainThreadMarker) {
 
 /// Open a URL via `NSWorkspace` (used for the System Settings deep-links).
 ///
-/// `pub(crate)` so `permission_gate.rs` reuses this opener rather than
-/// writing a second one (CONSTITUTION rule 26).
+/// `pub(crate)` so `settings_tab.rs`'s denied-state "Open System Settings"
+/// button reuses this opener rather than writing a second one (CONSTITUTION
+/// rule 26).
 pub(crate) fn open_url(url: &str) {
     if let Some(ns_url) = NSURL::URLWithString(&NSString::from_str(url)) {
         let _ = NSWorkspace::sharedWorkspace().openURL(&ns_url);

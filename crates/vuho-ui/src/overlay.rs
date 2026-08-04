@@ -128,12 +128,10 @@ const OPACITY_DIMMED: f32 = 0.4;
 
 // Panel chrome (Fix 3: moved out of the inline literals at the old
 // `overlay.rs:357-359` and into this named block, so the fade strip below
-// can reference the exact same background color). No shared-theme
-// equivalent: this exact hue/opacity combination is unique to the overlay's
-// floating, semi-transparent panel.
-const PANEL_HUE: f32 = 0.7;
-const PANEL_SATURATION: f32 = 0.1;
-const PANEL_LIGHTNESS: f32 = 0.08;
+// can reference the exact same background color). The hue/saturation/
+// lightness themselves live in `theme::PANEL_HUE`/`PANEL_SATURATION`/
+// `PANEL_LIGHTNESS` (F20) — shared with `panel.rs`'s `FULL_BG`; only the
+// opacity below is unique to the overlay's floating, semi-transparent panel.
 /// Raised from 0.85 (Fix 3): text should never fight the desktop behind it.
 const PANEL_BG_OPACITY: f32 = 0.9;
 const PANEL_BORDER_OPACITY: f32 = 0.1;
@@ -230,9 +228,9 @@ fn color_unconfirmed_text() -> Hsla {
 
 fn color_panel_bg() -> Hsla {
     hsla(
-        PANEL_HUE,
-        PANEL_SATURATION,
-        PANEL_LIGHTNESS,
+        theme::PANEL_HUE,
+        theme::PANEL_SATURATION,
+        theme::PANEL_LIGHTNESS,
         PANEL_BG_OPACITY,
     )
 }

@@ -15,13 +15,26 @@
 //! every item consumed only by production-only modules
 //! (`settings_tab.rs`/`controls.rs`/`panel.rs`'s Full-presentation code, all
 //! `#[cfg(not(feature = "demo"))]`) is therefore genuinely dead code under a
-//! demo build. A demo-scoped `#[cfg_attr(feature = "demo", allow(dead_code))]`
-//! per item would just enumerate the same list a second time, so this stays
-//! one file-level allow rather than roughly a dozen identical item-level
-//! ones. `TEXT_XS` (11px captions) is the one item with no call site in
-//! *either* build yet — kept for whichever future control needs a caption
-//! smaller than `TEXT_SM`, covered by the same allow.
-#![allow(dead_code)]
+//! demo build. That's a module-level `#[cfg_attr(feature = "demo",
+//! allow(dead_code))]` below (CONSTITUTION rule 29: scoped to the demo
+//! feature specifically, unlike the file-wide, always-on `allow` this
+//! replaces — a production build still catches a genuinely unused item).
+//! `TEXT_XS` (11px captions) is the one item with no call site in *either*
+//! build yet — the module-level allow doesn't reach it under production, so
+//! it carries its own item-level `allow` with its own reason, right above
+//! its definition.
+#![cfg_attr(
+    feature = "demo",
+    allow(
+        dead_code,
+        reason = "every semantic/fill/radius/section-helper token here that's consumed only by \
+                  settings_tab.rs/controls.rs/panel.rs's Full-presentation code (all \
+                  #[cfg(not(feature = \"demo\"))]) is genuinely dead when this module compiles \
+                  into the demo build, which never leaves Presentation::Hud (see the module doc \
+                  comment) — TEXT_XS is the one exception, dead under production too, and covered \
+                  by its own item-level allow instead"
+    )
+)]
 
 use gpui::{div, prelude::*, px, Div, Hsla, SharedString};
 
@@ -91,6 +104,19 @@ pub(crate) const ERROR_RED: Hsla = Hsla {
     a: 1.0,
 };
 
+// ── Shared panel background (F20) ──────────────────────────────────────────
+//
+// The Hud's translucent chrome (`overlay.rs`'s `color_panel_bg`) and the
+// Full presentation's opaque chrome (`panel.rs`'s `FULL_BG`) paint the same
+// hue/saturation/lightness — only the alpha differs (translucent vs. nearly
+// opaque, each still local to its own file) — so the three magnitudes live
+// here once instead of as two independently hand-copied literals that could
+// drift apart on a future restyle.
+
+pub(crate) const PANEL_HUE: f32 = 0.7;
+pub(crate) const PANEL_SATURATION: f32 = 0.1;
+pub(crate) const PANEL_LIGHTNESS: f32 = 0.08;
+
 // ── Fills (white-alpha) ─────────────────────────────────────────────────────
 
 pub(crate) const FILL_CARD: Hsla = Hsla {
@@ -139,7 +165,11 @@ pub(crate) const RADIUS_CHIP: f32 = 4.0;
 
 // ── Type scale (px) ─────────────────────────────────────────────────────────
 
-/// Captions. No call site yet — see the module doc comment.
+/// Captions. No call site in either build yet — see the module doc comment.
+#[allow(
+    dead_code,
+    reason = "reserved for a future caption smaller than TEXT_SM; no call site in either build yet"
+)]
 pub(crate) const TEXT_XS: f32 = 11.0;
 /// Secondary text / section labels.
 pub(crate) const TEXT_SM: f32 = 12.0;
