@@ -58,6 +58,10 @@ objc2-app-kit = { version = "0.3", features = [
     # replacement for window_config.rs's raw objc_msgSend activation-policy
     # hack.
     "NSRunningApplication",
+    # NSScreen::screens/mainScreen/frame — window_config.rs's set_frame
+    # (G2) always resolves the Cocoa coordinate flip against the primary
+    # screen, never the window's own (possibly nil, possibly stale) screen.
+    "NSScreen",
 ] }
 objc2-core-foundation = { version = "0.3", features = ["CFString", "CFArray", "CFDate", "CFDictionary", "CFNumber"] }
 objc2-core-graphics = { version = "0.3", features = ["CGEvent", "CGEventSource"] }

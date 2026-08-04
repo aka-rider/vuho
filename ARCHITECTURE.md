@@ -909,18 +909,36 @@ ever styled the overlay.
 The window itself is created once, at startup, in `Presentation::Hud`, `shown: false` — exactly
 like the old overlay was. Switching presentation is one **surgery chokepoint**
 (`panel::apply_presentation`): `Hud` sets the window's frame to the bottom-center bounds and turns
-click-through on; `Full` sets the frame to the centered bounds, turns click-through off, and calls
-`makeKeyAndOrderFront:` (`window_config::make_key_and_order_front`) — giving the panel keyboard
-focus *without* activating the application, since GPUI's `WindowKind::PopUp` already produces a
-non-activating `NSPanel` (`NSWindowStyleMaskNonactivatingPanel`) that can become key on its own.
-The window's level stays `kCGScreenSaverWindowLevel` (1000, set once at creation) across both
-presentations, so the Full presentation floats above normal windows exactly like the Hud does.
+click-through on; `Full` sets the frame to the centered bounds, turns click-through off, and — as
+long as a dictation session isn't currently recording — calls `makeKeyAndOrderFront:`
+(`window_config::make_key_and_order_front`), giving the panel keyboard focus *without* activating
+the application, since GPUI's `WindowKind::PopUp` already produces a non-activating `NSPanel`
+(`NSWindowStyleMaskNonactivatingPanel`) that can become key on its own. While recording, `Full`
+instead calls plain `orderFront:` and never grabs key status at all (`show_full`'s `grab_key`
+parameter, derived from `OverlayModel::is_recording`) — opening the panel mid-dictation (a
+`Failed` model status, a tray click) must not steal the destination of `inject_text`'s synthesized
+⌘V from the app the user is actually dictating into. The window's level stays
+`kCGScreenSaverWindowLevel` (1000, set once at creation) across both presentations, so the Full
+presentation floats above normal windows exactly like the Hud does.
+
 Three further transitions build on that chokepoint: `show_full` (tray click, `Cmd+,`, a `Failed`
 model status), `on_session_started` (a session beginning while the panel is hidden shows the Hud;
 while the Full presentation is already open, it only switches the active tab back to Overlay —
-never re-frames or steals key status from a window the user opened deliberately), and
+never re-frames a window the user opened deliberately, but if that window happens to be key it
+resigns key status via `window_config::resign_key_keep_front` — `orderOut:` then plain
+`orderFront:` — for the same reason `show_full` withholds it above: a session starting means the
+panel is about to lose the ⌘V destination race to whatever app the user is dictating into), and
 `hide_if_hud` (the old outcome-duration auto-hide, now a no-op while the Full presentation is
-open).
+open). A finished session whose outcome still needs attention (`ClipboardOnly`/`Failed`) re-shows
+the panel as the Hud even if it was already dismissed mid-session
+(`event_loop::maybe_show_hud_for_outcome` → `panel::show_hud_for_outcome`, sharing the same
+"show as Hud if not already shown" step `on_session_started` uses).
+
+**Dismissal affordances**, all going through the one `hide`/`hide_root` implementation: the Full
+presentation's tab-strip "✕" button, `Esc` (bound to the `ClosePanel` action on both the
+permissions-blocked and production startup paths), and clicking an already-open tray icon a second
+time (`open_from_tray`'s toggle). `hide_root` also closes any open Settings dropdowns
+(`SettingsTab::close_dropdowns`) so a dismiss-then-reopen never shows a stale device list.
 
 **The permission gate is now the panel's Settings tab (amends ADR-016).** `main.rs` builds the
 settings store, the `StatusModel`/`SettingsTab` entities, and the panel itself *before* checking
@@ -933,10 +951,19 @@ exactly the same Settings tab a fully-launched app's Cmd+, would open — there 
 window, and no separate `install_gate`/`DelegateMode::Gate`/`GateCommand` machinery in
 `status_bar.rs`: one `install(cmd_tx: Option<Sender<DictationCommand>>, ui_tx)` call serves both
 states, with `sync`'s existing `CompositeStatus::menu_title`/`toggle_enabled` already covering
-`PermissionsMissing`/`RelaunchRequired`. A `Full`-presentation permissions poll
-(`panel::start_permissions_poll`, spawned by `show_full`, dropped by `hide_if_hud`) replaces the
-old readiness window's `spawn_poll_loop`, writing `StatusModel::permissions_missing` only when it
-actually changed.
+`PermissionsMissing`/`RelaunchRequired`. A permissions poll (`panel::start_permissions_poll`)
+replaces the old readiness window's `spawn_poll_loop`, writing `StatusModel::permissions_missing`
+only when it actually changed. Its lifecycle is **not** simply tied to the panel's own visibility:
+`show_full` spawns it (guarded against a duplicate spawn if one is already running) and seeds
+`permissions_missing` synchronously first, so the Settings tab's very first paint is already
+truthful instead of waiting on the poll's own first tick; the poll then keeps re-checking every
+500 ms and self-terminates only once `!shown && permissions_missing.is_empty()` — i.e. the panel
+is hidden *and* every permission has actually been granted. This keep-alive-while-non-empty rule
+exists because the poll is the only thing that ever clears `permissions_missing`: if it stopped
+the moment the panel was merely hidden, a permission granted after dismissal would leave the
+tray/menu stuck reporting "Permissions…" forever, with nothing left running to notice the grant.
+`hide_root` mirrors the same condition — it drops the task early only when permissions are already
+empty, otherwise leaving it to keep converging past the dismiss.
 
 **ADR-020's "model row never on the gate path" invariant is now enforced by a type, not a
 window-selection branch.** The old readiness window kept the model row off the permission-gate

@@ -601,6 +601,19 @@ impl OverlayModel {
     pub(crate) fn has_session_content(&self) -> bool {
         self.recording || self.outcome.is_some()
     }
+
+    /// Whether a dictation session is actively recording right now —
+    /// narrower than [`Self::has_session_content`], which also stays `true`
+    /// while a finished session's outcome flash is still on screen. Drives
+    /// `panel.rs`'s G3(c) hazard: opening the Full presentation while a
+    /// session is actually live must not steal keyboard focus from the app
+    /// the user is dictating into (`inject_text`'s synthesized ⌘V is
+    /// delivered to whichever window is key when it fires).
+    #[cfg(not(feature = "demo"))]
+    #[must_use]
+    pub(crate) fn is_recording(&self) -> bool {
+        self.recording
+    }
 }
 
 /// The shared, bottom-anchored transcript viewport (Fix 3): fixed height,
