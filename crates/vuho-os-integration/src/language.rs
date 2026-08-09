@@ -26,59 +26,37 @@ use crate::sys;
 /// both mean "let the engine auto-detect" downstream.
 static CACHED_LANGUAGE: RwLock<Option<String>> = RwLock::new(None);
 
+/// Every BCP-47 primary subtag this module maps, and — since every mapping
+/// is the identity — every Whisper code it can produce. The single source
+/// both [`map_bcp47_to_whisper`] and [`mapped_languages`] read, so the
+/// supported set cannot drift from the mapper (CONSTITUTION rule 26).
+const MAPPED_LANGUAGES: [&str; 29] = [
+    "bg", "cs", "da", "de", "el", "en", "es", "et", "fi", "fr", "hr", "hu", "it", "ja", "ko", "lt",
+    "lv", "mt", "nl", "pl", "pt", "ro", "ru", "sk", "sl", "sv", "uk", "vi", "zh",
+];
+
 /// Map a BCP-47 language tag to a Whisper language code.
 ///
 /// Extracts the primary subtag (everything before the first `-`, e.g. `"en"`
-/// from `"en-US"`) and looks *only that* up in the supported set — the
-/// primary subtag by construction never contains a `-`, so match arms for
-/// full tags like `"en-US"` could never fire and are not listed. Returns
-/// `None` for unmapped languages, which signals the caller to use engine
-/// auto-detect (ADR-009).
+/// from `"en-US"`) and looks *only that* up in [`MAPPED_LANGUAGES`] — the
+/// primary subtag by construction never contains a `-`, so full tags like
+/// `"en-US"` are never themselves listed. Returns `None` for unmapped
+/// languages, which signals the caller to use engine auto-detect (ADR-009).
 ///
-/// # Supported BCP-47 primary subtag → Whisper mappings
-///
-/// | primary subtag | Whisper | example full tags it matches |
-/// |--------|---------|---|
-/// | `en` | `"en"` | `en`, `en-US`, `en-GB` |
-/// | `de` | `"de"` | `de`, `de-DE`, `de-AT` |
-/// | `fr` | `"fr"` | `fr`, `fr-FR` |
-/// | `vi` | `"vi"` | `vi`, `vi-VN` |
-/// | `es` | `"es"` | `es`, `es-ES` |
-/// | `it` | `"it"` | `it`, `it-IT` |
-/// | `pt` | `"pt"` | `pt`, `pt-BR`, `pt-PT` |
-/// | `nl` | `"nl"` | `nl`, `nl-NL` |
-/// | `ru` | `"ru"` | `ru`, `ru-RU` |
-/// | `ja` | `"ja"` | `ja`, `ja-JP` |
-/// | `ko` | `"ko"` | `ko`, `ko-KR` |
-/// | `zh` | `"zh"` | `zh`, `zh-Hans`, `zh-Hant` |
+/// See [`mapped_languages`] for the supported set.
 #[must_use]
 pub fn map_bcp47_to_whisper(tag: &str) -> Option<&'static str> {
     let primary = tag.split('-').next()?;
-    if primary.is_empty() {
-        return None;
-    }
+    MAPPED_LANGUAGES.into_iter().find(|&code| code == primary)
+}
 
-    // O(1) match — no linear scan, self-documenting mappings. Only bare
-    // primary-subtag arms: `primary` is everything before the first `-`, so
-    // it can never itself contain one — a `"en-US"` arm here would be dead
-    // code (confirmed dead: cargo clippy's `unreachable_patterns` doesn't
-    // even fire because the arms were never syntactically unreachable, just
-    // semantically unreachable given `primary`'s construction).
-    match primary {
-        "en" => Some("en"),
-        "de" => Some("de"),
-        "fr" => Some("fr"),
-        "vi" => Some("vi"),
-        "es" => Some("es"),
-        "it" => Some("it"),
-        "pt" => Some("pt"),
-        "nl" => Some("nl"),
-        "ru" => Some("ru"),
-        "ja" => Some("ja"),
-        "ko" => Some("ko"),
-        "zh" => Some("zh"),
-        _ => None,
-    }
+/// Every Whisper language code [`map_bcp47_to_whisper`] can return.
+///
+/// Callers intersect this with a speech model's own supported set to tell
+/// the user which languages that model can actually be reached in.
+#[must_use]
+pub fn mapped_languages() -> &'static [&'static str] {
+    &MAPPED_LANGUAGES
 }
 
 /// Detects the current keyboard input language via macOS TIS.
@@ -272,6 +250,113 @@ mod tests {
     #[test]
     fn map_zh_hant() {
         assert_eq!(map_bcp47_to_whisper("zh-Hant"), Some("zh"));
+    }
+
+    #[test]
+    fn map_bg_bg() {
+        assert_eq!(map_bcp47_to_whisper("bg-BG"), Some("bg"));
+    }
+
+    #[test]
+    fn map_hr_hr() {
+        assert_eq!(map_bcp47_to_whisper("hr-HR"), Some("hr"));
+    }
+
+    #[test]
+    fn map_cs_cz() {
+        assert_eq!(map_bcp47_to_whisper("cs-CZ"), Some("cs"));
+    }
+
+    #[test]
+    fn map_da_dk() {
+        assert_eq!(map_bcp47_to_whisper("da-DK"), Some("da"));
+    }
+
+    #[test]
+    fn map_et_ee() {
+        assert_eq!(map_bcp47_to_whisper("et-EE"), Some("et"));
+    }
+
+    #[test]
+    fn map_fi_fi() {
+        assert_eq!(map_bcp47_to_whisper("fi-FI"), Some("fi"));
+    }
+
+    #[test]
+    fn map_el_gr() {
+        assert_eq!(map_bcp47_to_whisper("el-GR"), Some("el"));
+    }
+
+    #[test]
+    fn map_hu_hu() {
+        assert_eq!(map_bcp47_to_whisper("hu-HU"), Some("hu"));
+    }
+
+    #[test]
+    fn map_lv_lv() {
+        assert_eq!(map_bcp47_to_whisper("lv-LV"), Some("lv"));
+    }
+
+    #[test]
+    fn map_lt_lt() {
+        assert_eq!(map_bcp47_to_whisper("lt-LT"), Some("lt"));
+    }
+
+    #[test]
+    fn map_mt_mt() {
+        assert_eq!(map_bcp47_to_whisper("mt-MT"), Some("mt"));
+    }
+
+    #[test]
+    fn map_pl_pl() {
+        assert_eq!(map_bcp47_to_whisper("pl-PL"), Some("pl"));
+    }
+
+    #[test]
+    fn map_ro_ro() {
+        assert_eq!(map_bcp47_to_whisper("ro-RO"), Some("ro"));
+    }
+
+    #[test]
+    fn map_sk_sk() {
+        assert_eq!(map_bcp47_to_whisper("sk-SK"), Some("sk"));
+    }
+
+    #[test]
+    fn map_sl_si() {
+        assert_eq!(map_bcp47_to_whisper("sl-SI"), Some("sl"));
+    }
+
+    #[test]
+    fn map_sv_se() {
+        assert_eq!(map_bcp47_to_whisper("sv-SE"), Some("sv"));
+    }
+
+    #[test]
+    fn map_uk_ua() {
+        assert_eq!(map_bcp47_to_whisper("uk-UA"), Some("uk"));
+    }
+
+    #[test]
+    fn map_plain_uk() {
+        assert_eq!(map_bcp47_to_whisper("uk"), Some("uk"));
+    }
+
+    #[test]
+    fn every_mapped_language_maps_to_itself() {
+        for code in mapped_languages() {
+            assert_eq!(map_bcp47_to_whisper(code), Some(*code));
+            assert_eq!(map_bcp47_to_whisper(&format!("{code}-XX")), Some(*code));
+        }
+    }
+
+    #[test]
+    fn mapped_languages_are_unique_two_letter_codes() {
+        let mut seen = mapped_languages().to_vec();
+        seen.sort_unstable();
+        seen.dedup();
+        assert_eq!(seen.len(), mapped_languages().len());
+        assert!(mapped_languages().iter().all(|code| code.len() == 2));
     }
 
     #[test]

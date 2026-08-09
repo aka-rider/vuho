@@ -21,9 +21,9 @@
 //!
 //! Every inference in this module — a partial re-inference of the open
 //! window, a full window commit, VAD-endpoint promotion, and the final
-//! end-aligned tail — decodes from a **fresh** `DecoderState::new()` and
-//! `initial_t = 0`. Nothing here threads decoder state from one inference
-//! into the next.
+//! end-aligned tail — goes through [`WindowInference::infer_window`], whose
+//! contract is that each window decodes from scratch. Nothing here threads
+//! decoder state from one inference into the next.
 //!
 //! This mirrors `engine.rs`'s batch `transcribe()` (see its doc comment
 //! for the full root-cause writeup) and `FluidAudio`'s own
@@ -50,12 +50,11 @@ use std::time::{Duration, Instant};
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender};
 use vuho_domain::{DictationEvent, ErrorKind, TranscriptionResult};
 
-use crate::parakeet::decoder_state::DecoderState;
-use crate::parakeet::models::ParakeetModels;
-use crate::parakeet::tdt::TokenAt;
 use crate::stream::accumulator::Accumulator;
 use crate::stream::merge::MergeOutcome;
 use crate::stream::{merge, windower};
+use crate::token::TokenAt;
+use crate::window_inference::WindowInference;
 use crate::EngineError;
 
 /// How often the recv loop times out to re-check the stop flag when no
@@ -135,8 +134,8 @@ fn activity_level(rms: f32) -> f32 {
 /// (via [`Accumulator`]), and the outstanding unconfirmed ("fresh") tokens
 /// from the last partial re-inference.
 ///
-/// No decoder state lives here — see this module's doc comment. Every
-/// inference builds its own `DecoderState::new()` on the spot.
+/// No decoder state lives here — see this module's doc comment; the
+/// backend owns whatever per-window state it needs.
 struct SessionState {
     /// Samples accumulated for the currently open (not yet committed) window.
     open_buffer: Vec<f32>,
@@ -159,16 +158,20 @@ struct SessionState {
     /// read) whenever `fresh` is empty, which is the only state it starts
     /// in and returns to after every promotion/commit.
     fresh_keep_committed: usize,
+    /// The session's language, passed to every [`WindowInference::infer_window`]
+    /// call (a backend that decodes without a language prompt ignores it).
+    language: String,
 }
 
 impl SessionState {
-    fn new() -> Self {
+    fn new(language: &str) -> Self {
         Self {
             open_buffer: Vec::with_capacity(windower::WINDOW_SAMPLES),
             window_base_offset: 0,
             acc: Accumulator::new(),
             fresh: Vec::new(),
             fresh_keep_committed: 0,
+            language: language.to_string(),
         }
     }
 
@@ -177,7 +180,7 @@ impl SessionState {
     }
 
     /// `(confirmed_text, unconfirmed_text)` for a `PartialTranscript` event.
-    fn transcript_texts(&self, models: &ParakeetModels) -> (String, String) {
+    fn transcript_texts(&self, models: &dyn WindowInference) -> (String, String) {
         self.acc.confirmed_unconfirmed_texts(&self.fresh, models)
     }
 }
@@ -266,14 +269,10 @@ fn endpoint_flush_due(trailing_silence_ms: u32, flushed_since_speech: bool) -> b
 fn apply_partial_merge<'p>(
     state: &mut SessionState,
     emitted: Vec<TokenAt>,
+    bounds: merge::MergeBounds,
     piece: impl Fn(u32) -> Option<(bool, &'p str)>,
 ) {
-    let merged = merge::merge(
-        state.acc.committed(),
-        emitted,
-        windower::OVERLAP_FRAMES,
-        piece,
-    );
+    let merged = merge::merge(state.acc.committed(), emitted, bounds, piece);
     // `fresh` is the append side of the outcome, displayed as unconfirmed
     // text. `keep_committed` is stashed alongside it: if this partial's
     // tokens are later promoted (VAD endpoint), the promotion must
@@ -291,11 +290,14 @@ fn apply_partial_merge<'p>(
 /// Re-decodes the *whole* open buffer from scratch every time (see this
 /// module's doc comment) — deterministic given the same buffer contents,
 /// so re-running is naturally idempotent.
-fn run_partial(state: &mut SessionState, models: &ParakeetModels, events: &Sender<DictationEvent>) {
+fn run_partial(
+    state: &mut SessionState,
+    models: &dyn WindowInference,
+    events: &Sender<DictationEvent>,
+) {
     let global_frame_offset = state.global_frame_offset();
-    let mut fresh_state = DecoderState::new();
     let started_at = Instant::now();
-    let outcome = models.infer_window(&state.open_buffer, 0, global_frame_offset, &mut fresh_state);
+    let outcome = models.infer_window(&state.open_buffer, global_frame_offset, &state.language);
     log::debug!(
         "vuho-stt-session: partial inference took {:?} over open_buffer.len()={}",
         started_at.elapsed(),
@@ -308,7 +310,9 @@ fn run_partial(state: &mut SessionState, models: &ParakeetModels, events: &Sende
         return;
     };
 
-    apply_partial_merge(state, emitted, |id| models.piece_info(id));
+    apply_partial_merge(state, emitted, models.merge_bounds(), |id| {
+        models.piece_info(id)
+    });
 
     let (confirmed_text, unconfirmed_text) = state.transcript_texts(models);
     send(
@@ -334,7 +338,7 @@ fn run_partial(state: &mut SessionState, models: &ParakeetModels, events: &Sende
 /// promotion stick.
 fn promote_fresh_to_committed(
     state: &mut SessionState,
-    models: &ParakeetModels,
+    models: &dyn WindowInference,
     events: &Sender<DictationEvent>,
 ) {
     if state.fresh.is_empty() {
@@ -383,15 +387,15 @@ fn promote_fresh_to_committed(
 fn infer_and_apply(
     acc: &mut Accumulator,
     global_frame_offset: usize,
-    models: &ParakeetModels,
+    models: &dyn WindowInference,
+    language: &str,
     samples: &[f32],
     context: &str,
     events: &Sender<DictationEvent>,
 ) {
-    let mut fresh_state = DecoderState::new();
-    match models.infer_window(samples, 0, global_frame_offset, &mut fresh_state) {
+    match models.infer_window(samples, global_frame_offset, language) {
         Ok(emitted) => {
-            let outcome = merge::merge(acc.committed(), emitted, windower::OVERLAP_FRAMES, |id| {
+            let outcome = merge::merge(acc.committed(), emitted, models.merge_bounds(), |id| {
                 models.piece_info(id)
             });
             acc.apply(outcome, models);
@@ -406,7 +410,7 @@ fn infer_and_apply(
 /// Build and send the recoverable `Error` event for a failed commit/final-
 /// window inference (see [`infer_and_apply`]'s doc comment for why the
 /// caller still advances afterward). Split out from `infer_and_apply` so
-/// it's unit-testable without a real `ParakeetModels`/`CoreML` call.
+/// it's unit-testable without a real backend/`CoreML` call.
 fn report_inference_failure(events: &Sender<DictationEvent>, context: &str, e: &EngineError) {
     send(
         events,
@@ -423,7 +427,7 @@ fn report_inference_failure(events: &Sender<DictationEvent>, context: &str, e: &
 /// and advances the window by `ADVANCE`.
 fn commit_window(
     state: &mut SessionState,
-    models: &ParakeetModels,
+    models: &dyn WindowInference,
     events: &Sender<DictationEvent>,
 ) {
     let global_frame_offset = state.global_frame_offset();
@@ -434,6 +438,7 @@ fn commit_window(
         &mut state.acc,
         global_frame_offset,
         models,
+        &state.language,
         &state.open_buffer[..windower::WINDOW_SAMPLES],
         "window commit",
         events,
@@ -465,7 +470,7 @@ fn commit_window(
 /// remains in the open buffer, folded into committed.
 fn finalize_tail(
     state: &mut SessionState,
-    models: &ParakeetModels,
+    models: &dyn WindowInference,
     events: &Sender<DictationEvent>,
 ) {
     if state.open_buffer.is_empty() {
@@ -477,6 +482,7 @@ fn finalize_tail(
         &mut state.acc,
         global_frame_offset,
         models,
+        &state.language,
         &tail,
         "final window",
         events,
@@ -503,7 +509,7 @@ fn handle_chunk(
     chunk: &[f32],
     vad: &mut crate::vad::Vad,
     state: &mut SessionState,
-    models: &ParakeetModels,
+    models: &dyn WindowInference,
     events: &Sender<DictationEvent>,
     audio_live: bool,
     cadence: &mut PartialCadence,
@@ -562,7 +568,7 @@ fn handle_chunk(
 /// final-window inference).
 fn handle_disconnected<A: AudioSource>(
     state: &mut SessionState,
-    models: &ParakeetModels,
+    models: &dyn WindowInference,
     events: &Sender<DictationEvent>,
     audio: Option<&A>,
 ) {
@@ -606,7 +612,7 @@ pub(crate) fn run_session<A: AudioSource>(
     chunks: &Receiver<Vec<f32>>,
     events: &Sender<DictationEvent>,
     stop: &AtomicBool,
-    models: &ParakeetModels,
+    models: &dyn WindowInference,
     audio: A,
     language: &str,
     partial_interval: Duration,
@@ -630,7 +636,7 @@ pub(crate) fn run_session<A: AudioSource>(
         }
     };
 
-    let mut state = SessionState::new();
+    let mut state = SessionState::new(language);
     let mut audio = Some(audio);
     let mut cadence = PartialCadence::new(partial_interval);
 
@@ -733,19 +739,20 @@ mod tests {
         }
     }
 
-    fn load_models() -> Option<ParakeetModels> {
-        let folder = crate::resolve_model_folder().ok()?;
-        match ParakeetModels::load(&folder) {
+    fn load_models() -> Option<crate::parakeet::models::ParakeetModels> {
+        let model_id = vuho_model_paths::manifest().stt.default_model.as_str();
+        let folder = crate::resolve_model_folder(model_id).ok()?;
+        match crate::parakeet::models::ParakeetModels::load(model_id, &folder) {
             Ok(m) => Some(m),
             Err(e) => {
-                eprintln!("skipping: ParakeetModels failed to load: {e}");
+                eprintln!("skipping: model load failed: {e}");
                 None
             }
         }
     }
 
-    fn tok(id: u32, frame: usize) -> TokenAt {
-        TokenAt { id, frame }
+    fn tok(id: u32, pos: usize) -> TokenAt {
+        TokenAt { id, pos }
     }
 
     /// Scan the real vocabulary for `count` distinct word-initial ids with
@@ -753,7 +760,7 @@ mod tests {
     /// — real "whole word" tokens to build a deterministic merge/promotion
     /// scenario against, without hardcoding ids the shipped vocab file
     /// happens to use today.
-    fn find_word_initial_ids(models: &ParakeetModels, count: usize) -> Vec<u32> {
+    fn find_word_initial_ids(models: &dyn WindowInference, count: usize) -> Vec<u32> {
         (0..8192u32)
             .filter(|&id| {
                 models
@@ -796,7 +803,7 @@ mod tests {
         );
         let (id_a, id_b, id_c, id_d) = (ids[0], ids[1], ids[2], ids[3]);
 
-        let mut state = SessionState::new();
+        let mut state = SessionState::new("en");
         // Seed committed = [A, B] via the same `Accumulator::apply` path a
         // real commit/promotion uses (not a private-field poke).
         state.acc.apply(
@@ -815,7 +822,9 @@ mod tests {
         // A fresh re-decode of the open window: A, B reproduced (same ids,
         // frames within `merge`'s overlap tolerance), plus newly emitted C, D.
         let emitted = vec![tok(id_a, 10), tok(id_b, 11), tok(id_c, 12), tok(id_d, 13)];
-        apply_partial_merge(&mut state, emitted, |id| models.piece_info(id));
+        apply_partial_merge(&mut state, emitted, models.merge_bounds(), |id| {
+            models.piece_info(id)
+        });
         assert_eq!(
             state.fresh_keep_committed, 0,
             "sanity: merge must recognize A, B as the matched seam and re-splice from frame 0"
@@ -838,13 +847,12 @@ mod tests {
     /// to one window's worth of audio silently fails to transcribe. This
     /// exercises `report_inference_failure` directly — the decision helper
     /// `infer_and_apply` calls on its `Err` arm — rather than the full
-    /// `commit_window`/`finalize_tail` → real `ParakeetModels::infer_window`
+    /// `commit_window`/`finalize_tail` → a real `WindowInference::infer_window`
     /// path: forcing a genuine `CoreML` failure deterministically would need
-    /// fault injection this crate's `models: &ParakeetModels` (a concrete
-    /// type, not a trait) doesn't support without a wider refactor out of
-    /// scope here. The full "a real `CoreML` failure during a commit reaches
-    /// the UI" path is therefore integration-BLIND; this test covers the
-    /// event-construction half of that path precisely.
+    /// a fault-injecting `WindowInference` fixture, a wider change than this
+    /// regression needs. The full "a real `CoreML` failure during a commit
+    /// reaches the UI" path is therefore integration-BLIND; this test covers
+    /// the event-construction half of that path precisely.
     #[test]
     fn report_inference_failure_sends_a_recoverable_error_naming_the_context() {
         let (events_tx, events_rx) = crossbeam_channel::unbounded::<DictationEvent>();
@@ -890,7 +898,7 @@ mod tests {
         let Some(models) = load_models() else { return };
 
         let mut vad = crate::vad::Vad::new().expect("vad init must succeed");
-        let mut state = SessionState::new();
+        let mut state = SessionState::new("en");
         let mut cadence = PartialCadence::new(Duration::ZERO);
         let (events_tx, events_rx) = crossbeam_channel::unbounded::<DictationEvent>();
 
@@ -996,10 +1004,63 @@ mod tests {
         );
     }
 
+    /// Chunk size the file-driven session tests feed with: 1 s @ 16 kHz. A
+    /// handful of chunks exercises interleaving without driving one real
+    /// inference per 100 ms of audio — each partial re-encodes a full 15 s
+    /// padded window however little of it is real audio, so the cost per
+    /// call is ~constant and fewer, larger chunks keeps the test's wall
+    /// time down.
+    const FEED_CHUNK_SAMPLES: usize = 16_000;
+
+    /// Send `samples` to a running session in [`FEED_CHUNK_SAMPLES`] chunks,
+    /// wait for the first `PartialTranscript` to have arrived, then set
+    /// `stop` — the two file-driven session tests' shared feeder
+    /// (CONSTITUTION rule 26). Returns the feeder's handle and the instant
+    /// `stop` was set, which is where a stop→final-result measurement
+    /// starts.
+    ///
+    /// Setting `stop` has to wait for the session to have actually produced
+    /// a partial: the chunk channel is unbounded, so a feeder that sent
+    /// everything and stopped immediately could beat the session thread to
+    /// its very first loop iteration and gate off cadence partials for the
+    /// entire drained backlog (see `handle_chunk`'s `audio_live` doc
+    /// comment). The wait is a receive on `first_partial`, which the
+    /// caller's event-drain loop sends on — the observable event itself
+    /// orders the stop, never a polled flag and never a duration
+    /// (CONSTITUTION rule 32). `timeout` bounds only the failure case, so a
+    /// genuinely broken streaming contract fails promptly instead of
+    /// hanging.
+    fn spawn_chunk_feeder(
+        samples: Vec<f32>,
+        chunk_tx: crossbeam_channel::Sender<Vec<f32>>,
+        stop: Arc<AtomicBool>,
+        first_partial: crossbeam_channel::Receiver<()>,
+        timeout: Duration,
+    ) -> (
+        std::thread::JoinHandle<()>,
+        Arc<std::sync::Mutex<Option<Instant>>>,
+    ) {
+        let stopped_at = Arc::new(std::sync::Mutex::new(None));
+        let feed_stopped_at = Arc::clone(&stopped_at);
+        let handle = std::thread::spawn(move || {
+            for chunk in samples.chunks(FEED_CHUNK_SAMPLES) {
+                if chunk_tx.send(chunk.to_vec()).is_err() {
+                    break;
+                }
+            }
+            let _ = first_partial.recv_timeout(timeout);
+            *feed_stopped_at
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Instant::now());
+            stop.store(true, Ordering::SeqCst);
+        });
+        (handle, stopped_at)
+    }
+
     /// Feed `jfk.wav` in 1 s chunks through `run_session` (no `cpal`, no
     /// microphone, no wall-clock pacing — `partial_interval: Duration::ZERO`
     /// makes every chunk with speech due for a partial, so the streaming
-    /// contract is exercised without an artificial `thread::sleep`) and
+    /// contract is exercised without pacing the sends at all) and
     /// assert: at least one `PartialTranscript` arrives before the final
     /// result, and the final text contains the expected quote. jfk.wav
     /// (~11 s) stays within a single 15 s window, so this exercises the
@@ -1007,26 +1068,10 @@ mod tests {
     /// (now-fixed) cross-window seam behavior covered by
     /// `tests/batch_multiwindow.rs`.
     ///
-    /// No wall-clock pacing between sends: `partial_interval: Duration::ZERO`
-    /// makes the first speech-containing chunk immediately due for a
-    /// partial, so a per-chunk sleep is not needed to make one *happen* —
-    /// but setting the stop flag still has to wait for the session to have
-    /// actually gotten to it (an unbounded channel means the feeder could
-    /// otherwise send every chunk and flip `stop` before the session thread
-    /// runs its first loop iteration at all, which would gate off cadence
-    /// partials for the *entire* drained backlog — see `handle_chunk`'s
-    /// `audio_live` doc comment). `saw_partial_flag`, set by the event-drain
-    /// loop below the moment the first `PartialTranscript` arrives, is that
-    /// wait condition — real synchronization, not a tuned sleep duration.
+    /// The stop is ordered by the first partial arriving — see
+    /// [`spawn_chunk_feeder`].
     #[test]
     fn streams_jfk_wav_in_chunks_and_produces_partial_then_final() {
-        // 1 s @ 16 kHz — a handful of chunks is enough to exercise
-        // interleaving without driving one real inference per 100 ms of
-        // audio (each partial re-inference re-encodes a full 15 s padded
-        // window regardless of how much of it is real audio, so the cost
-        // per call is ~constant — fewer, larger chunks keeps the call count
-        // and thus the test's wall time down).
-        const CHUNK_SAMPLES: usize = 16_000;
         /// Upper bound on how long the feeder waits for the first partial
         /// before giving up and flipping `stop` anyway — bounds the test's
         /// worst case to "fails promptly" rather than "hangs forever" if
@@ -1046,33 +1091,21 @@ mod tests {
 
         let (chunk_tx, chunk_rx) = crossbeam_channel::unbounded::<Vec<f32>>();
         let (events_tx, events_rx) = crossbeam_channel::unbounded::<DictationEvent>();
+        let (partial_tx, partial_rx) = crossbeam_channel::bounded::<()>(1);
         let stop = Arc::new(AtomicBool::new(false));
-        let saw_partial_flag = Arc::new(AtomicBool::new(false));
         // The session's own `AudioSource::stop()` is the only thing that
         // may close the chunk channel (see `TestAudioSource`'s doc
         // comment) — so the feeder sends on its own clone and never
         // touches this one.
         let audio_source = TestAudioSource::new(chunk_tx.clone());
 
-        let feed_stop = Arc::clone(&stop);
-        let feed_saw_partial = Arc::clone(&saw_partial_flag);
-        let feeder = std::thread::spawn(move || {
-            for chunk in samples.chunks(CHUNK_SAMPLES) {
-                if chunk_tx.send(chunk.to_vec()).is_err() {
-                    break;
-                }
-            }
-            // All audio sent. Wait for proof the session actually produced
-            // a partial before simulating the user pressing the stop
-            // hotkey — see this test's doc comment.
-            let started_waiting = Instant::now();
-            while !feed_saw_partial.load(Ordering::SeqCst)
-                && started_waiting.elapsed() < SAW_PARTIAL_TIMEOUT
-            {
-                std::thread::sleep(Duration::from_millis(2));
-            }
-            feed_stop.store(true, Ordering::SeqCst);
-        });
+        let (feeder, _stopped_at) = spawn_chunk_feeder(
+            samples,
+            chunk_tx,
+            Arc::clone(&stop),
+            partial_rx,
+            SAW_PARTIAL_TIMEOUT,
+        );
 
         let stop_for_session = Arc::clone(&stop);
         let session = std::thread::spawn(move || {
@@ -1097,11 +1130,107 @@ mod tests {
         for event in &events_rx {
             if matches!(event, DictationEvent::PartialTranscript { .. }) {
                 saw_partial = true;
-                saw_partial_flag.store(true, Ordering::SeqCst);
+                let _ = partial_tx.try_send(());
             }
         }
         feeder.join().expect("feeder thread panicked");
         let result = session.join().expect("session thread panicked");
+        assert!(
+            saw_partial,
+            "expected at least one PartialTranscript before the final result"
+        );
+        let lower = result.full_text.to_lowercase();
+        assert!(
+            lower.contains("ask not what your country can do for you"),
+            "expected the JFK quote in the final transcript, got: {}",
+            result.full_text
+        );
+    }
+
+    /// Canary's streaming contract, and the measurement that decides
+    /// whether it is viable for live dictation (WP6.S11 f).
+    ///
+    /// The number the user actually feels on releasing the hotkey is the
+    /// **stop → final result** latency: the end-aligned final-window
+    /// inference plus the session thread's wind-down. No cadence knob can
+    /// hide it, so it is measured here — from setting the stop flag to
+    /// `join()` returning — rather than assumed. Runs at the production
+    /// partial cadence, feeds jfk.wav with no wall-clock pacing, and still
+    /// asserts real behaviour (a partial before the final text, and the
+    /// quote in it) so the measurement rides on a genuine regression test.
+    #[test]
+    fn canary_streams_jfk_wav_and_reports_its_stop_to_result_latency() {
+        /// Upper bound on the wait for a first partial before stopping
+        /// anyway — bounds the worst case to "fails promptly" rather than
+        /// "hangs forever" if the streaming contract really is broken.
+        const SAW_PARTIAL_TIMEOUT: Duration = Duration::from_secs(300);
+
+        let Some(samples) = crate::test_support::load_jfk_wav_f32() else {
+            eprintln!("skipping: JFK_WAV/jfk.wav not found in this environment");
+            return;
+        };
+        let Some(model_id) = crate::canary::manifest_model_id() else {
+            eprintln!("skipping: the manifest declares no Canary model");
+            return;
+        };
+        let Ok(folder) = crate::resolve_model_folder(model_id) else {
+            eprintln!("skipping: no Canary model folder resolved in this environment");
+            return;
+        };
+        let models = match crate::canary::models::CanaryModels::load(model_id, &folder) {
+            Ok(m) => crate::coreml::SendModel(m),
+            Err(e) => {
+                eprintln!("skipping: Canary model load failed: {e}");
+                return;
+            }
+        };
+
+        let (chunk_tx, chunk_rx) = crossbeam_channel::unbounded::<Vec<f32>>();
+        let (events_tx, events_rx) = crossbeam_channel::unbounded::<DictationEvent>();
+        let (partial_tx, partial_rx) = crossbeam_channel::bounded::<()>(1);
+        let stop = Arc::new(AtomicBool::new(false));
+        let audio_source = TestAudioSource::new(chunk_tx.clone());
+
+        let (feeder, stopped_at) = spawn_chunk_feeder(
+            samples,
+            chunk_tx,
+            Arc::clone(&stop),
+            partial_rx,
+            SAW_PARTIAL_TIMEOUT,
+        );
+
+        let stop_for_session = Arc::clone(&stop);
+        let session = std::thread::spawn(move || {
+            let models = models;
+            run_session(
+                &chunk_rx,
+                &events_tx,
+                &stop_for_session,
+                &models.0,
+                audio_source,
+                "en",
+                PARTIAL_INTERVAL,
+            )
+        });
+
+        let mut saw_partial = false;
+        for event in &events_rx {
+            if matches!(event, DictationEvent::PartialTranscript { .. }) {
+                saw_partial = true;
+                let _ = partial_tx.try_send(());
+            }
+        }
+        feeder.join().expect("feeder thread panicked");
+        let result = session.join().expect("session thread panicked");
+        let stop_to_result = stopped_at
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .expect("the feeder always records when it stopped")
+            .elapsed();
+
+        println!("canary: stop -> final result took {stop_to_result:?}");
+        log::info!("canary: stop -> final result took {stop_to_result:?}");
+
         assert!(
             saw_partial,
             "expected at least one PartialTranscript before the final result"

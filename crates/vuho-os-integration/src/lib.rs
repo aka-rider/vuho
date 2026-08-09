@@ -17,7 +17,8 @@ pub use clipboard::copy_to_clipboard;
 pub use hotkey::{HotkeyConfig, HotkeyListener};
 pub use inject::inject_text;
 pub use language::{
-    cached_input_language, install_language_watcher, map_bcp47_to_whisper, LanguageDetector,
+    cached_input_language, install_language_watcher, map_bcp47_to_whisper, mapped_languages,
+    LanguageDetector,
 };
 
 /// Trigger the native macOS Accessibility permission prompt and add this process

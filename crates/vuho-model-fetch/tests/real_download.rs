@@ -27,9 +27,10 @@ fn downloads_and_fully_verifies_the_real_model() {
         std::env::set_var("HOME", scratch_home.path());
     }
 
+    let model_id = &vuho_model_paths::manifest().stt.default_model;
     let (tx, rx) = crossbeam_channel::unbounded();
     let started = std::time::Instant::now();
-    let result = vuho_model_fetch::download(&tx);
+    let result = vuho_model_fetch::download(model_id, &tx);
     let elapsed = started.elapsed();
 
     let progress_events: Vec<_> = rx.try_iter().collect();
@@ -41,14 +42,16 @@ fn downloads_and_fully_verifies_the_real_model() {
 
     let final_dir = result.expect("download should succeed against the real Hub");
 
-    let lock = vuho_model_paths::lock();
+    let lock = vuho_model_paths::lock()
+        .model(model_id)
+        .unwrap_or_else(|| panic!("{model_id} must be locked"));
     assert_eq!(
-        lock.stt.files.len(),
+        lock.files.len(),
         20,
         "lock should still name exactly 20 files"
     );
 
-    for locked in &lock.stt.files {
+    for locked in &lock.files {
         let path = final_dir.join(&locked.path);
         let bytes = fs::read(&path).unwrap_or_else(|e| panic!("reading {path:?}: {e}"));
         assert_eq!(
@@ -66,7 +69,7 @@ fn downloads_and_fully_verifies_the_real_model() {
 
     println!(
         "real_download: all {} locked files present at the correct size and hash under {:?}",
-        lock.stt.files.len(),
+        lock.files.len(),
         final_dir
     );
 }

@@ -242,15 +242,31 @@ impl DictationPipeline {
     /// denial surfaces distinctly so the overlay can prompt to grant it),
     /// emit it, and stay `Idle`.
     fn on_stream_start_failed(&mut self, err: &EngineError) {
-        let (message, kind) = if matches!(err, EngineError::MicPermissionDenied) {
-            log::error!("pipeline: microphone permission denied");
-            (
-                "Microphone permission denied".to_string(),
-                ErrorKind::MicPermissionDenied,
-            )
-        } else {
-            log::error!("pipeline: failed to start stream: {err}");
-            (format!("Failed to start stream: {err}"), ErrorKind::Other)
+        let (message, kind) = match err {
+            EngineError::MicPermissionDenied => {
+                log::error!("pipeline: microphone permission denied");
+                (
+                    "Microphone permission denied".to_string(),
+                    ErrorKind::MicPermissionDenied,
+                )
+            }
+            // Built from the error's own two fields — the model that
+            // refused and the language it refused — so the user learns
+            // which of the two to change, instead of a generic failure.
+            EngineError::UnsupportedLanguage { model, language } => {
+                log::error!("pipeline: {model} does not support {language}");
+                (
+                    format!(
+                        "{model} does not support {language}. Choose another speech model in \
+                         Settings, or switch your keyboard language."
+                    ),
+                    ErrorKind::Other,
+                )
+            }
+            other => {
+                log::error!("pipeline: failed to start stream: {other}");
+                (format!("Failed to start stream: {other}"), ErrorKind::Other)
+            }
         };
         let recoverable = !matches!(kind, ErrorKind::MicPermissionDenied);
         self.emit(DictationEvent::Error {
@@ -579,6 +595,11 @@ mod tests {
         start_calls: Arc<std::sync::atomic::AtomicUsize>,
         /// Number of `stop_stream` calls so far.
         stop_calls: Arc<std::sync::atomic::AtomicUsize>,
+        /// If set, **every** `start_stream` call fails with this error — a
+        /// stand-in for a backend that refuses the session up front (e.g. a
+        /// language the selected model cannot transcribe), as opposed to
+        /// `fail_next_start`'s one-shot dropped-command simulation.
+        start_error: Option<vuho_stt_engine::EngineError>,
         /// If `true`, the *next* `start_stream` call fails with
         /// `EngineError::LoadFailed` and clears this flag — a stand-in for a
         /// dropped/discarded `Start` command (e.g. arriving during model
@@ -596,6 +617,7 @@ mod tests {
                     language: language.to_string(),
                 },
                 device_probe: None,
+                start_error: None,
                 stream_txs: StreamTaps::default(),
                 start_calls: Arc::default(),
                 stop_calls: Arc::default(),
@@ -609,6 +631,14 @@ mod tests {
             Self {
                 device_probe: Some(probe),
                 ..Self::new(final_text, language)
+            }
+        }
+
+        /// Like `new`, but every `start_stream` call refuses with `error`.
+        fn refusing_to_start(error: vuho_stt_engine::EngineError) -> Self {
+            Self {
+                start_error: Some(error),
+                ..Self::new("unused", "en")
             }
         }
     }
@@ -629,6 +659,9 @@ mod tests {
         ) -> Result<Receiver<DictationEvent>, vuho_stt_engine::EngineError> {
             self.start_calls
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if let Some(error) = &self.start_error {
+                return Err(error.clone());
+            }
             if self
                 .fail_next_start
                 .swap(false, std::sync::atomic::Ordering::SeqCst)
@@ -650,6 +683,68 @@ mod tests {
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Ok(self.stop_result.clone())
         }
+    }
+
+    /// A model that cannot transcribe the session's language must produce
+    /// exactly one recoverable `Error` naming both the model and the
+    /// language, and **no** `SessionStarted` — announcing a session that
+    /// never started would be a lie about listening (CONSTITUTION rule 11).
+    #[test]
+    fn an_unsupported_language_errors_once_and_starts_no_session() {
+        let (_command_tx, command_rx) = crossbeam_channel::unbounded();
+        let (event_tx, event_rx) = crossbeam_channel::unbounded();
+
+        let engine =
+            FakeEngine::refusing_to_start(vuho_stt_engine::EngineError::UnsupportedLanguage {
+                model: "Some Model".to_string(),
+                language: "ja".to_string(),
+            });
+        let (injector, _received) = fake_injector();
+        let mut pipeline = DictationPipeline::new(
+            command_rx,
+            event_tx,
+            Box::new(engine),
+            test_settings(),
+            no_language,
+            injector,
+        );
+
+        assert!(matches!(
+            pipeline.dispatch(DictationCommand::Toggle),
+            Action::Continue
+        ));
+        assert_eq!(pipeline.state, PipelineState::Idle);
+
+        let events: Vec<DictationEvent> = event_rx.try_iter().collect();
+        let started = events
+            .iter()
+            .filter(|e| matches!(e, DictationEvent::SessionStarted))
+            .count();
+        assert_eq!(started, 0, "no session started, so none may be announced");
+
+        let errors: Vec<&DictationEvent> = events
+            .iter()
+            .filter(|e| matches!(e, DictationEvent::Error { .. }))
+            .collect();
+        assert_eq!(
+            errors.len(),
+            1,
+            "expected exactly one Error, got {errors:?}"
+        );
+        let DictationEvent::Error {
+            message,
+            recoverable,
+            kind,
+        } = errors[0]
+        else {
+            unreachable!("filtered to Error above")
+        };
+        assert!(
+            message.contains("Some Model") && message.contains("ja"),
+            "the message must name the model and the language, got: {message}"
+        );
+        assert!(*recoverable, "the user can fix this by changing either one");
+        assert_eq!(*kind, ErrorKind::Other);
     }
 
     /// A stream that dies mid-session (`recoverable: false`) must return the

@@ -3,7 +3,8 @@
 #
 # Produces a self-contained Vuho.app with:
 #   - The vuho binary in Contents/MacOS/
-#   - Parakeet TDT model in Contents/Resources/ (unless VUHO_BUNDLE_MODEL=0)
+#   - The models named by VUHO_BUNDLE_MODELS in Contents/Resources/
+#     (unless VUHO_BUNDLE_MODEL=0)
 #   - Valid Info.plist, code-signed with mic entitlement
 #
 # Two distribution shapes come out of this one script:
@@ -18,6 +19,7 @@
 # Usage:
 #   ./scripts/bundle-macos.sh          # builds if stale, ad-hoc signing
 #   VUHO_MODEL_DIR=/path/to/model ./scripts/bundle-macos.sh
+#   VUHO_BUNDLE_MODELS="a b" ./scripts/bundle-macos.sh  # embed two models
 #   VUHO_BUNDLE_MODEL=0 ./scripts/bundle-macos.sh  # model-less cask bundle
 #   SIGN_ID="Vuho Dev" ./scripts/bundle-macos.sh  # stable sig for TCC
 #
@@ -56,18 +58,31 @@ info() { echo "==> $*"; }
 
 manifest_out=$(manifest_vars "$MANIFEST" '
 emit("BUNDLE_ID", manifest["bundle_id"])
-emit("MODEL_NAME", manifest["stt"]["dir_name"])
-emit_array("REQUIRED_COMPONENTS", manifest["stt"]["components"])
+emit("DEFAULT_MODEL", manifest["stt"]["default_model"])
 ') || die "failed to read $MANIFEST (see traceback above)"
 eval "$manifest_out"
+
+# Which models get embedded (space-separated ids). Defaults to the
+# manifest's default_model, so the DMG shape is unchanged unless explicitly
+# widened; VUHO_BUNDLE_MODEL=0 still skips all of them.
+VUHO_BUNDLE_MODELS="${VUHO_BUNDLE_MODELS:-$DEFAULT_MODEL}"
+
+# model_vars <model-id> — emits MODEL_NAME + REQUIRED_COMPONENTS for one model.
+model_vars() {
+    manifest_vars "$MANIFEST" "
+model = manifest['stt']['models'].get('$1')
+if model is None:
+    raise SystemExit('unknown model id: $1')
+emit('MODEL_NAME', model['dir_name'])
+emit_array('REQUIRED_COMPONENTS', sorted(model['assets'].values()))
+"
+}
 
 SRC_BIN="$WORKSPACE_ROOT/target/release/vuho"
 SRC_PLIST="$WORKSPACE_ROOT/packaging/Info.plist"
 SRC_ENTITLEMENTS="$WORKSPACE_ROOT/packaging/vuho.entitlements"
 SRC_ICON="$WORKSPACE_ROOT/packaging/Vuho.icns"
 SRC_ATTRIBUTION="$WORKSPACE_ROOT/packaging/ATTRIBUTION.txt"
-
-VUHO_MODEL_DIR="${VUHO_MODEL_DIR:-$WORKSPACE_ROOT/models/$MODEL_NAME}"
 
 APP_DIR="$WORKSPACE_ROOT/$APP_NAME.app"
 
@@ -99,17 +114,34 @@ if [[ "$PLIST_BUNDLE_ID" != "$BUNDLE_ID" ]]; then
     die "Info.plist CFBundleIdentifier ($PLIST_BUNDLE_ID) != models.manifest.json bundle_id ($BUNDLE_ID)"
 fi
 
-if [[ "$VUHO_BUNDLE_MODEL" == "1" ]]; then
-    info "Building shape: model-embedded bundle (VUHO_BUNDLE_MODEL=1) — ~500 MB, offline from first launch."
-
-    if [[ ! -d "$VUHO_MODEL_DIR" ]]; then
-        die "Model directory not found at $VUHO_MODEL_DIR (set VUHO_MODEL_DIR)"
+# model_dir_for <model-id> <dir-name> — where this run reads that model's
+# tree from. VUHO_MODEL_DIR overrides the source of the default model only;
+# with several ids in VUHO_BUNDLE_MODELS one override cannot name them all.
+model_dir_for() {
+    if [[ -n "${VUHO_MODEL_DIR:-}" && "$1" == "$DEFAULT_MODEL" ]]; then
+        echo "$VUHO_MODEL_DIR"
+    else
+        echo "$WORKSPACE_ROOT/models/$2"
     fi
+}
 
-    for comp in "${REQUIRED_COMPONENTS[@]:-}"; do
-        if [[ ! -e "$VUHO_MODEL_DIR/$comp" ]]; then
-            die "Missing model component: $comp (expected in $VUHO_MODEL_DIR)"
+if [[ "$VUHO_BUNDLE_MODEL" == "1" ]]; then
+    info "Building shape: model-embedded bundle (VUHO_BUNDLE_MODEL=1) — offline from first launch, models: $VUHO_BUNDLE_MODELS"
+
+    for model_id in $VUHO_BUNDLE_MODELS; do
+        vars=$(model_vars "$model_id") || die "failed to read model $model_id from $MANIFEST"
+        eval "$vars"
+        model_dir="$(model_dir_for "$model_id" "$MODEL_NAME")"
+
+        if [[ ! -d "$model_dir" ]]; then
+            die "Model directory not found at $model_dir (provision it with ./scripts/fetch-model.sh $model_id)"
         fi
+
+        for comp in "${REQUIRED_COMPONENTS[@]:-}"; do
+            if [[ ! -e "$model_dir/$comp" ]]; then
+                die "Missing model component: $comp (expected in $model_dir)"
+            fi
+        done
     done
 else
     info "Building shape: model-less bundle (VUHO_BUNDLE_MODEL=0) — ≈40 MB on disk / ≈15 MB gzipped release tarball, model fetched on first run."
@@ -214,8 +246,13 @@ info "Installing app icon..."
 cp "$SRC_ICON" "$BUNDLE_CONTENTS/Resources/Vuho.icns"
 
 if [[ "$VUHO_BUNDLE_MODEL" == "1" ]]; then
-    info "Copying model ($MODEL_NAME)..."
-    cp -R "$VUHO_MODEL_DIR" "$BUNDLE_CONTENTS/Resources/$MODEL_NAME"
+    for model_id in $VUHO_BUNDLE_MODELS; do
+        vars=$(model_vars "$model_id") || die "failed to read model $model_id from $MANIFEST"
+        eval "$vars"
+        info "Copying model ($MODEL_NAME)..."
+        model_dir="$(model_dir_for "$model_id" "$MODEL_NAME")"
+        cp -R "$model_dir" "$BUNDLE_CONTENTS/Resources/$MODEL_NAME"
+    done
 else
     info "Skipping model copy (VUHO_BUNDLE_MODEL=0) — app will fetch it on first run."
 fi

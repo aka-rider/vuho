@@ -13,7 +13,6 @@
 //! need — no window, no polling loop (`crate::panel`'s own
 //! `start_permissions_poll` replaces it), no `AppKit` window construction.
 
-use vuho_domain::ModelStatus;
 use vuho_os_integration::InputMonitoringAccess;
 use vuho_stt_engine::MicAuthStatus;
 
@@ -182,27 +181,6 @@ pub(crate) fn missing_permissions() -> Vec<(Permission, Access)> {
 }
 
 // ── Speech-model formatting helpers ────────────────────────────────────────
-
-/// Human-readable subtitle for a model-status row
-/// (`crate::settings_tab::SettingsTab`'s Speech Model section).
-pub(crate) fn model_status_text(status: &ModelStatus) -> String {
-    match status {
-        ModelStatus::Missing { total_bytes } => {
-            format!("{} · not yet downloaded", format_mb(*total_bytes))
-        }
-        ModelStatus::Downloading {
-            received_bytes,
-            total_bytes,
-        } => format!(
-            "Downloading… {} of {}",
-            format_mb(*received_bytes),
-            format_mb(*total_bytes)
-        ),
-        ModelStatus::Verifying => "Verifying…".to_owned(),
-        ModelStatus::Ready => "Ready".to_owned(),
-        ModelStatus::Failed { message } => message.clone(),
-    }
-}
 
 /// Format a byte count as a whole number of megabytes (decimal, "474 MB") —
 /// readable, unlike the raw byte count `models.lock.json` stores.

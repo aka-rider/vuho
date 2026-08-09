@@ -16,7 +16,10 @@ use std::sync::Arc;
 
 use crossbeam_channel::{unbounded, Receiver, Sender};
 use gpui::{App, Entity, WindowHandle};
+use vuho_dictation::DictationSession;
 use vuho_domain::{DictationCommand, DictationEvent, ModelStatus};
+use vuho_model_fetch::ModelAvailability;
+use vuho_model_paths::Backend;
 use vuho_settings::SettingsStore;
 
 use crate::app_state::UiCommand;
@@ -28,15 +31,25 @@ use crate::{hotkey_presets, permissions, status_bar};
 
 // ── Provisioning state machine (ADR-020) ───────────────────────────────────
 
-/// Command the Settings tab's Download button (or a "Retry" click on a
-/// `Failed` row — same command, same transition) sends to the provisioning
-/// thread. `main.rs` owns both ends (CONSTITUTION rule 20): the `Sender`
-/// half goes straight into `SettingsTab::new`, the `Receiver` half into
+/// Command the Settings tab's model rows send to the provisioning thread.
+/// `main.rs` owns both ends (CONSTITUTION rule 20): the `Sender` half goes
+/// straight into `SettingsTab::new`, the `Receiver` half into
 /// [`spawn_warmup_and_bridge`]'s thread alongside `cmd_rx`.
+///
+/// Each variant names the model it applies to — the Settings tab lists
+/// every model the manifest knows, so a command with no id would be
+/// ambiguous the moment a second model exists.
 pub(crate) enum ProvisionCommand {
-    /// Start a download. Also what "Retry" sends — a failed download and a
-    /// fresh one are the same transition (`NeedsModel` → `Downloading`).
-    Download,
+    /// Start a download of this model. Also what a `Failed` row's "Retry"
+    /// sends — a failed download and a fresh one are the same transition.
+    Download(String),
+    /// Remove a model Vuho itself downloaded (ADR-020: only
+    /// [`vuho_model_paths::ModelSource::UserData`] trees are Vuho's to
+    /// delete).
+    Delete(String),
+    /// Make this model the active one: persist the choice and reload the
+    /// engine around it.
+    SelectModel(String),
 }
 
 /// The provisioning + dictation state machine driven by
@@ -48,49 +61,50 @@ pub(crate) enum ProvisionCommand {
 /// [`on_download_completed`] — no shared helper whose polarity could invert
 /// a transition.
 ///
-/// **Single source of the UI's `ModelStatus` (root-cause fix):** the status
+/// **Single source of the UI's model state (root-cause fix):** the status
 /// that used to be broadcast ad hoc from four different call sites (drifting
 /// out of sync with `Phase` itself — the four bugs this replaced) is now
 /// *carried by the variant itself* — [`phase_status`] is a pure, total
 /// mapping from a `Phase` to the `ModelStatus` it implies, and
-/// [`run_provisioning_loop`] is the only place that ever calls
-/// `ui_tx.send(UiCommand::ModelStatus(..))` (via [`send_phase_status`]),
+/// [`run_provisioning_loop`] is the only place that ever sends
+/// `UiCommand::ModelStatus`/`UiCommand::ModelList` (via [`broadcast_phase`]),
 /// unconditionally, immediately after every single transition. A `Phase`
 /// change without its status reaching the UI is therefore not a bug that can
 /// be introduced by a future edit forgetting one of four sites — there is
 /// only one site, and it can't be skipped without skipping the transition
 /// itself.
 enum Phase {
-    /// No usable model yet, or a download attempt failed. `status` carries
-    /// exactly what the Settings tab/status bar show — always
-    /// [`ModelStatus::Missing`] or [`ModelStatus::Failed`] — and is the
-    /// same value [`on_provision_command`]'s `Download` (also "Retry")
-    /// transition re-fetches size from the lock for.
-    NeedsModel(ModelStatus),
-    /// A download is in flight on a second thread. `status` is
-    /// `Downloading`/`Verifying`, straight from that thread's progress
-    /// channel, forwarded into a `Phase` by [`run_provisioning_loop`]'s
-    /// `progress_rx` arm. `Dictation` commands are still discarded; another
-    /// `Download` command is ignored — the Settings tab swaps the
-    /// Download button for disabled "In progress…" text as soon as this
-    /// variant is entered (see `settings_tab::SettingsTab::render_speech_model_section`), and
-    /// because `provision_rx` is drained one message at a time by this
-    /// single thread, there is no window where a second click could race
-    /// the first transition — the transition itself, not a later render,
-    /// is what a click observes.
-    Downloading(ModelStatus),
-    /// `vuho_model_fetch::availability()` reports the model is `Ready`, but
-    /// `ParakeetEngine::load` itself failed (corrupt/incompatible files,
-    /// permission error, out of memory, …) — a fact `Missing`/`Failed`
-    /// can't express, since the model bytes are actually fine. `message` is
-    /// shown the same way a download `Failed` is (Settings tab Failed
-    /// row, "Retry" button — see [`phase_status`]), but Retry from this
-    /// phase re-attempts the engine load only (`on_provision_command`'s
-    /// `EngineFailed` arm) — never a redundant re-download, which
-    /// couldn't fix an out-of-band-provisioned model anyway (ADR-020).
-    /// Without this variant this state was a dead end: the model row never
-    /// showed a way forward, and — the specific bug this variant fixes —
-    /// no status ever reached the UI for this branch at all.
+    /// No usable model yet, or a download attempt failed. `id` names the
+    /// model `status` is about — the selected one at startup, or whichever
+    /// model's download just failed — and `status` carries exactly what the
+    /// Settings tab/status bar show, always [`ModelStatus::Missing`] or
+    /// [`ModelStatus::Failed`].
+    NeedsModel { id: String, status: ModelStatus },
+    /// A download is in flight on a second thread, for `id` — which is not
+    /// necessarily the selected model: a second model can be downloaded
+    /// while the first stays selected. `status` is `Downloading`/`Verifying`,
+    /// straight from that thread's progress channel, forwarded into a
+    /// `Phase` by [`run_provisioning_loop`]'s `progress_rx` arm. `Dictation`
+    /// commands are discarded for as long as this lasts; a `Download` for a
+    /// *different* model is refused rather than started, because
+    /// [`run_provisioning_loop`]'s `select!` holds exactly one pair of
+    /// download receivers — starting a second download would strand the
+    /// first with nothing listening to it.
+    Downloading { id: String, status: ModelStatus },
+    /// `vuho_model_fetch::availability()` reports the selected model is
+    /// `Ready`, but the engine itself failed to load (corrupt/incompatible
+    /// files, permission error, out of memory, …) — a fact
+    /// `Missing`/`Failed` can't express, since the model bytes are actually
+    /// fine. `message` is shown the same way a download `Failed` is (a
+    /// "Retry" line under the Settings tab's model list — see
+    /// [`phase_status`]), and that Retry sends
+    /// [`ProvisionCommand::SelectModel`] for the already-selected model,
+    /// which re-attempts the engine load only — never a redundant
+    /// re-download, which couldn't fix an out-of-band-provisioned model
+    /// anyway (ADR-020). Without this variant this state was a dead end:
+    /// the model row never showed a way forward, and — the specific bug
+    /// this variant fixes — no status ever reached the UI for this branch
+    /// at all.
     EngineFailed(String),
     /// Model loaded, engine warmed, session ready to take `DictationCommand`s.
     Ready(vuho_dictation::DictationSession),
@@ -98,10 +112,10 @@ enum Phase {
 
 /// The `ModelStatus` a given [`Phase`] implies — pure and total, so a
 /// `Phase` value alone fully determines what the UI shows (see [`Phase`]'s
-/// doc comment). The only caller is [`send_phase_status`].
+/// doc comment). The only caller is [`broadcast_phase`].
 fn phase_status(phase: &Phase) -> ModelStatus {
     match phase {
-        Phase::NeedsModel(status) | Phase::Downloading(status) => status.clone(),
+        Phase::NeedsModel { status, .. } | Phase::Downloading { status, .. } => status.clone(),
         Phase::EngineFailed(message) => ModelStatus::Failed {
             message: message.clone(),
         },
@@ -109,13 +123,60 @@ fn phase_status(phase: &Phase) -> ModelStatus {
     }
 }
 
-/// The **sole** producer of `UiCommand::ModelStatus` in the process — every
-/// call site in this module that changes `phase` calls this immediately
-/// after, with the new value, and nothing else ever sends this command. See
+/// The one model whose row the [`Phase`] — not the filesystem — is
+/// authoritative about, if any: a download in flight (whose bytes are still
+/// under a `.partial` directory `availability()` cannot see) or a model the
+/// loop has something to say about that a fresh `availability()` call would
+/// not repeat, such as a download that just failed.
+fn phase_row_override(phase: &Phase) -> Option<(&str, ModelStatus)> {
+    match phase {
+        Phase::NeedsModel { id, status } | Phase::Downloading { id, status } => {
+            Some((id.as_str(), status.clone()))
+        }
+        Phase::EngineFailed(_) | Phase::Ready(_) => None,
+    }
+}
+
+/// The model list to render: `models` as last read from disk, with
+/// [`phase_row_override`]'s row replaced.
+fn phase_rows(phase: &Phase, models: &[ModelAvailability]) -> Vec<ModelAvailability> {
+    let Some((id, status)) = phase_row_override(phase) else {
+        return models.to_vec();
+    };
+    models
+        .iter()
+        .map(|model| {
+            if model.id == id {
+                ModelAvailability {
+                    status: status.clone(),
+                    ..model.clone()
+                }
+            } else {
+                model.clone()
+            }
+        })
+        .collect()
+}
+
+/// The **sole** producer of `UiCommand::ModelStatus`/`UiCommand::ModelList`
+/// in the process — every call site in this module that can change what
+/// [`phase_status`] or [`phase_rows`] report calls this immediately after,
+/// with the new value, and nothing else ever sends those commands. See
 /// [`Phase`]'s doc comment for why that closes off the four-site drift bug
 /// class this state machine replaced.
-fn send_phase_status(ui_tx: &Sender<UiCommand>, phase: &Phase) {
+///
+/// The one `phase` assignment that does not broadcast is
+/// [`run_provisioning_loop`]'s `cmd_rx` arm: [`on_dictation_command`] hands
+/// the command to the session it already holds and returns the same variant
+/// carrying the same payload, so there is nothing new for either function to
+/// report.
+///
+/// `phase_status` still reports the *selected* model alone, so the menu-bar
+/// composite (`app_status::StatusModel::composite`) is unchanged by the list
+/// existing.
+fn broadcast_phase(ui_tx: &Sender<UiCommand>, phase: &Phase, models: &[ModelAvailability]) {
     let _ = ui_tx.send(UiCommand::ModelStatus(phase_status(phase)));
+    let _ = ui_tx.send(UiCommand::ModelList(phase_rows(phase, models)));
 }
 
 /// What the download thread reports back to the select loop on completion —
@@ -327,7 +388,8 @@ fn spawn_warmup_and_bridge(
         // Keep `event_tx_bridge` alive for the process lifetime so the pipeline
         // thread's event sender never gets dropped.
         let _event_tx_bridge = event_tx_bridge;
-        let initial = initial_phase(&event_tx, &ui_tx, &settings);
+        let mut load = || load_engine_and_session(&event_tx, &ui_tx, &settings);
+        let initial = load_selected_model(&settings, &mut load);
         run_provisioning_loop(
             &cmd_rx,
             &provision_rx,
@@ -336,6 +398,7 @@ fn spawn_warmup_and_bridge(
             &settings,
             initial,
             spawn_download_thread,
+            load,
         );
     });
 }
@@ -356,15 +419,18 @@ fn drain_stale_dictation_commands(cmd_rx: &Receiver<DictationCommand>) {
 /// The provisioning + dictation state machine's event loop.
 ///
 /// `initial` is the starting [`Phase`], already resolved by the caller
-/// (production: [`initial_phase`], which touches `vuho_model_fetch` and
+/// (production: [`load_selected_model`], which touches `vuho_model_fetch` and
 /// possibly loads the engine; tests: any `Phase` value, injected directly —
 /// this is what makes the loop itself testable without network or a real
 /// engine, per this module's test module). `spawn_download` is the
 /// side-effecting "start a download thread" step, also injected
 /// (CONSTITUTION rule 5): production always passes [`spawn_download_thread`];
-/// tests pass a fake under their own control.
+/// tests pass a fake under their own control. `load` is the other injected
+/// side effect — "load the engine and build a session around it", production
+/// [`load_engine_and_session`] — so every transition that reloads the engine
+/// is exercisable without a real `CoreML` model.
 ///
-/// Sends `initial`'s status once (see [`send_phase_status`]) before doing
+/// Sends `initial`'s status once (see [`broadcast_phase`]) before doing
 /// anything else, then drops anything pressed during whatever synchronous
 /// work produced it, then services `cmd_rx`/`provision_rx`/download-progress/
 /// download-completion messages with `crossbeam_channel::select!` for the
@@ -373,6 +439,22 @@ fn drain_stale_dictation_commands(cmd_rx: &Receiver<DictationCommand>) {
 /// are swapped for real ones only while [`Phase::Downloading`], so `select!`
 /// never has to special-case "no download in flight" as a `Disconnected`
 /// error.
+///
+/// `models` is the last read of `vuho_model_fetch::availability_all()`,
+/// re-read after every transition that can have changed what is on disk. A
+/// progress tick is the one message that cannot: it moves bytes only inside
+/// the `.partial` directory the resolver never sees, and the one row it does
+/// change — the in-flight model's — is supplied by [`phase_row_override`]
+/// instead. Re-reading on every tick would re-`stat` every locked file of
+/// every model thousands of times during a download for an answer that
+/// cannot have moved.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the loop owns one receiving end per message class it services plus the two \
+              injected side effects (CONSTITUTION rule 5) — bundling them into a struct would \
+              move the same eight values into a second place with one production call site and \
+              one test helper, without removing anything the loop needs"
+)]
 fn run_provisioning_loop(
     cmd_rx: &Receiver<DictationCommand>,
     provision_rx: &Receiver<ProvisionCommand>,
@@ -380,10 +462,12 @@ fn run_provisioning_loop(
     ui_tx: &Sender<UiCommand>,
     settings: &Arc<SettingsStore>,
     initial: Phase,
-    mut spawn_download: impl FnMut() -> (Receiver<DownloadOutcome>, Receiver<ModelStatus>),
+    mut spawn_download: impl FnMut(&str) -> (Receiver<DownloadOutcome>, Receiver<ModelStatus>),
+    mut load: impl FnMut() -> Option<DictationSession>,
 ) {
     let mut phase = initial;
-    send_phase_status(ui_tx, &phase);
+    let mut models = vuho_model_fetch::availability_all();
+    broadcast_phase(ui_tx, &phase, &models);
     drain_stale_dictation_commands(cmd_rx);
 
     let mut download_done_rx: Receiver<DownloadOutcome> = crossbeam_channel::never();
@@ -397,42 +481,42 @@ fn run_provisioning_loop(
                 };
                 phase = on_dictation_command(phase, cmd);
             },
-            recv(provision_rx) -> msg => match msg {
-                Ok(ProvisionCommand::Download) => {
-                    let (next, outcome) = on_provision_command(
-                        phase,
-                        ui_tx,
-                        event_tx,
-                        settings,
-                        &mut spawn_download,
-                    );
-                    phase = next;
-                    match outcome {
-                        ProvisionOutcome::DownloadStarted(done_rx, prog_rx) => {
-                            download_done_rx = done_rx;
-                            progress_rx = prog_rx;
-                        }
-                        // `Phase::EngineFailed`'s retry reloads the engine
-                        // in place on this thread, blocking it — drain any
-                        // presses that landed during that (A1), same as the
-                        // startup path above.
-                        ProvisionOutcome::RetriedBlocking => {
-                            drain_stale_dictation_commands(cmd_rx);
-                        }
-                        ProvisionOutcome::Ignored => {}
-                    }
-                    send_phase_status(ui_tx, &phase);
-                }
-                Err(_) => {
+            recv(provision_rx) -> msg => {
+                let Ok(cmd) = msg else {
                     log::info!("provisioning: provision channel disconnected — stopping");
                     return;
+                };
+                let (next, outcome) = on_provision_command(
+                    phase,
+                    cmd,
+                    event_tx,
+                    settings,
+                    &mut spawn_download,
+                    &mut load,
+                );
+                phase = next;
+                match outcome {
+                    ProvisionOutcome::DownloadStarted(done_rx, prog_rx) => {
+                        download_done_rx = done_rx;
+                        progress_rx = prog_rx;
+                    }
+                    // A `SelectModel` reload runs the engine load in
+                    // place on this thread, blocking it — drain any
+                    // presses that landed during that (A1, ADR-007),
+                    // same as the startup path above.
+                    ProvisionOutcome::ReloadedBlocking => {
+                        drain_stale_dictation_commands(cmd_rx);
+                    }
+                    ProvisionOutcome::Handled => {}
                 }
+                models = vuho_model_fetch::availability_all();
+                broadcast_phase(ui_tx, &phase, &models);
             },
             recv(progress_rx) -> msg => {
                 match msg {
                     Ok(status) => {
-                        phase = Phase::Downloading(status);
-                        send_phase_status(ui_tx, &phase);
+                        phase = on_download_progress(phase, status);
+                        broadcast_phase(ui_tx, &phase, &models);
                     }
                     Err(_) => {
                         // The download thread finished (or died) and
@@ -470,10 +554,11 @@ fn run_provisioning_loop(
                         "the download stopped unexpectedly — please try again".to_owned(),
                     )
                 });
-                phase = on_download_completed(phase, outcome, event_tx, ui_tx, settings);
-                send_phase_status(ui_tx, &phase);
+                phase = on_download_completed(phase, outcome, settings, &mut load);
+                models = vuho_model_fetch::availability_all();
+                broadcast_phase(ui_tx, &phase, &models);
                 // Only the `Finished` path runs a blocking engine load
-                // (`load_after_download`) on this thread — a `Failed`
+                // (`load_selected_model`) on this thread — a `Failed`
                 // outcome does no blocking work, so draining here
                 // unconditionally would discard a legitimate press that
                 // simply happened to race with an unrelated download
@@ -486,28 +571,98 @@ fn run_provisioning_loop(
     }
 }
 
-/// The starting [`Phase`], decided by `vuho_model_fetch::availability()`
-/// (ADR-020's chokepoint). `Ready` loads the engine exactly as before this
-/// state machine existed — no behavior change for anyone who already has a
-/// model; a load failure there now becomes [`Phase::EngineFailed`] rather
-/// than the dead-end [`Phase::NeedsModel`] it used to (B4) — the caller
-/// ([`run_provisioning_loop`]) sends this phase's status unconditionally, so
-/// there is no longer a branch here that can silently withhold it.
-fn initial_phase(
-    event_tx: &Sender<DictationEvent>,
-    ui_tx: &Sender<UiCommand>,
-    settings: &Arc<SettingsStore>,
+/// The model the user picked, resolved against the embedded manifest: an
+/// absent setting means "the manifest's default" (ADR-019 keeps the id
+/// literal out of `vuho-settings`), and so does a setting naming a model
+/// this build no longer ships — a downgrade must fall back to something
+/// loadable rather than dead-end on an id nothing can resolve.
+///
+/// The single place that decision is made (CONSTITUTION rule 26): the
+/// provisioning loop and the Settings tab's combobox both read it here.
+pub(crate) fn selected_model_id(settings: &SettingsStore) -> String {
+    let stt = &vuho_model_paths::manifest().stt;
+    match settings.get().speech_model {
+        Some(id) if stt.model(&id).is_some() => id,
+        Some(unknown) => {
+            log::warn!(
+                "settings: speech_model {unknown} names no model this build ships — falling back \
+                 to {}",
+                stt.default_model
+            );
+            stt.default_model.clone()
+        }
+        None => stt.default_model.clone(),
+    }
+}
+
+/// The [`Phase`] the selected model implies right now: refuse to load
+/// anything `vuho_model_fetch::availability()` (ADR-020's chokepoint) does
+/// not report as `Ready`, or that the running macOS is too old for (WP8.S3),
+/// and otherwise load the engine through the injected `load`.
+///
+/// The one place a load is decided (CONSTITUTION rule 26) — startup, a
+/// finished download, and every `SelectModel` all come through here, so
+/// "never load a model the chokepoint hasn't cleared" cannot be forgotten at
+/// one of three call sites.
+fn load_selected_model(
+    settings: &SettingsStore,
+    load: &mut impl FnMut() -> Option<DictationSession>,
 ) -> Phase {
-    match vuho_model_fetch::availability() {
-        ModelStatus::Ready => match load_engine_and_session(event_tx, ui_tx, settings) {
-            Some(session) => Phase::Ready(session),
-            None => Phase::EngineFailed(
-                "the model is present but the engine failed to load at startup — see the log \
-                 for details"
-                    .to_owned(),
-            ),
-        },
-        other => Phase::NeedsModel(other),
+    let availability = vuho_model_fetch::availability(&selected_model_id(settings));
+    phase_for_availability(availability, load)
+}
+
+/// The [`Phase`] one model's [`ModelAvailability`] implies — the decision
+/// half of [`load_selected_model`], split from the `availability()` lookup
+/// so every refusal is testable without a filesystem in a particular state.
+fn phase_for_availability(
+    availability: ModelAvailability,
+    load: &mut impl FnMut() -> Option<DictationSession>,
+) -> Phase {
+    if !availability.supported_on_this_os {
+        log::warn!(
+            "provisioning: {} is not supported by this macOS version",
+            availability.id
+        );
+        return Phase::NeedsModel {
+            status: ModelStatus::Failed {
+                message: unsupported_message(&availability),
+            },
+            id: availability.id,
+        };
+    }
+    if availability.status != ModelStatus::Ready {
+        log::warn!(
+            "provisioning: {} is not ready to load: {:?}",
+            availability.id,
+            availability.status
+        );
+        return Phase::NeedsModel {
+            id: availability.id,
+            status: availability.status,
+        };
+    }
+    match load() {
+        Some(session) => Phase::Ready(session),
+        None => Phase::EngineFailed(
+            "the model is present but the engine failed to load — see the log for details"
+                .to_owned(),
+        ),
+    }
+}
+
+/// Why a model this macOS is too old for can't be selected, naming the
+/// floor from the manifest rather than a second copy of the version.
+fn unsupported_message(availability: &ModelAvailability) -> String {
+    match vuho_model_paths::manifest().stt.model(&availability.id) {
+        Some(model) => format!(
+            "{} needs macOS {} or later.",
+            availability.display_name, model.min_macos
+        ),
+        None => format!(
+            "{} is not supported on this Mac.",
+            availability.display_name
+        ),
     }
 }
 
@@ -516,7 +671,7 @@ fn initial_phase(
 /// sites CONSTITUTION rule 8 requires for this state machine.
 fn on_dictation_command(phase: Phase, cmd: DictationCommand) -> Phase {
     match phase {
-        p @ (Phase::NeedsModel(_) | Phase::Downloading(_) | Phase::EngineFailed(_)) => {
+        p @ (Phase::NeedsModel { .. } | Phase::Downloading { .. } | Phase::EngineFailed(_)) => {
             log::info!("provisioning: discarding {cmd:?} — model not ready yet");
             p
         }
@@ -532,82 +687,253 @@ fn on_dictation_command(phase: Phase, cmd: DictationCommand) -> Phase {
 
 /// What [`on_provision_command`] did, for [`run_provisioning_loop`] to act
 /// on — explicit rather than an `Option`, so "no download thread started"
-/// (an ignored click) and "a blocking engine reload just ran on this
-/// thread" (needs [`drain_stale_dictation_commands`], A1) can't be confused
-/// with each other.
+/// and "a blocking engine reload just ran on this thread" (needs
+/// [`drain_stale_dictation_commands`], A1) can't be confused with each
+/// other.
 enum ProvisionOutcome {
-    /// [`Phase::NeedsModel`] → [`Phase::Downloading`]: the two receivers
-    /// [`run_provisioning_loop`] should install.
+    /// A download thread is now running: the two receivers
+    /// [`run_provisioning_loop`] should install for it.
     DownloadStarted(Receiver<DownloadOutcome>, Receiver<ModelStatus>),
-    /// [`Phase::EngineFailed`]'s retry ran a blocking `ParakeetEngine::load`
-    /// on this thread, in place — win or lose, `cmd_rx` needs draining.
-    RetriedBlocking,
-    /// The command was ignored: already [`Phase::Downloading`], or
-    /// [`Phase::Ready`] (unreachable in the shipped UI in practice — once
-    /// model and engine are both `Ready`, `settings_tab::should_show_speech_model_section`
-    /// hides the Speech Model card, and its Download/Retry button along
-    /// with it, so there is nothing left to click that could send this —
-    /// but handled rather than left an unspecified match arm). F23: this
-    /// does *not* close any window — there is no separate readiness window
-    /// left to self-close (ADR-021); the panel (`crate::panel`) simply stays
-    /// open on whichever tab the user left it on.
-    Ignored,
+    /// A `SelectModel` ran a blocking engine load on this thread, in place
+    /// — win or lose, `cmd_rx` needs draining (ADR-007: a `CapsLock` press
+    /// during the reload must not leave the LED on with no session behind
+    /// it).
+    ReloadedBlocking,
+    /// Nothing left for the loop to do: a refused command, or a delete,
+    /// which touches the filesystem only. F23: this does *not* close any
+    /// window — there is no separate readiness window left to self-close
+    /// (ADR-021); the panel (`crate::panel`) simply stays open on whichever
+    /// tab the user left it on.
+    Handled,
 }
 
-/// `(Phase, ProvisionCommand::Download)`: start a download from
-/// [`Phase::NeedsModel`] (returning the new [`Phase::Downloading`], whose
-/// status is set synchronously to `Downloading { received_bytes: 0, .. }`
-/// rather than waiting for the download thread's first progress tick — A3:
-/// the Settings tab's button reflects the click immediately, not one
-/// network round-trip later); retry a blocking engine load from
-/// [`Phase::EngineFailed`] (B4 — no redundant re-download, which can't fix
-/// an out-of-band-provisioned model anyway); ignore it while already
-/// [`Phase::Downloading`] or [`Phase::Ready`].
+/// Total download size of `model_id`, from the repo-pinned lock — the one
+/// place this crate reads it, so the progress bar's denominator and the size
+/// the download offer quotes can never disagree.
+fn model_total_bytes(model_id: &str) -> u64 {
+    if let Some(locked) = vuho_model_paths::lock().model(model_id) {
+        return locked.total_bytes;
+    }
+    log::error!(
+        "provisioning: {model_id} is absent from models.lock.json — reporting an unknown \
+         download size"
+    );
+    0
+}
+
+/// `(Phase, ProvisionCommand)`: the twelve pairs CONSTITUTION rule 8
+/// requires, split one function per command so each phase match stays
+/// exhaustive and readable — [`on_download_command`], [`on_delete_command`],
+/// [`on_select_model_command`].
 ///
-/// `spawn` is the side-effecting "start a download thread" step, injected
-/// rather than hardcoded (CONSTITUTION rule 5) so this transition can be
-/// tested without touching the network — production always passes
-/// [`spawn_download_thread`]; tests pass a fake that returns receivers under
-/// their own control.
+/// `spawn` (start a download thread) and `load` (load the engine and build a
+/// session) are the two side effects, injected rather than hardcoded
+/// (CONSTITUTION rule 5) so every transition here is testable without the
+/// network or a real `CoreML` model.
 fn on_provision_command(
     phase: Phase,
-    ui_tx: &Sender<UiCommand>,
+    cmd: ProvisionCommand,
     event_tx: &Sender<DictationEvent>,
     settings: &Arc<SettingsStore>,
-    spawn: &mut impl FnMut() -> (Receiver<DownloadOutcome>, Receiver<ModelStatus>),
+    spawn: &mut impl FnMut(&str) -> (Receiver<DownloadOutcome>, Receiver<ModelStatus>),
+    load: &mut impl FnMut() -> Option<DictationSession>,
+) -> (Phase, ProvisionOutcome) {
+    match cmd {
+        ProvisionCommand::Download(id) => on_download_command(phase, &id, spawn),
+        ProvisionCommand::Delete(id) => (
+            on_delete_command(phase, &id, event_tx, settings),
+            ProvisionOutcome::Handled,
+        ),
+        ProvisionCommand::SelectModel(id) => on_select_model_command(phase, &id, settings, load),
+    }
+}
+
+/// `(Phase, Download(id))` — four pairs.
+///
+/// While [`Phase::Downloading`], a `Download` is refused whichever model it
+/// names: the same one is already running, and a *different* one would be
+/// orphaned the moment [`run_provisioning_loop`] rebound its single pair of
+/// download receivers to the new thread. Every other phase starts the
+/// download, moving straight to `Downloading { received_bytes: 0, .. }`
+/// rather than waiting for the first progress tick (A3: the row reflects the
+/// click immediately, not one network round-trip later).
+fn on_download_command(
+    phase: Phase,
+    id: &str,
+    spawn: &mut impl FnMut(&str) -> (Receiver<DownloadOutcome>, Receiver<ModelStatus>),
 ) -> (Phase, ProvisionOutcome) {
     match phase {
-        Phase::NeedsModel(_) => {
-            log::info!("provisioning: starting model download");
-            let total_bytes = vuho_model_paths::lock().stt.total_bytes;
-            let (done_rx, progress_rx) = spawn();
+        Phase::Downloading {
+            id: in_flight,
+            status,
+        } => {
+            if in_flight == id {
+                log::info!("provisioning: {id} is already downloading — ignoring");
+            } else {
+                log::warn!(
+                    "provisioning: refusing to download {id} while {in_flight} is still \
+                     downloading"
+                );
+            }
             (
-                Phase::Downloading(ModelStatus::Downloading {
-                    received_bytes: 0,
-                    total_bytes,
-                }),
-                ProvisionOutcome::DownloadStarted(done_rx, progress_rx),
+                Phase::Downloading {
+                    id: in_flight,
+                    status,
+                },
+                ProvisionOutcome::Handled,
             )
         }
-        Phase::EngineFailed(_) => {
-            log::info!("provisioning: retrying engine load");
-            let next = match load_engine_and_session(event_tx, ui_tx, settings) {
-                Some(session) => Phase::Ready(session),
-                None => Phase::EngineFailed(
-                    "the model is present but the engine still failed to load — see the log \
-                     for details"
-                        .to_owned(),
-                ),
-            };
-            (next, ProvisionOutcome::RetriedBlocking)
+        phase @ (Phase::NeedsModel { .. } | Phase::EngineFailed(_) | Phase::Ready(_)) => {
+            start_download(phase, id, spawn)
         }
-        downloading @ Phase::Downloading(_) => {
-            log::info!("provisioning: download already in progress — ignoring");
-            (downloading, ProvisionOutcome::Ignored)
+    }
+}
+
+/// Start a download of `id`, or refuse it with a reason in the log.
+///
+/// Leaving [`Phase::Ready`] drops the live `DictationSession` — dictation is
+/// unavailable for the duration, exactly as it is while the first model
+/// downloads, and comes back when [`on_download_completed`] reloads the
+/// selected model.
+fn start_download(
+    phase: Phase,
+    id: &str,
+    spawn: &mut impl FnMut(&str) -> (Receiver<DownloadOutcome>, Receiver<ModelStatus>),
+) -> (Phase, ProvisionOutcome) {
+    let availability = vuho_model_fetch::availability(id);
+    if vuho_model_paths::manifest().stt.model(id).is_none() {
+        log::warn!("provisioning: refusing to download {id} — no such model in the manifest");
+        return (phase, ProvisionOutcome::Handled);
+    }
+    if !availability.supported_on_this_os {
+        log::warn!(
+            "provisioning: refusing to download {id} — {}",
+            unsupported_message(&availability)
+        );
+        return (phase, ProvisionOutcome::Handled);
+    }
+    log::info!("provisioning: starting download of {id}");
+    let (done_rx, progress_rx) = spawn(id);
+    (
+        Phase::Downloading {
+            id: id.to_owned(),
+            status: ModelStatus::Downloading {
+                received_bytes: 0,
+                total_bytes: model_total_bytes(id),
+            },
+        },
+        ProvisionOutcome::DownloadStarted(done_rx, progress_rx),
+    )
+}
+
+/// `(Phase, Delete(id))` — four pairs, all leaving the phase untouched:
+/// deleting a model can never change the state of the *selected* one,
+/// because [`delete_model`] refuses to delete the selected model at all.
+fn on_delete_command(
+    phase: Phase,
+    id: &str,
+    event_tx: &Sender<DictationEvent>,
+    settings: &Arc<SettingsStore>,
+) -> Phase {
+    let in_flight = match &phase {
+        Phase::Downloading { id, .. } => Some(id.as_str()),
+        Phase::NeedsModel { .. } | Phase::EngineFailed(_) | Phase::Ready(_) => None,
+    };
+    delete_model(id, in_flight, &selected_model_id(settings), event_tx);
+    phase
+}
+
+/// Delete `id`'s model directory, or refuse with a reason.
+///
+/// Three refusals, in order: the model whose download is in flight (its
+/// bytes are still being written), the selected model (the engine is loaded
+/// from it, and deleting it would leave the app with nothing to dictate
+/// with), and anything `ModelAvailability::deletable` says is not Vuho's to
+/// remove (ADR-020: only trees `vuho_model_fetch::download` itself wrote).
+fn delete_model(
+    id: &str,
+    in_flight: Option<&str>,
+    selected: &str,
+    event_tx: &Sender<DictationEvent>,
+) {
+    if in_flight == Some(id) {
+        log::warn!("provisioning: refusing to delete {id} — its download is still running");
+        return;
+    }
+    if id == selected {
+        log::warn!("provisioning: refusing to delete {id} — it is the selected model");
+        return;
+    }
+    if !vuho_model_fetch::availability(id).deletable() {
+        log::warn!("provisioning: refusing to delete {id} — Vuho did not download it");
+        return;
+    }
+    match vuho_model_fetch::delete(id) {
+        Ok(()) => log::info!("provisioning: deleted {id}"),
+        Err(e) => {
+            log::error!("provisioning: failed to delete {id}: {e}");
+            let _ = event_tx.send(DictationEvent::Error {
+                message: format!("Could not delete {id}: {e}"),
+                recoverable: true,
+                kind: vuho_domain::ErrorKind::Other,
+            });
         }
-        ready @ Phase::Ready(_) => {
-            log::warn!("provisioning: Download command while already Ready — ignoring");
-            (ready, ProvisionOutcome::Ignored)
+    }
+}
+
+/// `(Phase, SelectModel(id))` — four pairs.
+///
+/// The choice is persisted first, in every phase, so it survives a restart
+/// even when it can't be acted on yet. While [`Phase::Downloading`] that is
+/// all that happens: [`on_download_completed`] loads whatever is selected by
+/// the time the download finishes, so acting now would mean either
+/// abandoning the running download or running two engines at once. Every
+/// other phase drops whatever session it holds and reloads through
+/// [`load_selected_model`], which refuses a model
+/// `vuho_model_fetch::availability` hasn't cleared (WP8.S3) instead of
+/// attempting a load that would fail.
+fn on_select_model_command(
+    phase: Phase,
+    id: &str,
+    settings: &Arc<SettingsStore>,
+    load: &mut impl FnMut() -> Option<DictationSession>,
+) -> (Phase, ProvisionOutcome) {
+    if vuho_model_paths::manifest().stt.model(id).is_none() {
+        log::warn!("provisioning: refusing to select {id} — no such model in the manifest");
+        return (phase, ProvisionOutcome::Handled);
+    }
+    if let Err(e) = settings.update(|s| s.speech_model = Some(id.to_owned())) {
+        log::warn!("provisioning: failed to save the speech-model setting: {e}");
+    }
+    match phase {
+        downloading @ Phase::Downloading { .. } => {
+            log::info!("provisioning: {id} selected — loading it once the download finishes");
+            (downloading, ProvisionOutcome::Handled)
+        }
+        Phase::Ready(session) => {
+            drop(session);
+            (
+                load_selected_model(settings, load),
+                ProvisionOutcome::ReloadedBlocking,
+            )
+        }
+        Phase::NeedsModel { .. } | Phase::EngineFailed(_) => (
+            load_selected_model(settings, load),
+            ProvisionOutcome::ReloadedBlocking,
+        ),
+    }
+}
+
+/// A progress tick from the download thread. Only [`Phase::Downloading`] can
+/// absorb one; a tick observed in any other phase is a straggler from a
+/// download that already completed, and applying it would resurrect a
+/// `Downloading` state with no download behind it.
+fn on_download_progress(phase: Phase, status: ModelStatus) -> Phase {
+    match phase {
+        Phase::Downloading { id, .. } => Phase::Downloading { id, status },
+        other @ (Phase::NeedsModel { .. } | Phase::EngineFailed(_) | Phase::Ready(_)) => {
+            log::info!("provisioning: discarding a progress tick from a finished download");
+            other
         }
     }
 }
@@ -617,66 +943,46 @@ fn on_provision_command(
 /// other phase observing this message would mean a stale completion from an
 /// earlier download landed after a state change, so it's passed through
 /// unchanged rather than acted on.
+///
+/// A finished download re-derives readiness through [`load_selected_model`]
+/// rather than trusting the download thread's own success signal — the
+/// engine must never load until the one chokepoint that decides
+/// trustworthiness says `Ready` (ADR-020's enforcement clause) — and it
+/// loads the *selected* model, which is not necessarily the one that was
+/// downloaded (A `SelectModel` during the download persists only).
 fn on_download_completed(
     phase: Phase,
     outcome: DownloadOutcome,
-    event_tx: &Sender<DictationEvent>,
-    ui_tx: &Sender<UiCommand>,
     settings: &Arc<SettingsStore>,
+    load: &mut impl FnMut() -> Option<DictationSession>,
 ) -> Phase {
     match (phase, outcome) {
-        (Phase::Downloading(_), DownloadOutcome::Finished) => {
-            load_after_download(event_tx, ui_tx, settings)
+        (Phase::Downloading { .. }, DownloadOutcome::Finished) => {
+            load_selected_model(settings, load)
         }
-        (Phase::Downloading(_), DownloadOutcome::Failed(message)) => {
-            log::error!("provisioning: download failed: {message}");
-            Phase::NeedsModel(ModelStatus::Failed { message })
+        (Phase::Downloading { id, .. }, DownloadOutcome::Failed(message)) => {
+            log::error!("provisioning: {id} download failed: {message}");
+            Phase::NeedsModel {
+                id,
+                status: ModelStatus::Failed { message },
+            }
         }
         (other, _) => other,
     }
 }
 
-/// After a successful download, re-derive readiness from
-/// `availability()` rather than trusting the download thread's own success
-/// signal — `ParakeetEngine::load` must never run until the one chokepoint
-/// that decides trustworthiness says `Ready` (ADR-020's enforcement clause).
-fn load_after_download(
-    event_tx: &Sender<DictationEvent>,
-    ui_tx: &Sender<UiCommand>,
-    settings: &Arc<SettingsStore>,
-) -> Phase {
-    match vuho_model_fetch::availability() {
-        ModelStatus::Ready => match load_engine_and_session(event_tx, ui_tx, settings) {
-            Some(session) => Phase::Ready(session),
-            None => Phase::EngineFailed(
-                "the model finished downloading but the engine failed to load — see the log \
-                 for details"
-                    .to_owned(),
-            ),
-        },
-        other => {
-            log::error!("provisioning: download finished but availability() reports {other:?}");
-            Phase::NeedsModel(other)
-        }
-    }
-}
-
-/// Resolve and load the engine, then build the `DictationSession` around it.
-/// Shared by [`initial_phase`] (model already present at startup),
-/// [`load_after_download`] (model just finished downloading), and
-/// [`on_provision_command`]'s `Phase::EngineFailed` retry (model present,
-/// engine previously failed to load) — one load path, not three
+/// Load the selected model's engine, then build the `DictationSession`
+/// around it. [`load_selected_model`] is the only caller, so startup, a
+/// finished download, and every `SelectModel` share this one path
 /// (CONSTITUTION rule 26).
 fn load_engine_and_session(
     event_tx: &Sender<DictationEvent>,
     ui_tx: &Sender<UiCommand>,
     settings: &Arc<SettingsStore>,
-) -> Option<vuho_dictation::DictationSession> {
-    use vuho_stt_engine::{resolve_model_folder, ParakeetEngine};
-
+) -> Option<DictationSession> {
     log::info!("warmup: loading engine");
     let started = std::time::Instant::now();
-    let engine = match resolve_model_folder().and_then(ParakeetEngine::load) {
+    let engine = match load_engine(&selected_model_id(settings)) {
         Ok(engine) => engine,
         Err(e) => {
             log::error!("warmup: engine unavailable: {e}");
@@ -698,14 +1004,27 @@ fn load_engine_and_session(
     // constructor-injected (CONSTITUTION rule 5) so tests can substitute a
     // fake through the same door.
     let injector: vuho_dictation::Injector = Arc::new(vuho_os_integration::inject_text);
-    let session = vuho_dictation::DictationSession::new(
-        event_tx.clone(),
-        Box::new(engine),
-        settings.clone(),
-        injector,
-    );
+    let session = DictationSession::new(event_tx.clone(), engine, settings.clone(), injector);
     let _ = ui_tx.send(UiCommand::EngineReady(Ok(())));
     Some(session)
+}
+
+/// Build the engine `model_id`'s manifest entry calls for — the one place a
+/// [`Backend`] becomes a concrete engine, so adding a third backend is one
+/// match arm here rather than a second load path.
+fn load_engine(
+    model_id: &str,
+) -> Result<Box<dyn vuho_stt_engine::TranscriptionEngine + Send>, vuho_stt_engine::EngineError> {
+    let backend = vuho_model_paths::manifest()
+        .stt
+        .model(model_id)
+        .map(|model| model.backend)
+        .ok_or_else(|| vuho_stt_engine::EngineError::UnknownModel(model_id.to_owned()))?;
+    let folder = vuho_stt_engine::resolve_model_folder(model_id)?;
+    Ok(match backend {
+        Backend::ParakeetTdt => Box::new(vuho_stt_engine::ParakeetEngine::load(model_id, folder)?),
+        Backend::CanaryAed => Box::new(vuho_stt_engine::CanaryEngine::load(model_id, folder)?),
+    })
 }
 
 /// Spawn the thread that performs the blocking download itself, reporting
@@ -723,13 +1042,14 @@ fn load_engine_and_session(
 /// sender land after a `Failed` from the other (B3) — two independent
 /// senders into the same channel have no ordering guarantee across each
 /// other. Now there is only one sender of that command in the whole
-/// process (`run_provisioning_loop`'s [`send_phase_status`]), so that race
+/// process (`run_provisioning_loop`'s [`broadcast_phase`]), so that race
 /// cannot recur structurally, not just by convention.
-fn spawn_download_thread() -> (Receiver<DownloadOutcome>, Receiver<ModelStatus>) {
+fn spawn_download_thread(model_id: &str) -> (Receiver<DownloadOutcome>, Receiver<ModelStatus>) {
     let (done_tx, done_rx) = crossbeam_channel::bounded(1);
     let (progress_tx, progress_rx) = crossbeam_channel::unbounded::<ModelStatus>();
+    let model_id = model_id.to_owned();
     std::thread::spawn(move || {
-        let outcome = match vuho_model_fetch::download(&progress_tx) {
+        let outcome = match vuho_model_fetch::download(&model_id, &progress_tx) {
             Ok(_path) => DownloadOutcome::Finished,
             Err(e) => {
                 log::error!("provisioning: download failed: {e}");
@@ -788,19 +1108,43 @@ mod tests {
         Arc::new(SettingsStore::new_temp("wiring-provisioning-test"))
     }
 
-    /// `on_provision_command`'s `NeedsModel` arm re-fetches `total_bytes`
-    /// from the repo-pinned lock (not from whatever total the `Phase` it's
-    /// leaving happened to carry) — this is what a `Downloading{0, ..}`
-    /// transition's `total_bytes` actually equals in every test below.
+    fn default_model() -> &'static str {
+        vuho_model_paths::manifest().stt.default_model.as_str()
+    }
+
+    /// `start_download` re-fetches `total_bytes` from the repo-pinned lock
+    /// (not from whatever total the `Phase` it is leaving happened to carry)
+    /// — this is what a `Downloading{0, ..}` transition's `total_bytes`
+    /// actually equals in every test below.
     fn lock_total_bytes() -> u64 {
-        vuho_model_paths::lock().stt.total_bytes
+        model_total_bytes(default_model())
     }
 
     /// A `spawn_download` fake that is never actually called in a given
-    /// test (used where the test only cares about a phase that ignores or
-    /// never reaches `ProvisionCommand::Download`).
-    fn unreachable_spawn() -> (Receiver<DownloadOutcome>, Receiver<ModelStatus>) {
+    /// test (used where the test only cares about a phase that refuses
+    /// `ProvisionCommand::Download`).
+    fn unreachable_spawn(_id: &str) -> (Receiver<DownloadOutcome>, Receiver<ModelStatus>) {
         panic!("spawn_download must not be called in this test");
+    }
+
+    /// A `load` fake that is never actually called — the falsification
+    /// target for every "this transition must not touch the engine" test.
+    fn unreachable_load() -> Option<DictationSession> {
+        panic!("the engine loader must not be called in this test");
+    }
+
+    /// One model's availability, built by hand so a test can state exactly
+    /// the readiness it wants without depending on what happens to be on
+    /// this machine's disk.
+    fn availability_of(id: &str, status: ModelStatus, supported: bool) -> ModelAvailability {
+        ModelAvailability {
+            id: id.to_owned(),
+            display_name: id.to_owned(),
+            status,
+            source: None,
+            total_bytes: 100,
+            supported_on_this_os: supported,
+        }
     }
 
     /// A `TranscriptionEngine` that satisfies `DictationSession::new`'s
@@ -836,17 +1180,35 @@ mod tests {
         }
     }
 
-    /// A `Phase::Ready` built from [`FakeEngine`] — for tests of the
-    /// `Ready` arm that don't need a real model or a real dictation
-    /// session, only a `Phase` value of the right shape.
-    fn fake_ready_phase() -> Phase {
+    fn fake_session() -> DictationSession {
         let injector: vuho_dictation::Injector = Arc::new(|_: &str| Ok(()));
-        Phase::Ready(vuho_dictation::DictationSession::new(
+        DictationSession::new(
             dummy_event_tx(),
             Box::new(FakeEngine),
             dummy_settings(),
             injector,
-        ))
+        )
+    }
+
+    /// A `Phase::Ready` built from [`FakeEngine`] — for tests of the
+    /// `Ready` arm that don't need a real model or a real dictation
+    /// session, only a `Phase` value of the right shape.
+    fn fake_ready_phase() -> Phase {
+        Phase::Ready(fake_session())
+    }
+
+    fn needs_model(status: ModelStatus) -> Phase {
+        Phase::NeedsModel {
+            id: default_model().to_owned(),
+            status,
+        }
+    }
+
+    fn downloading(id: &str, status: ModelStatus) -> Phase {
+        Phase::Downloading {
+            id: id.to_owned(),
+            status,
+        }
     }
 
     /// Upper bound on how long a test waits for a status the loop is
@@ -891,11 +1253,19 @@ mod tests {
     }
 
     /// Pull the `ModelStatus` out of a `UiCommand`, discarding anything
-    /// else (`EngineReady`, `OpenPanel`, …) — what these tests care about
-    /// is exactly the one command [`send_phase_status`] produces.
+    /// else (`ModelList`, `EngineReady`, `OpenPanel`, …) — what these tests
+    /// care about is exactly the one command [`broadcast_phase`] produces
+    /// for the selected model.
     fn model_status(cmd: UiCommand) -> Option<ModelStatus> {
         match cmd {
             UiCommand::ModelStatus(status) => Some(status),
+            _ => None,
+        }
+    }
+
+    fn model_list(cmd: UiCommand) -> Option<Vec<ModelAvailability>> {
+        match cmd {
+            UiCommand::ModelList(models) => Some(models),
             _ => None,
         }
     }
@@ -916,7 +1286,7 @@ mod tests {
         std::thread::JoinHandle<()>,
     )
     where
-        F: FnMut() -> (Receiver<DownloadOutcome>, Receiver<ModelStatus>) + Send + 'static,
+        F: FnMut(&str) -> (Receiver<DownloadOutcome>, Receiver<ModelStatus>) + Send + 'static,
     {
         let (cmd_tx, cmd_rx) = crossbeam_channel::unbounded::<DictationCommand>();
         let (provision_tx, provision_rx) = crossbeam_channel::unbounded::<ProvisionCommand>();
@@ -932,9 +1302,91 @@ mod tests {
                 &settings,
                 initial,
                 spawn_download,
+                unreachable_load,
             );
         });
         (cmd_tx, provision_tx, ui_rx, handle)
+    }
+
+    // ── selected_model_id — WP8.S1 ──────────────────────────────────────
+
+    #[test]
+    fn no_persisted_speech_model_selects_the_manifest_default() {
+        let settings = dummy_settings();
+        assert_eq!(selected_model_id(&settings), default_model());
+    }
+
+    #[test]
+    fn an_unknown_persisted_speech_model_falls_back_to_the_manifest_default() {
+        let settings = dummy_settings();
+        settings
+            .update(|s| s.speech_model = Some("a-model-this-build-does-not-ship".to_owned()))
+            .expect("temp settings are writable");
+        assert_eq!(
+            selected_model_id(&settings),
+            default_model(),
+            "a setting naming a model this build no longer ships must fall back to \
+             something loadable, not dead-end on an id nothing can resolve"
+        );
+    }
+
+    #[test]
+    fn a_known_persisted_speech_model_is_selected() {
+        let settings = dummy_settings();
+        for id in vuho_model_paths::manifest().stt.models.keys() {
+            settings
+                .update(|s| s.speech_model = Some(id.clone()))
+                .expect("temp settings are writable");
+            assert_eq!(&selected_model_id(&settings), id);
+        }
+    }
+
+    // ── phase_for_availability — WP8.S3 ─────────────────────────────────
+
+    #[test]
+    fn selecting_a_missing_model_needs_the_model_and_never_loads_an_engine() {
+        let phase = phase_for_availability(
+            availability_of("some-model", ModelStatus::Missing { total_bytes: 42 }, true),
+            &mut unreachable_load,
+        );
+        match phase {
+            Phase::NeedsModel { id, status } => {
+                assert_eq!(id, "some-model");
+                assert_eq!(status, ModelStatus::Missing { total_bytes: 42 });
+            }
+            other => panic!("expected NeedsModel, got {:?}", phase_status(&other)),
+        }
+    }
+
+    #[test]
+    fn selecting_a_model_this_macos_is_too_old_for_needs_the_model_and_never_loads_an_engine() {
+        let phase = phase_for_availability(
+            availability_of("some-model", ModelStatus::Ready, false),
+            &mut unreachable_load,
+        );
+        assert!(
+            matches!(phase_status(&phase), ModelStatus::Failed { .. }),
+            "an OS-unsupported model must never report Ready — the menu bar would claim a \
+             session that cannot exist"
+        );
+    }
+
+    #[test]
+    fn selecting_a_ready_supported_model_loads_the_engine() {
+        let phase = phase_for_availability(
+            availability_of("some-model", ModelStatus::Ready, true),
+            &mut || Some(fake_session()),
+        );
+        assert!(matches!(phase, Phase::Ready(_)));
+    }
+
+    #[test]
+    fn a_failing_engine_load_ends_in_engine_failed() {
+        let phase = phase_for_availability(
+            availability_of("some-model", ModelStatus::Ready, true),
+            &mut || None,
+        );
+        assert!(matches!(phase, Phase::EngineFailed(_)));
     }
 
     // ── phase_status — pure mapping, one test per variant ──────────────
@@ -942,11 +1394,11 @@ mod tests {
     #[test]
     fn phase_status_covers_every_variant() {
         assert_eq!(
-            phase_status(&Phase::NeedsModel(ModelStatus::Missing { total_bytes: 7 })),
+            phase_status(&needs_model(ModelStatus::Missing { total_bytes: 7 })),
             ModelStatus::Missing { total_bytes: 7 }
         );
         assert_eq!(
-            phase_status(&Phase::Downloading(ModelStatus::Verifying)),
+            phase_status(&downloading("a", ModelStatus::Verifying)),
             ModelStatus::Verifying
         );
         assert_eq!(
@@ -958,10 +1410,46 @@ mod tests {
         assert_eq!(phase_status(&fake_ready_phase()), ModelStatus::Ready);
     }
 
+    // ── phase_rows — the list the Settings tab renders ──────────────────
+
+    #[test]
+    fn an_in_flight_download_overrides_only_its_own_row() {
+        let models = vec![
+            availability_of("a", ModelStatus::Ready, true),
+            availability_of("b", ModelStatus::Missing { total_bytes: 100 }, true),
+        ];
+        let rows = phase_rows(
+            &downloading(
+                "b",
+                ModelStatus::Downloading {
+                    received_bytes: 10,
+                    total_bytes: 100,
+                },
+            ),
+            &models,
+        );
+        assert_eq!(rows[0].status, ModelStatus::Ready);
+        assert_eq!(
+            rows[1].status,
+            ModelStatus::Downloading {
+                received_bytes: 10,
+                total_bytes: 100
+            },
+            "the downloading model's bytes live under a .partial directory the resolver \
+             cannot see — the phase, not the filesystem, is authoritative for that row"
+        );
+    }
+
+    #[test]
+    fn a_ready_phase_leaves_every_row_as_the_filesystem_reported_it() {
+        let models = vec![availability_of("a", ModelStatus::Ready, true)];
+        assert_eq!(phase_rows(&fake_ready_phase(), &models), models);
+    }
+
     // ── B1: nothing ever produced ModelStatus::Ready ────────────────────
 
-    /// Direct regression for B1: `initial_phase`/`load_after_download` used
-    /// to match `ModelStatus::Ready` in a branch that sent nothing at all —
+    /// Direct regression for B1: the startup and post-download load paths
+    /// used to match `ModelStatus::Ready` in a branch that sent nothing at all —
     /// `Ready` was consumed, never forwarded, so the Settings tab never
     /// closed after a successful provision. Here `run_provisioning_loop`
     /// is handed a `Phase::Ready` directly (bypassing the real model/engine
@@ -990,20 +1478,33 @@ mod tests {
             &settings,
             fake_ready_phase(),
             unreachable_spawn,
+            unreachable_load,
         );
 
-        let statuses: Vec<ModelStatus> = ui_rx.try_iter().filter_map(model_status).collect();
+        let commands: Vec<UiCommand> = ui_rx.try_iter().collect();
+        let statuses: Vec<ModelStatus> = commands
+            .iter()
+            .filter_map(|cmd| match cmd {
+                UiCommand::ModelStatus(status) => Some(status.clone()),
+                _ => None,
+            })
+            .collect();
         assert_eq!(
             statuses,
             vec![ModelStatus::Ready],
             "B1: entering Phase::Ready must broadcast ModelStatus::Ready — \
              the bug this regresses sent nothing for the Ready arm at all"
         );
+        assert_eq!(
+            commands.into_iter().filter_map(model_list).count(),
+            1,
+            "WP8.S4: every transition broadcasts the model list alongside the status"
+        );
     }
 
     // ── B4: engine-load failure on an available model was a silent sink ─
 
-    /// Direct regression for B4: `initial_phase`'s `Ready`-availability/
+    /// Direct regression for B4: the startup path's `Ready`-availability/
     /// engine-load-failure branch used to return `Phase::NeedsModel` with
     /// no status sent at all, so `LAST_MODEL_STATUS` stayed `None` forever
     /// and "Setup…" opened no window — a genuine dead end recoverable only
@@ -1028,6 +1529,7 @@ mod tests {
             &settings,
             Phase::EngineFailed("the engine blew up".to_owned()),
             unreachable_spawn,
+            unreachable_load,
         );
 
         let statuses: Vec<ModelStatus> = ui_rx.try_iter().filter_map(model_status).collect();
@@ -1057,8 +1559,8 @@ mod tests {
     #[test]
     fn a_download_thread_that_dies_without_reporting_ends_in_a_broadcast_failed_status() {
         let (cmd_tx, provision_tx, ui_rx, handle) = spawn_loop(
-            Phase::NeedsModel(ModelStatus::Missing { total_bytes: 100 }),
-            || {
+            needs_model(ModelStatus::Missing { total_bytes: 100 }),
+            |_id| {
                 let (done_tx, done_rx) = crossbeam_channel::bounded::<DownloadOutcome>(1);
                 drop(done_tx); // the "thread" died before reporting
                 (done_rx, crossbeam_channel::never())
@@ -1072,7 +1574,9 @@ mod tests {
             Some(ModelStatus::Missing { total_bytes: 100 })
         );
 
-        provision_tx.send(ProvisionCommand::Download).unwrap();
+        provision_tx
+            .send(ProvisionCommand::Download(default_model().to_owned()))
+            .unwrap();
 
         // The synchronous `Downloading{0,total}` transition (A3), then the
         // synthesized `Failed` from the dead-thread branch — both
@@ -1122,8 +1626,8 @@ mod tests {
         let mut once = Some((done_rx, progress_rx));
 
         let (cmd_tx, provision_tx, ui_rx, handle) = spawn_loop(
-            Phase::NeedsModel(ModelStatus::Missing { total_bytes: 100 }),
-            move || once.take().expect("spawn_download called more than once"),
+            needs_model(ModelStatus::Missing { total_bytes: 100 }),
+            move |_id| once.take().expect("spawn_download called more than once"),
         );
 
         assert_eq!(
@@ -1131,7 +1635,9 @@ mod tests {
             Some(ModelStatus::Missing { total_bytes: 100 })
         );
 
-        provision_tx.send(ProvisionCommand::Download).unwrap();
+        provision_tx
+            .send(ProvisionCommand::Download(default_model().to_owned()))
+            .unwrap();
         assert_eq!(
             next_status(&ui_rx),
             Some(ModelStatus::Downloading {
@@ -1174,8 +1680,8 @@ mod tests {
     #[test]
     fn dictation_commands_are_discarded_before_the_model_is_ready() {
         for phase in [
-            Phase::NeedsModel(ModelStatus::Missing { total_bytes: 1 }),
-            Phase::Downloading(ModelStatus::Verifying),
+            needs_model(ModelStatus::Missing { total_bytes: 1 }),
+            downloading("a", ModelStatus::Verifying),
             Phase::EngineFailed("boom".to_owned()),
         ] {
             let next = on_dictation_command(phase, DictationCommand::Toggle);
@@ -1193,25 +1699,20 @@ mod tests {
         assert!(matches!(phase, Phase::Ready(_)));
     }
 
-    // ── on_provision_command — one test per (Phase, Download) pair ─────
+    // ── on_download_command — one test per (Phase, Download) pair ───────
 
     #[test]
-    fn provision_download_from_needs_model_starts_a_download_with_zero_received_bytes() {
-        let ui_tx = crossbeam_channel::unbounded().0;
-        let event_tx = dummy_event_tx();
-        let settings = dummy_settings();
-        let mut spawn = || {
+    fn download_from_needs_model_starts_a_download_with_zero_received_bytes() {
+        let mut spawn = |_id: &str| {
             (
                 crossbeam_channel::never(),
                 crossbeam_channel::never::<ModelStatus>(),
             )
         };
 
-        let (phase, outcome) = on_provision_command(
-            Phase::NeedsModel(ModelStatus::Missing { total_bytes: 100 }),
-            &ui_tx,
-            &event_tx,
-            &settings,
+        let (phase, outcome) = on_download_command(
+            needs_model(ModelStatus::Missing { total_bytes: 100 }),
+            default_model(),
             &mut spawn,
         );
 
@@ -1219,7 +1720,7 @@ mod tests {
             phase_status(&phase),
             ModelStatus::Downloading {
                 received_bytes: 0,
-                total_bytes: vuho_model_paths::lock().stt.total_bytes,
+                total_bytes: lock_total_bytes(),
             },
             "A3: the transition to Downloading must be synchronous with the \
              click, not wait for the first real progress tick"
@@ -1228,100 +1729,255 @@ mod tests {
     }
 
     #[test]
-    fn provision_download_while_downloading_is_ignored() {
-        let ui_tx = crossbeam_channel::unbounded().0;
-        let event_tx = dummy_event_tx();
-        let settings = dummy_settings();
-        let (phase, outcome) = on_provision_command(
-            Phase::Downloading(ModelStatus::Verifying),
-            &ui_tx,
-            &event_tx,
-            &settings,
-            &mut unreachable_spawn,
+    fn download_from_engine_failed_starts_a_download() {
+        let mut spawn = |_id: &str| {
+            (
+                crossbeam_channel::never(),
+                crossbeam_channel::never::<ModelStatus>(),
+            )
+        };
+        let (phase, outcome) = on_download_command(
+            Phase::EngineFailed("boom".to_owned()),
+            default_model(),
+            &mut spawn,
         );
-        assert!(matches!(phase, Phase::Downloading(ModelStatus::Verifying)));
-        assert!(matches!(outcome, ProvisionOutcome::Ignored));
+        assert!(matches!(phase, Phase::Downloading { .. }));
+        assert!(matches!(outcome, ProvisionOutcome::DownloadStarted(..)));
     }
 
     #[test]
-    fn provision_download_while_ready_is_ignored() {
-        let ui_tx = crossbeam_channel::unbounded().0;
-        let event_tx = dummy_event_tx();
+    fn download_from_ready_starts_a_download() {
+        let mut spawn = |_id: &str| {
+            (
+                crossbeam_channel::never(),
+                crossbeam_channel::never::<ModelStatus>(),
+            )
+        };
+        let (phase, outcome) = on_download_command(fake_ready_phase(), default_model(), &mut spawn);
+        assert!(matches!(phase, Phase::Downloading { .. }));
+        assert!(matches!(outcome, ProvisionOutcome::DownloadStarted(..)));
+    }
+
+    #[test]
+    fn download_of_the_same_model_while_it_downloads_is_ignored() {
+        let (phase, outcome) = on_download_command(
+            downloading("a", ModelStatus::Verifying),
+            "a",
+            &mut unreachable_spawn,
+        );
+        assert!(matches!(phase, Phase::Downloading { id, .. } if id == "a"));
+        assert!(matches!(outcome, ProvisionOutcome::Handled));
+    }
+
+    /// `run_provisioning_loop`'s `select!` holds exactly one pair of
+    /// download receivers and rebinds both when a download starts — so
+    /// starting a second one would leave the first running with nothing
+    /// listening to its progress or its completion, wedging the UI on a
+    /// download that can never finish as far as the loop is concerned.
+    #[test]
+    fn download_of_another_model_while_one_is_in_flight_leaves_the_in_flight_one_untouched() {
+        let (phase, outcome) = on_download_command(
+            downloading(
+                "a",
+                ModelStatus::Downloading {
+                    received_bytes: 10,
+                    total_bytes: 100,
+                },
+            ),
+            "b",
+            &mut unreachable_spawn, // panics if a second download is started
+        );
+
+        match phase {
+            Phase::Downloading { id, status } => {
+                assert_eq!(id, "a", "the in-flight download must not be replaced");
+                assert_eq!(
+                    status,
+                    ModelStatus::Downloading {
+                        received_bytes: 10,
+                        total_bytes: 100
+                    },
+                    "its progress must not be reset either"
+                );
+            }
+            other => panic!(
+                "expected the in-flight Downloading phase, got {:?}",
+                phase_status(&other)
+            ),
+        }
+        assert!(matches!(outcome, ProvisionOutcome::Handled));
+    }
+
+    #[test]
+    fn download_of_an_unknown_model_is_refused() {
+        let (phase, outcome) = on_download_command(
+            needs_model(ModelStatus::Missing { total_bytes: 1 }),
+            "no-such-model",
+            &mut unreachable_spawn,
+        );
+        assert!(matches!(phase, Phase::NeedsModel { .. }));
+        assert!(matches!(outcome, ProvisionOutcome::Handled));
+    }
+
+    // ── on_select_model_command ─────────────────────────────────────────
+
+    #[test]
+    fn selecting_a_model_while_downloading_persists_it_without_touching_the_download() {
         let settings = dummy_settings();
-        let (phase, outcome) = on_provision_command(
-            fake_ready_phase(),
-            &ui_tx,
+        let target = vuho_model_paths::manifest()
+            .stt
+            .models
+            .keys()
+            .next()
+            .expect("the manifest ships at least one model")
+            .clone();
+
+        let (phase, outcome) = on_select_model_command(
+            downloading("a", ModelStatus::Verifying),
+            &target,
+            &settings,
+            &mut unreachable_load,
+        );
+
+        assert!(matches!(phase, Phase::Downloading { id, .. } if id == "a"));
+        assert!(matches!(outcome, ProvisionOutcome::Handled));
+        assert_eq!(settings.get().speech_model.as_ref(), Some(&target));
+    }
+
+    #[test]
+    fn selecting_an_unknown_model_changes_nothing() {
+        let settings = dummy_settings();
+        let (phase, outcome) = on_select_model_command(
+            needs_model(ModelStatus::Missing { total_bytes: 1 }),
+            "no-such-model",
+            &settings,
+            &mut unreachable_load,
+        );
+        assert!(matches!(phase, Phase::NeedsModel { .. }));
+        assert!(matches!(outcome, ProvisionOutcome::Handled));
+        assert_eq!(settings.get().speech_model, None);
+    }
+
+    // ── on_delete_command ───────────────────────────────────────────────
+
+    #[test]
+    fn deleting_the_in_flight_model_is_refused_and_leaves_the_phase_alone() {
+        let settings = dummy_settings();
+        let event_tx = dummy_event_tx();
+        let phase = on_delete_command(
+            downloading("a", ModelStatus::Verifying),
+            "a",
             &event_tx,
             &settings,
-            &mut unreachable_spawn,
+        );
+        assert!(matches!(phase, Phase::Downloading { id, .. } if id == "a"));
+    }
+
+    #[test]
+    fn deleting_the_selected_model_is_refused() {
+        let settings = dummy_settings();
+        let event_tx = dummy_event_tx();
+        let selected = selected_model_id(&settings);
+        let phase = on_delete_command(fake_ready_phase(), &selected, &event_tx, &settings);
+        assert!(matches!(phase, Phase::Ready(_)));
+    }
+
+    #[test]
+    fn deleting_from_needs_model_leaves_the_phase_alone() {
+        let settings = dummy_settings();
+        let event_tx = dummy_event_tx();
+        let phase = on_delete_command(
+            needs_model(ModelStatus::Missing { total_bytes: 1 }),
+            "a-model-this-build-does-not-ship",
+            &event_tx,
+            &settings,
+        );
+        assert!(matches!(phase, Phase::NeedsModel { .. }));
+    }
+
+    #[test]
+    fn deleting_from_engine_failed_leaves_the_phase_alone() {
+        let settings = dummy_settings();
+        let event_tx = dummy_event_tx();
+        let phase = on_delete_command(
+            Phase::EngineFailed("boom".to_owned()),
+            "a-model-this-build-does-not-ship",
+            &event_tx,
+            &settings,
+        );
+        assert!(matches!(phase, Phase::EngineFailed(_)));
+    }
+
+    // ── on_download_progress ────────────────────────────────────────────
+
+    #[test]
+    fn a_progress_tick_keeps_the_in_flight_model_id() {
+        let phase = on_download_progress(
+            downloading("a", ModelStatus::Verifying),
+            ModelStatus::Downloading {
+                received_bytes: 5,
+                total_bytes: 10,
+            },
+        );
+        assert!(matches!(phase, Phase::Downloading { id, .. } if id == "a"));
+    }
+
+    #[test]
+    fn a_progress_tick_after_completion_never_resurrects_downloading() {
+        let phase = on_download_progress(
+            fake_ready_phase(),
+            ModelStatus::Downloading {
+                received_bytes: 5,
+                total_bytes: 10,
+            },
         );
         assert!(matches!(phase, Phase::Ready(_)));
-        assert!(matches!(outcome, ProvisionOutcome::Ignored));
-    }
-
-    #[test]
-    fn provision_download_while_engine_failed_retries_the_engine_not_the_network() {
-        let ui_tx = crossbeam_channel::unbounded().0;
-        let event_tx = dummy_event_tx();
-        let settings = dummy_settings();
-        let (phase, outcome) = on_provision_command(
-            Phase::EngineFailed("boom".to_owned()),
-            &ui_tx,
-            &event_tx,
-            &settings,
-            &mut unreachable_spawn,
-        );
-        // `unreachable_spawn` panics if called — merely returning without
-        // panicking already proves this phase never starts a download.
-        // What `load_engine_and_session` itself does with the retry
-        // (whether the real model on this machine loads or not) is out of
-        // scope for this unit — it's exercised end-to-end by
-        // `test-stt-ffi`; here only the *dispatch* (retry engine, not
-        // network) is under test.
-        assert!(matches!(outcome, ProvisionOutcome::RetriedBlocking));
-        assert!(matches!(phase, Phase::EngineFailed(_) | Phase::Ready(_)));
     }
 
     // ── on_download_completed ───────────────────────────────────────────
 
     #[test]
     fn failed_download_outside_downloading_is_left_unchanged() {
-        let ui_tx = crossbeam_channel::unbounded().0;
-        let event_tx = dummy_event_tx();
         let settings = dummy_settings();
         let phase = on_download_completed(
-            Phase::NeedsModel(ModelStatus::Missing { total_bytes: 5 }),
+            needs_model(ModelStatus::Missing { total_bytes: 5 }),
             DownloadOutcome::Failed("simulated".to_owned()),
-            &event_tx,
-            &ui_tx,
             &settings,
+            &mut unreachable_load,
         );
         assert!(matches!(
             phase,
-            Phase::NeedsModel(ModelStatus::Missing { total_bytes: 5 })
+            Phase::NeedsModel {
+                status: ModelStatus::Missing { total_bytes: 5 },
+                ..
+            }
         ));
     }
 
     #[test]
     fn failed_download_from_downloading_carries_the_message_into_needs_model() {
-        let ui_tx = crossbeam_channel::unbounded().0;
-        let event_tx = dummy_event_tx();
         let settings = dummy_settings();
         let phase = on_download_completed(
-            Phase::Downloading(ModelStatus::Downloading {
-                received_bytes: 10,
-                total_bytes: 100,
-            }),
+            downloading(
+                "a",
+                ModelStatus::Downloading {
+                    received_bytes: 10,
+                    total_bytes: 100,
+                },
+            ),
             DownloadOutcome::Failed("connection reset".to_owned()),
-            &event_tx,
-            &ui_tx,
             &settings,
+            &mut unreachable_load,
         );
         assert_eq!(
             phase_status(&phase),
             ModelStatus::Failed {
                 message: "connection reset".to_owned()
             }
+        );
+        assert!(
+            matches!(&phase, Phase::NeedsModel { id, .. } if id == "a"),
+            "the failed row must be the model that was actually downloading"
         );
     }
 }

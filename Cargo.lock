@@ -6926,6 +6926,8 @@ name = "test-stt-ffi"
 version = "0.0.0-dev"
 dependencies = [
  "env_logger",
+ "vuho-domain",
+ "vuho-model-paths",
  "vuho-stt-engine",
 ]
 
@@ -7844,6 +7846,7 @@ dependencies = [
  "hex",
  "hf-hub",
  "log",
+ "objc2-foundation",
  "serde_json",
  "sha2 0.11.0",
  "tempfile",

@@ -43,6 +43,7 @@ half = { workspace = true }
 # own tests need", without making the feature part of the crate's own
 # default build.
 vuho-stt-engine = { path = ".", features = ["test-fixtures"] }
+vuho-model-paths = { workspace = true }
 criterion = { version = "0.5", default-features = false }
 
 [[bench]]

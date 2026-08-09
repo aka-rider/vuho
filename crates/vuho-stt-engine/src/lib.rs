@@ -1,8 +1,18 @@
-//! Parakeet-TDT STT engine via native `CoreML` on the ANE.
+//! STT engines via native `CoreML`, behind one `TranscriptionEngine` trait
+//! with batch and streaming paths.
 //!
-//! Loads the Parakeet-TDT model components (Preprocessor, Encoder, Decoder,
-//! `RNNTJoint`) as `CoreML` bundles, runs greedy TDT decoding, and exposes
-//! a `TranscriptionEngine` trait with batch and streaming paths.
+//! Two backends share everything but the decode loop, meeting at the
+//! `WindowInference` seam (ADR-022) so `StreamingEngine<M>` owns the window
+//! planning, the seam merge, and the session lifecycle exactly once:
+//!
+//! - **Parakeet-TDT** (`ParakeetEngine`, the manifest's default model):
+//!   Preprocessor, Encoder, Decoder, and `RNNTJoint` `CoreML` bundles,
+//!   greedy TDT decoding over a sliding 15 s window. Its encoder runs on
+//!   the ANE.
+//! - **Canary-1B-v2** (`CanaryEngine`): Preprocessor, Encoder, Decoder, and
+//!   Projection bundles, greedy attention encoder-decoder over a fixed 15 s
+//!   window. Every component loads CPU-only — measured, not assumed; see
+//!   `canary::models::Components::load`.
 //!
 //! VAD uses the embedded Silero v5 from `voice_activity_detector`
 //! (crate cannot load external weights — the fetched `models/silero-vad/`
@@ -26,10 +36,29 @@ mod coreml;
 // Parakeet-TDT model components.
 mod parakeet;
 
+// Canary-1B-v2 model components. `pub` for its `prompt` module alone: the
+// Settings UI needs the language list this backend can actually reach, and
+// a second copy of that list anywhere else would be a list to keep in sync
+// (CONSTITUTION rule 26).
+pub mod canary;
+
+// The backend-independent engine half: batch windowing + session lifecycle.
+mod streaming_engine;
+
+// The backend-independent decoded-token type and frame->ms conversion.
+pub(crate) mod token;
+
+// Vocabulary loading + detokenization, shared by every backend.
+pub(crate) mod vocab;
+
+// The seam every STT backend implements for the shared streaming pipeline.
+pub(crate) mod window_inference;
+
 // Sliding window + merge pipeline.
 mod stream;
 
-// Engine handle.
+// Engine handles, one thin wrapper per backend.
+mod canary_engine;
 mod engine;
 
 // Shared WAV-fixture test helpers (jfk.wav loading + generic WAV parsing) —
@@ -45,30 +74,35 @@ pub mod test_support;
 // Re-exports of pure, model-free internals for `benches/hot_paths.rs`. A
 // criterion bench target is compiled as a separate crate, so it only sees
 // this crate's `pub` surface — `tdt_greedy`, `StepModel`, `TokenAt`,
-// `DecoderState`, `merge`, `MergeOutcome`, `windower::plan`, and
-// `windower::OVERLAP_FRAMES` are marked `pub` (not `pub(crate)`) at their
-// own declaration sites specifically so this module can re-export them (a
+// `frame_ms`, `DecoderState`, `merge`, `MergeBounds`, `MergeOutcome`,
+// `windower::plan`, and `windower::OVERLAP_FRAMES` are marked `pub` (not
+// `pub(crate)`) at their own declaration sites specifically so this module can re-export them (a
 // `pub use` cannot widen a `pub(crate)` item's visibility — only forward an
 // already-`pub` one), with a doc comment there pointing back here. Their
 // FIELDS stay `pub(crate)` — the bench never needs to read/construct them
 // directly, only via the shim constructors below, which live inside this
 // crate and so can see those fields.
 pub mod bench_support {
-    //! Re-exports + constructor shims for `benches/hot_paths.rs`. Nothing
-    //! here touches `CoreML` — every benched function is model-free (a
-    //! synthetic `StepModel`/token stream stands in for the real engine),
-    //! matching the plan's "model-free, deterministic" bench requirement.
+    //! Re-exports + constructor shims for this crate's separate bench and
+    //! integration-test crates (`benches/hot_paths.rs`,
+    //! `tests/canary_batch.rs`) — the one sanctioned way they reach a
+    //! crate-internal item, instead of restating its value as a literal
+    //! (CONSTITUTION rule 27). Nothing here touches `CoreML` — every benched
+    //! function is model-free (a synthetic `StepModel`/token stream stands
+    //! in for the real engine), matching the plan's "model-free,
+    //! deterministic" bench requirement.
     pub use crate::parakeet::decoder_state::DecoderState;
-    pub use crate::parakeet::tdt::{tdt_greedy, StepModel, TokenAt};
-    pub use crate::stream::merge::{merge, MergeOutcome};
-    pub use crate::stream::windower::{plan, OVERLAP_FRAMES};
+    pub use crate::parakeet::tdt::{tdt_greedy, StepModel};
+    pub use crate::stream::merge::{merge, MergeBounds, MergeOutcome};
+    pub use crate::stream::windower::{plan, OVERLAP_FRAMES, WINDOW_SAMPLES};
+    pub use crate::token::{frame_ms, TokenAt};
     pub use crate::EngineError;
 
     /// Construct a `TokenAt` — the bench's only way to build one (see this
     /// module's doc comment).
     #[must_use]
-    pub fn token_at(id: u32, frame: usize) -> TokenAt {
-        TokenAt { id, frame }
+    pub fn token_at(id: u32, pos: usize) -> TokenAt {
+        TokenAt { id, pos }
     }
 
     /// A `StepModel` that always emits a fixed `token` at a fixed
@@ -136,6 +170,12 @@ pub enum EngineError {
         /// [`vuho_model_paths::resolve_model_folder`]).
         tried: Vec<PathBuf>,
     },
+    /// The model directory name — usually a `VUHO_MODEL_NAME` override — is
+    /// not a single plain path component, so no candidate location could be
+    /// built from it. Distinct from [`Self::ModelFolderMissing`]: nothing
+    /// was tried, because the name itself is unusable.
+    #[error("{0}")]
+    InvalidModelDirName(String),
     /// Loading the `CoreML` model components failed.
     #[error("model load failed: {0}")]
     LoadFailed(String),
@@ -169,6 +209,21 @@ pub enum EngineError {
     /// returning normally.
     #[error("streaming session thread panicked")]
     SessionPanicked,
+    /// The selected model cannot transcribe the session's language. Carries
+    /// both facts so the UI can name them without re-deriving either
+    /// (CONSTITUTION rule 2: no silent fallback to some other language).
+    #[error("{model} does not support {language}")]
+    UnsupportedLanguage {
+        /// The selected model's display name.
+        model: String,
+        /// The BCP-47-derived language code that was asked for.
+        language: String,
+    },
+    /// The requested model id is absent from the embedded
+    /// `models.manifest.json`, so there is no directory name, revision, or
+    /// asset list to resolve it with.
+    #[error("unknown model id: {0}")]
+    UnknownModel(String),
     /// The OS failed to spawn the streaming session's background thread.
     #[error("failed to spawn streaming session thread: {0}")]
     SpawnFailed(String),
@@ -201,25 +256,80 @@ pub enum EngineError {
 ///
 /// # Errors
 ///
-/// Returns `EngineError::ModelFolderMissing` naming every candidate tried
-/// if none of them is an existing directory.
-pub fn resolve_model_folder() -> Result<PathBuf, EngineError> {
-    vuho_model_paths::resolve_model_folder(&vuho_model_paths::manifest().stt.spec())
-        .map_err(|e| EngineError::ModelFolderMissing { tried: e.tried })
+/// Returns `EngineError::UnknownModel` if `model_id` names no model in the
+/// embedded manifest, `EngineError::InvalidModelDirName` if the directory
+/// name (or its `VUHO_MODEL_NAME` override) is not a single plain path
+/// component, or `EngineError::ModelFolderMissing` naming every candidate
+/// tried if none of them is an existing directory.
+pub fn resolve_model_folder(model_id: &str) -> Result<PathBuf, EngineError> {
+    let spec = vuho_model_paths::manifest()
+        .stt
+        .spec_for(model_id)
+        .ok_or_else(|| EngineError::UnknownModel(model_id.to_owned()))?;
+    vuho_model_paths::resolve_model_folder(&spec).map_err(|e| match e {
+        vuho_model_paths::ModelPathError::NotFound { tried } => {
+            EngineError::ModelFolderMissing { tried }
+        }
+        vuho_model_paths::ModelPathError::InvalidDirName(invalid) => {
+            EngineError::InvalidModelDirName(invalid.to_string())
+        }
+    })
 }
 
-/// Required sub-paths inside a model directory for the parakeet TDT model —
-/// the STT component list from the embedded `models.manifest.json`, the one
-/// place this list is written down (`scripts/*.sh` read the same file).
+/// Required sub-paths inside `model_id`'s directory — the model's asset
+/// filenames from the embedded `models.manifest.json`, the one place this
+/// list is written down (`scripts/*.sh` read the same file).
 ///
-/// The `FluidInference/parakeet-tdt-0.6b-v3-coreml` model ships these `CoreML`
-/// component bundles plus a vocabulary file. If any are missing the engine
-/// cannot transcribe.
-fn required_components() -> &'static [String] {
-    &vuho_model_paths::manifest().stt.components
+/// # Errors
+///
+/// Returns `EngineError::UnknownModel` if `model_id` names no model in the
+/// embedded manifest.
+fn required_components(model_id: &str) -> Result<Vec<&'static str>, EngineError> {
+    vuho_model_paths::manifest()
+        .stt
+        .model(model_id)
+        .map(vuho_model_paths::SttModel::components)
+        .ok_or_else(|| EngineError::UnknownModel(model_id.to_owned()))
 }
 
-/// Validate that a model directory contains all required Parakeet-TDT `CoreML` components.
+/// The asset roles a backend loads by name from the embedded manifest.
+///
+/// The manifest maps each role to a filename; these role keys are the only
+/// model-file identifiers written down in Rust (ADR-019 keeps every actual
+/// `.mlmodelc`/vocabulary filename in `models.manifest.json`).
+pub(crate) mod asset_role {
+    pub(crate) const PREPROCESSOR: &str = "preprocessor";
+    pub(crate) const ENCODER: &str = "encoder";
+    pub(crate) const DECODER: &str = "decoder";
+    pub(crate) const JOINT: &str = "joint";
+    pub(crate) const PROJECTION: &str = "projection";
+    pub(crate) const VOCAB: &str = "vocab";
+}
+
+/// Path to `model_id`'s `role` asset inside `model_dir` — the one place a
+/// backend turns a role into a file (ADR-019: filenames live in the
+/// manifest, never in this crate).
+///
+/// # Errors
+///
+/// Returns `EngineError::UnknownModel` for an unknown `model_id`, or
+/// `EngineError::LoadFailed` if the model declares no asset for `role`.
+pub(crate) fn asset_path(
+    model_id: &str,
+    role: &str,
+    model_dir: &Path,
+) -> Result<PathBuf, EngineError> {
+    let model = vuho_model_paths::manifest()
+        .stt
+        .model(model_id)
+        .ok_or_else(|| EngineError::UnknownModel(model_id.to_owned()))?;
+    let file = model.asset(role).ok_or_else(|| {
+        EngineError::LoadFailed(format!("model {model_id} declares no '{role}' asset"))
+    })?;
+    Ok(model_dir.join(file))
+}
+
+/// Validate that `model_dir` contains every asset `model_id` declares.
 ///
 /// Returns `Ok(())` when every component exists. On failure, returns
 /// `EngineError::LoadFailed` naming the **first** missing component so the
@@ -227,11 +337,12 @@ fn required_components() -> &'static [String] {
 ///
 /// # Errors
 ///
+/// `EngineError::UnknownModel` for an unknown `model_id`, or
 /// `EngineError::LoadFailed` with a message like
-/// `"missing model component: TextDecoderContextPrefill.mlmodelc"` when
-/// at least one required component is absent.
-pub fn validate_model_layout(model_dir: &Path) -> Result<(), EngineError> {
-    for component in required_components() {
+/// `"missing model component: RNNTJoint.mlmodelc"` when at least one
+/// required component is absent.
+pub fn validate_model_layout(model_id: &str, model_dir: &Path) -> Result<(), EngineError> {
+    for component in required_components(model_id)? {
         if !model_dir.join(component).exists() {
             return Err(EngineError::LoadFailed(format!(
                 "missing model component: {component}"
@@ -306,6 +417,7 @@ pub trait TranscriptionEngine {
 
 // ── ParakeetEngine (the real engine) ───────────────────────────────────
 
+pub use canary_engine::CanaryEngine;
 pub use engine::ParakeetEngine;
 
 /// List the names of available audio input devices.
@@ -375,7 +487,9 @@ mod tests {
     /// at all rather than one that fails later, mid-session.
     #[test]
     fn engine_load_fails_for_a_missing_model_folder() {
-        assert!(ParakeetEngine::load(PathBuf::from("/nonexistent-model")).is_err());
+        assert!(
+            ParakeetEngine::load(default_model_id(), PathBuf::from("/nonexistent-model")).is_err()
+        );
     }
 
     #[test]
@@ -396,7 +510,8 @@ mod tests {
                 "vuho-stt-engine-test-name-that-cannot-exist",
             );
         }
-        let err = resolve_model_folder().expect_err("nonexistent folder must not resolve");
+        let err = resolve_model_folder(vuho_model_paths::manifest().stt.default_model.as_str())
+            .expect_err("nonexistent folder must not resolve");
         unsafe {
             std::env::remove_var("VUHO_MODEL_FOLDER");
             std::env::remove_var("VUHO_MODEL_NAME");
@@ -414,13 +529,17 @@ mod tests {
         }
     }
 
-    /// A directory with all required components passes validation.
-    #[test]
-    fn validate_model_layout_passes_when_all_components_present() {
-        let tmp = std::env::temp_dir().join("vuho-test-model-ok");
+    fn default_model_id() -> &'static str {
+        vuho_model_paths::manifest().stt.default_model.as_str()
+    }
+
+    /// Lay out `components` under a fresh `label` temp directory: a
+    /// `.mlmodelc` component is a directory, anything else a file.
+    fn lay_out_components(label: &str, components: &[&str]) -> PathBuf {
+        let tmp = std::env::temp_dir().join(label);
         fs::remove_dir_all(&tmp).ok();
         fs::create_dir_all(&tmp).expect("create tempdir");
-        for comp in required_components() {
+        for comp in components {
             let p = tmp.join(comp);
             if comp.ends_with(".mlmodelc") {
                 fs::create_dir_all(&p).expect("create component dir");
@@ -428,26 +547,36 @@ mod tests {
                 fs::write(&p, "").expect("create component file");
             }
         }
-        assert!(validate_model_layout(&tmp).is_ok());
+        tmp
+    }
+
+    /// A directory with all required components passes validation.
+    #[test]
+    fn validate_model_layout_passes_when_all_components_present() {
+        let components = required_components(default_model_id()).expect("default model is known");
+        let tmp = lay_out_components("vuho-test-model-ok", &components);
+
+        assert!(validate_model_layout(default_model_id(), &tmp).is_ok());
+
         fs::remove_dir_all(&tmp).ok();
     }
 
-    /// Validation fails on the first missing component, and the error names it.
+    /// Validation fails when any single component is absent, and the error
+    /// names that component rather than a generic "layout invalid".
     #[test]
-    fn validate_model_layout_fails_on_first_missing_component() {
-        let tmp = std::env::temp_dir().join("vuho-test-model-missing");
-        fs::remove_dir_all(&tmp).ok();
-        fs::create_dir_all(&tmp).expect("create tempdir");
-        // Only create the first two components — ParakeetEncoder_15s is missing.
-        fs::create_dir_all(tmp.join("Preprocessor.mlmodelc")).unwrap();
-        fs::create_dir_all(tmp.join("ParakeetEncoder_15s.mlmodelc")).unwrap();
+    fn validate_model_layout_fails_naming_the_missing_component() {
+        let mut components =
+            required_components(default_model_id()).expect("default model is known");
+        let absent = components.pop().expect("the model declares assets");
+        let tmp = lay_out_components("vuho-test-model-missing", &components);
 
-        let err = validate_model_layout(&tmp).expect_err("should fail");
+        let err =
+            validate_model_layout(default_model_id(), &tmp).expect_err("a gap must be rejected");
         match err {
             EngineError::LoadFailed(msg) => {
                 assert!(
-                    msg.contains("ParakeetDecoder.mlmodelc"),
-                    "error should name ParakeetDecoder.mlmodelc, got: {msg}"
+                    msg.contains(absent),
+                    "error should name {absent}, got: {msg}"
                 );
             }
             other => panic!("expected LoadFailed, got {other:?}"),
@@ -458,20 +587,36 @@ mod tests {
     /// An empty directory fails on the very first required component.
     #[test]
     fn validate_model_layout_fails_on_empty_dir() {
-        let tmp = std::env::temp_dir().join("vuho-test-model-empty");
-        fs::remove_dir_all(&tmp).ok();
-        fs::create_dir_all(&tmp).expect("create tempdir");
+        let components = required_components(default_model_id()).expect("default model is known");
+        let tmp = lay_out_components("vuho-test-model-empty", &[]);
 
-        let err = validate_model_layout(&tmp).expect_err("should fail");
+        let err =
+            validate_model_layout(default_model_id(), &tmp).expect_err("an empty dir must fail");
         match err {
             EngineError::LoadFailed(msg) => {
                 assert!(
-                    msg.contains("Preprocessor.mlmodelc"),
-                    "should name first component, got: {msg}"
+                    msg.contains(components[0]),
+                    "should name the first component {}, got: {msg}",
+                    components[0]
                 );
             }
             other => panic!("expected LoadFailed, got {other:?}"),
         }
         fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// An id the manifest doesn't know must be a typed error, never a
+    /// silent fall-back to the default model.
+    #[test]
+    fn an_unknown_model_id_is_rejected_by_both_entry_points() {
+        let unknown = "no-such-model";
+        assert!(matches!(
+            resolve_model_folder(unknown),
+            Err(EngineError::UnknownModel(id)) if id == unknown
+        ));
+        assert!(matches!(
+            validate_model_layout(unknown, Path::new("/nonexistent")),
+            Err(EngineError::UnknownModel(id)) if id == unknown
+        ));
     }
 }

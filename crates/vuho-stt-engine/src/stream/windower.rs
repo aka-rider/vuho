@@ -17,8 +17,12 @@
 
 /// Samples per encoder frame (1280 = 80 ms @ 16 kHz).
 pub(crate) const SAMPLES_PER_FRAME: usize = 1280;
-/// Samples per model window (240 000 = 15 s).
-pub(crate) const WINDOW_SAMPLES: usize = 240_000;
+/// Samples per model window (240 000 = 15 s). `pub` (not `pub(crate)`) for
+/// the same reason [`OVERLAP_FRAMES`] is: `tests/canary_batch.rs` — a
+/// separate crate — asserts against the window size, and a duplicated
+/// literal there would be a second copy of this fact (CONSTITUTION rule
+/// 26); re-exported via `crate::bench_support`.
+pub const WINDOW_SAMPLES: usize = 240_000;
 /// Overlap samples (32 000 = 2 s = 25 frames).
 pub(crate) const OVERLAP_SAMPLES: usize = 32_000;
 /// Advance per window (208 000 = 13 s).

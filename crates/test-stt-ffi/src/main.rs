@@ -1,10 +1,11 @@
-//! Transcribe jfk.wav via the Parakeet-TDT STT engine.
+//! Transcribe jfk.wav via one of the workspace's STT backends.
 //!
-//! Reads the WAV file, initializes the engine, and verifies the transcription
-//! contains the expected JFK quote.
+//! Reads the WAV file, loads the engine for the selected model, and verifies
+//! the transcription contains the expected JFK quote.
 //!
-//! Gate: `cargo run -p test-stt-ffi` prints **PASS** when the transcription
-//! contains the expected quote.
+//! Gate: `cargo run -p test-stt-ffi` prints **PASS** for the manifest's
+//! default model; `cargo run -p test-stt-ffi -- --model <id>` runs any other
+//! model the manifest declares.
 //!
 //! WAV loading (path resolution + PCM decode) is NOT reimplemented here —
 //! `vuho_stt_engine::test_support` (behind the `test-fixtures` feature, see
@@ -12,14 +13,27 @@
 //! lives (CONSTITUTION rule 26); this binary and
 //! `vuho-stt-engine/tests/batch_multiwindow.rs` both call it.
 
+use vuho_model_paths::Backend;
 use vuho_stt_engine::test_support::{jfk_wav_path, load_wav_16k_mono_f32};
-use vuho_stt_engine::{ParakeetEngine, TranscriptionEngine};
+use vuho_stt_engine::{CanaryEngine, ParakeetEngine, TranscriptionEngine};
 
-/// Sample rate the Parakeet-TDT engine expects (16 kHz mono).
+/// Sample rate every backend here expects (16 kHz mono).
 const STT_SAMPLE_RATE: u32 = 16_000;
+
+/// The quote jfk.wav contains — the gate's pass condition.
+const EXPECTED_QUOTE: &str = "ask not what your country can do for you";
 
 fn main() {
     env_logger::init();
+
+    let model_id = selected_model_id();
+    let model = vuho_model_paths::manifest()
+        .stt
+        .model(&model_id)
+        .unwrap_or_else(|| {
+            eprintln!("ERROR: unknown model id: {model_id}");
+            std::process::exit(1);
+        });
 
     let audio_path = jfk_wav_path().unwrap_or_else(|| {
         eprintln!(
@@ -30,14 +44,15 @@ fn main() {
 
     // The engine's own chokepoint resolves the model (and honors VUHO_MODEL_FOLDER),
     // so this gate exercises exactly the path the app takes.
-    let model_folder = vuho_stt_engine::resolve_model_folder().unwrap_or_else(|e| {
+    let model_folder = vuho_stt_engine::resolve_model_folder(&model_id).unwrap_or_else(|e| {
         eprintln!("ERROR: {e}");
         std::process::exit(1);
     });
 
-    println!("=== Vuho Parakeet-TDT STT Test ===");
+    println!("=== Vuho STT Test ===");
+    println!("Model: {} ({model_id})", model.display_name);
     println!("Audio: {}", audio_path.display());
-    println!("Model: {}", model_folder.display());
+    println!("Folder: {}", model_folder.display());
     println!();
 
     // ── Read WAV file ───────────────────────────────────────────────────
@@ -54,22 +69,33 @@ fn main() {
 
     // ── Initialize STT engine ───────────────────────────────────────────
     println!("Initializing engine and loading models...");
-    let engine = ParakeetEngine::load(model_folder).expect("engine load");
+    let engine: Box<dyn TranscriptionEngine> = match model.backend {
+        Backend::ParakeetTdt => {
+            Box::new(ParakeetEngine::load(&model_id, model_folder).expect("Parakeet engine load"))
+        }
+        Backend::CanaryAed => {
+            Box::new(CanaryEngine::load(&model_id, model_folder).expect("Canary engine load"))
+        }
+    };
     println!("Models loaded.");
     println!();
 
     // ── Transcribe ──────────────────────────────────────────────────────
     println!("Transcribing...");
+    let started = std::time::Instant::now();
     let result = engine.transcribe(&samples, Some("en")).expect("transcribe");
+    let elapsed = started.elapsed();
 
     println!("=== Transcription Result ===");
     println!("Language: {}", result.language);
+    println!("Transcribe wall clock: {elapsed:?}");
     println!("Segments: {}", result.segments.len());
-    for seg in &result.segments {
-        #[allow(clippy::cast_precision_loss)]
-        // display-only duration; ms timestamps never approach 2^52
-        let (start_s, end_s) = (seg.start_ms as f64 / 1000.0, seg.end_ms as f64 / 1000.0);
-        println!("  [{start_s:.2}s - {end_s:.2}s] {}", seg.text);
+    for (index, seg) in result.segments.iter().enumerate() {
+        println!(
+            "  {} {}",
+            segment_label(model.backend, seg, index),
+            seg.text
+        );
     }
     println!();
     println!("Full text: {}", result.full_text);
@@ -77,12 +103,11 @@ fn main() {
 
     // ── Verify ──────────────────────────────────────────────────────────
     let lower = result.full_text.to_lowercase();
-    let expected = "ask not what your country can do for you";
 
-    if lower.contains(expected) {
+    if lower.contains(EXPECTED_QUOTE) {
         println!("PASS: Transcription contains expected quote!");
     } else {
-        eprintln!("FAIL: Expected to find \"{expected}\" in transcription");
+        eprintln!("FAIL: Expected to find \"{EXPECTED_QUOTE}\" in transcription");
         eprintln!("Got: {}", result.full_text);
         std::process::exit(1);
     }
@@ -90,4 +115,35 @@ fn main() {
     // Clean up.
     engine.unload();
     println!("\n=== DONE ===");
+}
+
+/// `--model <id>`, defaulting to the manifest's own default model.
+fn selected_model_id() -> String {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    match args.as_slice() {
+        [] => vuho_model_paths::manifest().stt.default_model.clone(),
+        [flag, id] if flag == "--model" => id.clone(),
+        _ => {
+            eprintln!("ERROR: usage: test-stt-ffi [--model <model-id>]");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// A segment's diagnostic prefix.
+///
+/// A backend whose token positions are real encoder frames gets real
+/// timestamps; one whose positions are a fixed synthetic stride gets its
+/// segment index instead, so this printout never shows a plausible-looking
+/// time that means nothing (CONSTITUTION rule 2).
+fn segment_label(backend: Backend, seg: &vuho_domain::TranscriptSegment, index: usize) -> String {
+    match backend {
+        Backend::ParakeetTdt => {
+            #[allow(clippy::cast_precision_loss)]
+            // display-only duration; ms timestamps never approach 2^52
+            let (start_s, end_s) = (seg.start_ms as f64 / 1000.0, seg.end_ms as f64 / 1000.0);
+            format!("[{start_s:.2}s - {end_s:.2}s]")
+        }
+        Backend::CanaryAed => format!("[segment {index}]"),
+    }
 }

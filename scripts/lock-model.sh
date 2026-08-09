@@ -1,20 +1,24 @@
 #!/usr/bin/env bash
-# lock-model.sh — Generate models.lock.json: a per-file SHA-256 + size
-# manifest for the pinned STT model tree, cross-checked against the pinned
-# Hugging Face revision before anything is written.
+# lock-model.sh — Record one STT model's per-file SHA-256 + size into
+# models.lock.json, cross-checked against the pinned Hugging Face revision
+# before anything is written.
+#
+# The write is a read-modify-write keyed by model id: every other model's
+# entry in the lock is carried over untouched, so locking one model never
+# invalidates another's already-verified hashes.
 #
 # Usage:
-#   ./scripts/lock-model.sh
+#   ./scripts/lock-model.sh <model-id>
 #
 # Prerequisites:
 #   - The model must already be provisioned locally (./scripts/fetch-model.sh)
 #   - python3 (for JSON emission, hashing, and the Hugging Face API cross-check)
 #
-# The upstream repo, pinned revision, model dir name, and component list all
+# The upstream repo, pinned revision, model dir name, and asset list all
 # come from models.manifest.json (repo root) via scripts/manifest-lib.sh —
 # the single source of truth shared with the Rust build (vuho-model-paths)
-# and the other provisioning scripts. This script walks ONLY the paths
-# listed under the manifest's `components`, so any unmanifested directory
+# and the other provisioning scripts. This script walks ONLY the model's
+# manifested `assets`, so any unmanifested directory
 # sitting in the local checkout (e.g. Melspectrogram_15s.mlmodelc) is
 # skipped.
 #
@@ -42,6 +46,10 @@ LOCK_FILE="$ROOT_DIR/models.lock.json"
 # Timeout (seconds) for each Hugging Face tree-API request.
 readonly HF_API_TIMEOUT_SECS=30
 
+# Lock schema version this script emits — must match `vuho_model_paths::Lock`'s
+# `schema_version` assertion.
+readonly LOCK_SCHEMA_VERSION=2
+
 log() { printf "[lock-model] %s\n" "$*"; }
 die() { printf "[lock-model] ERROR: %s\n" "$*" >&2; exit 1; }
 
@@ -49,14 +57,18 @@ die() { printf "[lock-model] ERROR: %s\n" "$*" >&2; exit 1; }
 
 . "$SCRIPT_DIR/manifest-lib.sh"
 
-manifest_out=$(manifest_vars "$MANIFEST" '
-stt = manifest["stt"]
+MODEL_ID="${1:-}"
+[[ -n "$MODEL_ID" ]] || die "usage: $0 <model-id>"
 
-emit("STT_REPO", stt["repo"])
-emit("STT_REV", stt["revision"])
-emit("STT_DIR_NAME", stt["dir_name"])
-emit_array("STT_COMPONENTS", stt["components"])
-') || die "failed to read $MANIFEST (see traceback above)"
+manifest_out=$(manifest_vars "$MANIFEST" "
+model = manifest['stt']['models'].get('$MODEL_ID')
+if model is None:
+    raise SystemExit('unknown model id: $MODEL_ID (known: ' + ', '.join(sorted(manifest['stt']['models'])) + ')')
+emit('STT_REPO', model['repo'])
+emit('STT_REV', model['revision'])
+emit('STT_DIR_NAME', model['dir_name'])
+emit_array('STT_COMPONENTS', sorted(model['assets'].values()))
+") || die "failed to read $MANIFEST (see traceback above)"
 eval "$manifest_out"
 
 MODEL_DIR="$MODELS_DIR/$STT_DIR_NAME"
@@ -66,20 +78,21 @@ if [[ ! -d "$MODEL_DIR" ]]; then
     exit 1
 fi
 
-log "Locking $STT_REPO@$STT_REV from $MODEL_DIR"
+log "Locking $MODEL_ID ($STT_REPO@$STT_REV) from $MODEL_DIR"
 
 # ── Walk local components, hash, cross-check against HF, emit the lock ──
 
-python3 - "$STT_REPO" "$STT_REV" "$STT_DIR_NAME" "$MODEL_DIR" "$LOCK_FILE" "$HF_API_TIMEOUT_SECS" "${STT_COMPONENTS[@]}" <<'PY'
+python3 - "$MODEL_ID" "$STT_REPO" "$STT_REV" "$STT_DIR_NAME" "$MODEL_DIR" "$LOCK_FILE" "$HF_API_TIMEOUT_SECS" "$LOCK_SCHEMA_VERSION" "${STT_COMPONENTS[@]}" <<'PY'
 import hashlib
 import json
 import sys
 import urllib.error
 import urllib.request
 
-repo, rev, dir_name, model_dir, lock_file, timeout_str = sys.argv[1:7]
-components = sys.argv[7:]
+model_id, repo, rev, dir_name, model_dir, lock_file, timeout_str, schema_version_str = sys.argv[1:9]
+components = sys.argv[9:]
 timeout = float(timeout_str)
+schema_version = int(schema_version_str)
 
 
 def fail(message: str) -> None:
@@ -212,7 +225,7 @@ print(
     "into the lock)."
 )
 
-# ── 4. Emit the lock, sorted by path for a deterministic diff ───────────
+# ── 4. Merge this model into the lock, sorted by path for a stable diff ──
 
 files = [
     {"path": path, "size": sizes[path], "sha256": hashes[path]}
@@ -220,21 +233,35 @@ files = [
 ]
 total_bytes = sum(f["size"] for f in files)
 
-lock = {
-    "schema_version": 1,
-    "stt": {
-        "dir_name": dir_name,
-        "revision": rev,
-        "total_bytes": total_bytes,
-        "files": files,
-    },
+try:
+    with open(lock_file, encoding="utf-8") as f:
+        lock = json.load(f)
+except FileNotFoundError:
+    lock = {"schema_version": schema_version, "models": {}}
+
+if lock.get("schema_version") != schema_version:
+    fail(
+        f"{lock_file} has schema_version {lock.get('schema_version')}, "
+        f"this script writes {schema_version} — migrate it before re-locking, "
+        "rather than silently mixing two shapes in one file"
+    )
+
+lock["models"][model_id] = {
+    "dir_name": dir_name,
+    "revision": rev,
+    "total_bytes": total_bytes,
+    "files": files,
 }
+lock["models"] = dict(sorted(lock["models"].items()))
 
 with open(lock_file, "w", encoding="utf-8") as f:
     json.dump(lock, f, indent=2, sort_keys=False)
     f.write("\n")
 
-print(f"[lock-model] wrote {lock_file}: {len(files)} files, {total_bytes} bytes")
+print(
+    f"[lock-model] wrote {lock_file}: {model_id} = {len(files)} files, {total_bytes} bytes "
+    f"({len(lock['models'])} models locked)"
+)
 PY
 
 log "Done."

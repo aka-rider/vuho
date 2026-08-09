@@ -101,6 +101,12 @@ pub struct Settings {
     /// longer resolves (e.g. the device was unplugged).
     #[serde(default)]
     pub microphone: Option<String>,
+    /// The selected speech model's id, or `None` for the manifest's default
+    /// model. Deliberately an `Option<String>` rather than a defaulted
+    /// `String`: it keeps this crate serde-only (no `vuho-model-paths`
+    /// dependency) and keeps model-id literals out of it (ADR-019).
+    #[serde(default)]
+    pub speech_model: Option<String>,
 }
 
 /// `#[serde(default = ...)]` target for [`Settings::version`]: a document
@@ -116,6 +122,7 @@ impl Default for Settings {
             version: CURRENT_SETTINGS_VERSION,
             hotkey: HotkeySetting::default(),
             microphone: None,
+            speech_model: None,
         }
     }
 }
@@ -583,6 +590,44 @@ mod tests {
         assert_eq!(settings.hotkey, HotkeySetting::OptionSpace);
         assert_eq!(settings.microphone.as_deref(), Some("Test Mic"));
         assert_eq!(settings.version, CURRENT_SETTINGS_VERSION);
+    }
+
+    #[test]
+    fn file_written_before_speech_model_existed_loads_without_warning() {
+        // Falsification target: adding `speech_model` without
+        // `#[serde(default)]`, or bumping `CURRENT_SETTINGS_VERSION`, would
+        // discard this user's hotkey and microphone and raise a warning.
+        let path = temp_settings_path("pre-speech-model");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(
+            &path,
+            br#"{"version":1,"hotkey":"caps_lock","microphone":null}"#,
+        )
+        .unwrap();
+
+        let store = SettingsStore::load_from(path);
+        let settings = store.get();
+        assert_eq!(settings.speech_model, None);
+        assert_eq!(settings.hotkey, HotkeySetting::CapsLock);
+        assert_eq!(store.load_warning(), None);
+    }
+
+    #[test]
+    fn speech_model_round_trips_through_save_and_load() {
+        let path = temp_settings_path("speech-model-roundtrip");
+        let store = SettingsStore::load_from(path.clone());
+
+        // The id is opaque to this crate, and naming a real model here would
+        // reintroduce the model-id literal ADR-019 keeps out of it.
+        store
+            .update(|s| s.speech_model = Some("some-model-id".to_string()))
+            .unwrap();
+
+        let reloaded = SettingsStore::load_from(path);
+        assert_eq!(
+            reloaded.get().speech_model.as_deref(),
+            Some("some-model-id")
+        );
     }
 
     #[test]

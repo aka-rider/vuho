@@ -5,7 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
-description = "Batch STT regression gate: transcribe jfk.wav via ParakeetEngine, print PASS"
+description = "Batch STT regression gate: transcribe jfk.wav via the selected backend, print PASS"
 
 [[bin]]
 name = "test-stt-ffi"
@@ -14,6 +14,8 @@ path = "src/main.rs"
 [dependencies]
 env_logger = { workspace = true }
 vuho-stt-engine = { workspace = true, features = ["test-fixtures"] }
+vuho-model-paths = { workspace = true }
+vuho-domain = { workspace = true }
 
 [lints]
 workspace = true

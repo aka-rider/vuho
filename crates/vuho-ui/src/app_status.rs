@@ -55,6 +55,13 @@ pub(crate) struct StatusModel {
     /// — the permission-gate startup path, which never reaches model
     /// provisioning — stays `None` for the whole process lifetime).
     pub model: Option<ModelStatus>,
+    /// Every model the manifest knows, as last reported by the provisioning
+    /// thread (`UiCommand::ModelList`) — the Settings tab's model list and
+    /// combobox render from this alone. Empty until that first report, and
+    /// for the whole process lifetime in gate mode. Deliberately absent
+    /// from [`StatusModel::composite`]: the tray reports the *selected*
+    /// model only, which is what [`StatusModel::model`] already carries.
+    pub models: Vec<vuho_model_fetch::ModelAvailability>,
     /// Initial value: [`EngineState::Loading`] — warmup starts immediately
     /// and unconditionally.
     pub engine: EngineState,
@@ -307,6 +314,7 @@ mod tests {
     fn base_model() -> StatusModel {
         StatusModel {
             model: Some(ModelStatus::Ready),
+            models: Vec::new(),
             engine: EngineState::Ready,
             recording: false,
             hotkey: HotkeyState::Active(HotkeySetting::CapsLock),

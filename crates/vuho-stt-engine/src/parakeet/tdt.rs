@@ -7,6 +7,7 @@
 //! Pure module: no `CoreML` dependency — the `StepModel` trait is the
 //! seam for injecting a real `CoreML` impl or a test fake.
 
+use crate::token::TokenAt;
 use crate::EngineError;
 
 use super::decoder_state::DecoderState;
@@ -17,31 +18,8 @@ pub(crate) const BLANK: u32 = 8192;
 const MAX_SYMBOLS_PER_FRAME: usize = 10;
 /// Maximum tokens emitted per 15s window (degenerate-chunk guard).
 const MAX_TOKENS_PER_WINDOW: usize = 150;
-/// Duration of one encoder frame in milliseconds (1280 samples @ 16kHz = 80ms).
-pub(crate) const FRAME_MS: usize = 80;
 /// Encoder feature dimension.
 const ENCODER_DIM: usize = 1024;
-
-/// Convert a global encoder frame index to milliseconds.
-///
-/// The one place this conversion happens (CONSTITUTION rule 26) — both the
-/// batch window loop (`engine.rs`) and the streaming accumulator
-/// (`stream::accumulator`) call this rather than keeping their own copies.
-pub(crate) fn frame_ms(frame: usize) -> u64 {
-    (frame * FRAME_MS) as u64
-}
-
-/// A token emitted during decoding, with its global frame index.
-///
-/// `pub` (not `pub(crate)`): re-exported by `bench_support` for
-/// `benches/hot_paths.rs` — fields stay `pub(crate)`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TokenAt {
-    /// Token id in the vocabulary.
-    pub(crate) id: u32,
-    /// Global encoder frame index (includes window offset).
-    pub(crate) frame: usize,
-}
 
 /// Trait for the decoder + joint models used by the TDT greedy loop.
 ///
@@ -157,7 +135,7 @@ pub fn tdt_greedy(
         } else {
             emitted.push(TokenAt {
                 id: tok,
-                frame: t + global_frame_offset,
+                pos: t + global_frame_offset,
             });
             #[allow(clippy::cast_possible_wrap)]
             let tok_i32 = tok as i32;
@@ -293,9 +271,9 @@ mod tests {
 
         // Token 1 emitted at frames 0, 2, 4, 6, 8 → 5 times.
         assert_eq!(emitted.len(), 5);
-        assert_eq!(emitted[0].frame, 0);
-        assert_eq!(emitted[1].frame, 2);
-        assert_eq!(emitted[4].frame, 8);
+        assert_eq!(emitted[0].pos, 0);
+        assert_eq!(emitted[1].pos, 2);
+        assert_eq!(emitted[4].pos, 8);
         assert_eq!(next_t, enc_len);
     }
 
@@ -323,7 +301,7 @@ mod tests {
         // Each frame: emit token 1 ten times (cap), then t+1 → 10 frames × 10 = 100.
         assert_eq!(emitted.len(), 100);
         for (i, tok) in emitted.iter().enumerate() {
-            assert_eq!(tok.frame, i / 10);
+            assert_eq!(tok.pos, i / 10);
         }
         assert_eq!(next_t, enc_len);
     }
@@ -351,7 +329,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(emitted.len(), 1);
-        assert_eq!(emitted[0].frame, 42); // 0 + 42
+        assert_eq!(emitted[0].pos, 42); // 0 + 42
     }
 
     /// Token cap 150 breaks the loop.

@@ -1,4 +1,4 @@
-//! Parakeet-TDT vocabulary loader and detokenizer.
+//! Vocabulary loader and detokenizer, shared by every backend.
 //!
 //! Loads the JSON vocabulary file (token id → token string) and applies
 //! detokenization rules ported from `parakeet-rs`'s `decoder_tdt.rs`:
@@ -10,13 +10,12 @@
 use std::collections::HashMap;
 use std::path::Path;
 
+use crate::token::TokenAt;
 use crate::EngineError;
 
-use super::tdt::{TokenAt, BLANK};
-
 /// Vocabulary: indexed by token id. `None` at an id means "no token with
-/// this id in the JSON file" (a gap, or the blank id `8192`, which the
-/// vocabulary file deliberately omits).
+/// this id in the JSON file" (a gap, or a backend's reserved id that the
+/// file deliberately omits — see [`Vocab::load`]'s `reserved_id`).
 #[derive(Debug, Clone)]
 pub(crate) struct Vocab {
     /// Token string for each id.
@@ -31,25 +30,30 @@ impl Vocab {
     /// The JSON maps token ids (as strings) to token strings, e.g.
     /// `{"0":"<unk>","1":"<|nospeech|>","2":"▁hello",...}`.
     ///
+    /// `reserved_id` is an id the backend's decoder can emit but the
+    /// vocabulary file omits (Parakeet-TDT's blank); the table is sized to
+    /// cover it so [`Self::detokenize`] skips it instead of panicking. A
+    /// backend whose file already covers every emittable id passes `None`
+    /// — this is why the sizing rule is a parameter rather than a reach
+    /// into one backend's constant.
+    ///
     /// # Errors
     ///
     /// Returns `EngineError::LoadFailed` if the file cannot be read or parsed.
-    pub(crate) fn load(path: &Path) -> Result<Self, EngineError> {
+    pub(crate) fn load(path: &Path, reserved_id: Option<u32>) -> Result<Self, EngineError> {
         let data = std::fs::read_to_string(path).map_err(|e| {
             EngineError::LoadFailed(format!("failed to read vocab {}: {e}", path.display()))
         })?;
         let map: HashMap<String, String> = serde_json::from_str(&data)
             .map_err(|e| EngineError::LoadFailed(format!("failed to parse vocab JSON: {e}")))?;
 
-        // Size the vector to cover every id present, plus the blank id (the
-        // file omits it, but callers pass BLANK as a TokenAt id during
-        // decode and detokenize() must handle it without panicking).
+        let reserved = reserved_id.unwrap_or(0);
         let max_id = map
             .keys()
             .filter_map(|k| k.parse::<u32>().ok())
             .max()
-            .unwrap_or(BLANK);
-        let len = (max_id.max(BLANK) + 1) as usize;
+            .unwrap_or(reserved);
+        let len = (max_id.max(reserved) + 1) as usize;
 
         let mut tokens = vec![None; len];
         for (id_str, token) in &map {
@@ -184,7 +188,8 @@ fn flush_byte_buf(out: &mut String, byte_buf: &mut Vec<u8>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::parakeet::tdt::TokenAt;
+    use crate::parakeet::tdt::BLANK;
+    use crate::token::TokenAt;
 
     fn make_vocab(pieces: &[Option<&str>]) -> Vocab {
         let tokens: Vec<Option<String>> = pieces.iter().map(|p| p.map(str::to_string)).collect();
@@ -196,7 +201,7 @@ mod tests {
     }
 
     fn tok(id: u32) -> TokenAt {
-        TokenAt { id, frame: 0 }
+        TokenAt { id, pos: 0 }
     }
 
     /// Round-trip: a hand-built vocab with ▁ boundaries, special tokens, and a multi-piece word.
@@ -228,13 +233,7 @@ mod tests {
         let mut pieces = vec![None; 8193];
         pieces[0] = Some("▁hello");
         let vocab = make_vocab(&pieces);
-        let tokens = vec![
-            TokenAt {
-                id: BLANK,
-                frame: 0,
-            },
-            tok(0),
-        ];
+        let tokens = vec![TokenAt { id: BLANK, pos: 0 }, tok(0)];
         assert_eq!(vocab.detokenize(&tokens), "hello");
     }
 
@@ -285,7 +284,7 @@ mod tests {
     #[test]
     fn detokenize_skips_unknown_id() {
         let vocab = make_vocab(&[Some("▁hi")]);
-        let tokens = vec![TokenAt { id: 99, frame: 0 }, tok(0)];
+        let tokens = vec![TokenAt { id: 99, pos: 0 }, tok(0)];
         assert_eq!(vocab.detokenize(&tokens), "hi");
     }
 

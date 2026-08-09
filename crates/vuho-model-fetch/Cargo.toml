@@ -5,11 +5,12 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
-description = "The only crate in the workspace permitted to perform network I/O: downloads and verifies the Parakeet-TDT model into the user-data directory (ADR-020)"
+description = "The only crate in the workspace permitted to perform network I/O: downloads, verifies, and deletes STT models in the user-data directory (ADR-020)"
 
 [dependencies]
 vuho-model-paths = { workspace = true }
 vuho-domain = { workspace = true }
+objc2-foundation = { workspace = true, features = ["NSProcessInfo"] }
 crossbeam-channel = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }

@@ -22,8 +22,10 @@ use vuho_stt_engine::{ParakeetEngine, TranscriptionEngine};
 #[ignore = "requires microphone + signed binary with NSMicrophoneUsageDescription; run manually with -- --ignored"]
 #[test]
 fn streaming_smoke() {
+    let model_id = vuho_model_paths::manifest().stt.default_model.as_str();
     let engine = ParakeetEngine::load(
-        vuho_stt_engine::resolve_model_folder().expect("resolve model folder"),
+        model_id,
+        vuho_stt_engine::resolve_model_folder(model_id).expect("resolve model folder"),
     )
     .expect("engine load");
 
@@ -60,8 +62,10 @@ fn streaming_smoke() {
 #[ignore = "requires microphone + signed binary with NSMicrophoneUsageDescription; run manually with -- --ignored"]
 #[test]
 fn double_start_stream_returns_stream_already_active() {
+    let model_id = vuho_model_paths::manifest().stt.default_model.as_str();
     let engine = ParakeetEngine::load(
-        vuho_stt_engine::resolve_model_folder().expect("resolve model folder"),
+        model_id,
+        vuho_stt_engine::resolve_model_folder(model_id).expect("resolve model folder"),
     )
     .expect("engine load");
 

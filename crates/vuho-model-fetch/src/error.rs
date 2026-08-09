@@ -26,6 +26,27 @@ pub enum FetchError {
     #[error("model directory I/O error: {0}")]
     Io(#[from] std::io::Error),
 
+    /// The model directory name — usually a `VUHO_MODEL_NAME` override — is
+    /// not a single plain directory name, so joining it onto
+    /// [`vuho_model_paths::user_models_dir`] would not stay inside that
+    /// directory. Refused before any download or removal touches the disk.
+    #[error("{0}")]
+    InvalidDirName(#[from] vuho_model_paths::InvalidDirName),
+
+    /// The requested model id is absent from the embedded manifest or the
+    /// embedded lock, so there is nothing to fetch and no hashes to verify
+    /// what was fetched against.
+    #[error("unknown model id: {0}")]
+    UnknownModel(String),
+
+    /// The model resolved to a tree Vuho did not download — the `.app`
+    /// bundle, the workspace `models/` dev tree, or a `VUHO_MODEL_FOLDER`
+    /// override — or to a path outside
+    /// [`vuho_model_paths::user_models_dir`] entirely. ADR-020: Vuho owns,
+    /// and therefore removes, only bytes it fetched itself.
+    #[error("{0}")]
+    NotDeletable(String),
+
     /// The downloaded `.partial` tree did not match `models.lock.json`
     /// after a full (hashing) verification pass: a missing file, a size
     /// mismatch, or a SHA-256 mismatch. The message names the offending

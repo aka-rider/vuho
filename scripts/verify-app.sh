@@ -2,13 +2,14 @@
 # verify-app.sh — Verify Vuho.app bundle and provisioned model.
 #
 # Checks:
-#   1. Model layout: required Parakeet model components in models/ (skipped
+#   1. Model layout: every VUHO_BUNDLE_MODELS model's components in models/ (skipped
 #      when VUHO_BUNDLE_MODEL=0 — a model-less bundle has no workspace model
 #      dependency)
 #   2. Bundle exists: Vuho.app binary is executable
 #   3. Code signature: codesign --verify --deep --strict passes
 #   4. No third-party dylibs: all dependencies are system libraries
-#   5. Bundled model: model is present in app Contents/Resources/ (skipped
+#   5. Bundled model: every VUHO_BUNDLE_MODELS model is present in app
+#      Contents/Resources/ (skipped
 #      when VUHO_BUNDLE_MODEL=0 — the app fetches it on first run instead)
 #   6. Attribution: ATTRIBUTION.txt file is present (warn-only)
 #   7. Info.plist: plutil -lint passes, NSMicrophoneUsageDescription present,
@@ -30,7 +31,7 @@ set -euo pipefail
 
 # ── Configuration ───────────────────────────────────────────────────────
 #
-# The model directory name and required-component list come from
+# The model directory names and required-component lists come from
 # models.manifest.json (repo root) — the single source of truth shared with
 # the Rust build (vuho-model-paths) and the other 3 scripts.
 
@@ -45,12 +46,24 @@ VUHO_BUNDLE_MODEL="${VUHO_BUNDLE_MODEL:-1}"
 die() { echo "ERROR: $*" >&2; exit 1; }
 
 manifest_out=$(manifest_vars "$MANIFEST" '
-emit("MODEL_NAME", manifest["stt"]["dir_name"])
-emit_array("REQUIRED_COMPONENTS", manifest["stt"]["components"])
+emit("DEFAULT_MODEL", manifest["stt"]["default_model"])
 ') || die "failed to read $MANIFEST (see traceback above)"
 eval "$manifest_out"
 
-MODEL_DIR="$ROOT_DIR/models/$MODEL_NAME"
+# Which models the bundle is expected to embed — the same list, with the
+# same default, bundle-macos.sh copied in.
+VUHO_BUNDLE_MODELS="${VUHO_BUNDLE_MODELS:-$DEFAULT_MODEL}"
+
+# model_vars <model-id> — emits MODEL_NAME + REQUIRED_COMPONENTS for one model.
+model_vars() {
+    manifest_vars "$MANIFEST" "
+model = manifest['stt']['models'].get('$1')
+if model is None:
+    raise SystemExit('unknown model id: $1')
+emit('MODEL_NAME', model['dir_name'])
+emit_array('REQUIRED_COMPONENTS', sorted(model['assets'].values()))
+"
+}
 
 fail_count=0
 
@@ -63,12 +76,16 @@ warn() { echo "[warn] $*"; }
 # ── Check 1: Model layout ────────────────────────────────────────────
 
 if [[ "$VUHO_BUNDLE_MODEL" == "1" ]]; then
-    for comp in "${REQUIRED_COMPONENTS[@]:-}"; do
-        if [[ -e "$MODEL_DIR/$comp" ]]; then
-            pass "Model component: $comp"
-        else
-            fail "Model component missing: $comp"
-        fi
+    for model_id in $VUHO_BUNDLE_MODELS; do
+        vars=$(model_vars "$model_id") || die "failed to read model $model_id from $MANIFEST"
+        eval "$vars"
+        for comp in "${REQUIRED_COMPONENTS[@]:-}"; do
+            if [[ -e "$ROOT_DIR/models/$MODEL_NAME/$comp" ]]; then
+                pass "Model component: $MODEL_NAME/$comp"
+            else
+                fail "Model component missing: $MODEL_NAME/$comp"
+            fi
+        done
     done
 else
     warn "Skipping workspace model-layout check (VUHO_BUNDLE_MODEL=0)"
@@ -117,22 +134,24 @@ fi
 
 # ── Check 5: Bundled model ───────────────────────────────────────────
 
-bundled_model="$APP/Contents/Resources/$MODEL_NAME"
-if [[ "$VUHO_BUNDLE_MODEL" == "1" ]]; then
-    for comp in "${REQUIRED_COMPONENTS[@]:-}"; do
-        if [[ -e "$bundled_model/$comp" ]]; then
-            pass "Bundled model component: $comp"
-        else
-            fail "Bundled model component missing: $comp"
-        fi
-    done
-else
-    if [[ -e "$bundled_model" ]]; then
+for model_id in $VUHO_BUNDLE_MODELS; do
+    vars=$(model_vars "$model_id") || die "failed to read model $model_id from $MANIFEST"
+    eval "$vars"
+    bundled_model="$APP/Contents/Resources/$MODEL_NAME"
+    if [[ "$VUHO_BUNDLE_MODEL" == "1" ]]; then
+        for comp in "${REQUIRED_COMPONENTS[@]:-}"; do
+            if [[ -e "$bundled_model/$comp" ]]; then
+                pass "Bundled model component: $MODEL_NAME/$comp"
+            else
+                fail "Bundled model component missing: $MODEL_NAME/$comp"
+            fi
+        done
+    elif [[ -e "$bundled_model" ]]; then
         fail "Model-less bundle (VUHO_BUNDLE_MODEL=0) unexpectedly contains $bundled_model"
     else
         pass "Model-less bundle correctly omits $MODEL_NAME"
     fi
-fi
+done
 
 # ── Check 6: Attribution ─────────────────────────────────────────────
 

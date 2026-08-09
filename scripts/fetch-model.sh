@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
-# fetch-model.sh — Download the parakeet TDT + Silero VAD models.
+# fetch-model.sh — Download the manifest's STT models + Silero VAD.
 #
 # Idempotent: safe to re-run. A file that is already present *and verified
 # complete* is skipped; a missing, truncated, or corrupt file is (re)fetched
 # — see "Resumability" below for how that's made true rather than aspirational.
 #
 # Usage:
-#   ./scripts/fetch-model.sh          # download everything
-#   ./scripts/fetch-model.sh parakeet # download only the parakeet model
-#   ./scripts/fetch-model.sh silero   # download only Silero VAD
+#   ./scripts/fetch-model.sh                     # download everything
+#   ./scripts/fetch-model.sh parakeet-tdt-0.6b-v3  # one STT model, by id
+#   ./scripts/fetch-model.sh silero              # download only Silero VAD
 #
 # Prerequisites:
 #   - `huggingface-cli` (from `pip install huggingface_hub`) — preferred
@@ -22,7 +22,7 @@
 # `jfk.wav` (the `test-stt-ffi` regression fixture) is tracked directly in
 # git, not fetched here — it has no canonical upstream source to pin.
 #
-# After fetching the parakeet model, the resulting tree is cross-checked
+# After fetching an STT model, the resulting tree is cross-checked
 # against `models.lock.json` (repo root, produced by `scripts/lock-model.sh`)
 # — every locked file must be present at its locked size *and* sha256, or
 # the script fails loudly naming exactly what's missing/mismatched. This
@@ -45,7 +45,7 @@
 # `.tmp-*` directories under models/ either.
 #
 # Hashing cost: the completeness check reads and SHA-256-hashes the full
-# ~474 MB parakeet tree every run (~1-2s on this machine) — deliberate, not
+# fetched STT tree every run (~1-2s on this machine) — deliberate, not
 # an oversight. A size-only check passes same-length corruption; this
 # script exists specifically to catch corruption the naive check missed.
 # Set VUHO_SKIP_HASH_VERIFY=1 to fall back to the cheaper size-only check
@@ -81,13 +81,9 @@ trap cleanup EXIT
 . "$SCRIPT_DIR/manifest-lib.sh"
 
 manifest_out=$(manifest_vars "$MANIFEST" '
-stt = manifest["stt"]
 silero = manifest["silero"]
 
-emit("PARAKEET_REPO", stt["repo"])
-emit("PARAKEET_REV", stt["revision"])
-emit("PARAKEET_DIR_NAME", stt["dir_name"])
-emit_array("PARAKEET_COMPONENTS", stt["components"])
+emit_array("STT_MODEL_IDS", sorted(manifest["stt"]["models"]))
 
 emit("SILERO_REPO", silero["repo"])
 emit("SILERO_REV", silero["revision"])
@@ -96,8 +92,20 @@ emit_array("SILERO_COMPONENTS", silero["components"])
 ') || die "failed to read $MANIFEST (see traceback above)"
 eval "$manifest_out"
 
-PARAKEET_DIR="$MODELS_DIR/$PARAKEET_DIR_NAME"
 SILERO_DIR="$MODELS_DIR/$SILERO_DIR_NAME"
+
+# stt_model_vars <model-id> — emits STT_REPO/STT_REV/STT_DIR_NAME/STT_COMPONENTS.
+stt_model_vars() {
+    manifest_vars "$MANIFEST" "
+model = manifest['stt']['models'].get('$1')
+if model is None:
+    raise SystemExit('unknown model id: $1')
+emit('STT_REPO', model['repo'])
+emit('STT_REV', model['revision'])
+emit('STT_DIR_NAME', model['dir_name'])
+emit_array('STT_COMPONENTS', sorted(model['assets'].values()))
+"
+}
 
 # Try huggingface-cli first, fall back to curl — including when the CLI is
 # *present but fails* (offline, HF 401/429, disk full): both stdout and
@@ -214,28 +222,34 @@ fetch_dir_recursive() {
     done <<< "$files"
 }
 
-# ── Parakeet model ────────────────────────────────────────────────────
+# ── STT models ────────────────────────────────────────────────────────
 
-fetch_parakeet() {
-    log "Downloading parakeet TDT v3 model from $PARAKEET_REPO@$PARAKEET_REV"
-    mkdir -p "$PARAKEET_DIR"
+# fetch_stt_model <model-id>
+fetch_stt_model() {
+    local model_id="$1" vars stt_dir
+    vars=$(stt_model_vars "$model_id") || die "failed to read model $model_id from $MANIFEST"
+    eval "$vars"
+    stt_dir="$MODELS_DIR/$STT_DIR_NAME"
 
-    for comp in "${PARAKEET_COMPONENTS[@]:-}"; do
+    log "Downloading $model_id from $STT_REPO@$STT_REV"
+    mkdir -p "$stt_dir"
+
+    for comp in "${STT_COMPONENTS[@]:-}"; do
         if [[ "$comp" == *.mlmodelc ]]; then
             # .mlmodelc is a directory, recursively populated (weights/,
             # analytics/) — walk and fetch it via the HF tree API.
-            fetch_dir_recursive "$PARAKEET_REPO" "$PARAKEET_REV" "$comp" "$PARAKEET_DIR"
+            fetch_dir_recursive "$STT_REPO" "$STT_REV" "$comp" "$stt_dir"
         else
-            # Regular file (vocab.json)
-            download_file "$PARAKEET_REPO" "$PARAKEET_REV" "$comp" "$PARAKEET_DIR/$comp"
+            # Regular file (the vocabulary JSON)
+            download_file "$STT_REPO" "$STT_REV" "$comp" "$stt_dir/$comp"
         fi
     done
 
-    log "Parakeet model ready: $PARAKEET_DIR"
-    assert_parakeet_complete
+    log "Model ready: $stt_dir"
+    assert_stt_model_complete "$model_id" "$stt_dir"
 }
 
-# Cross-check the fetched parakeet tree against models.lock.json: every
+# Cross-check a fetched STT tree against models.lock.json: every
 # locked file must be present locally at its locked size and (unless
 # VUHO_SKIP_HASH_VERIFY=1) sha256. This is the safety net for the bug
 # documented at the top of this file — a script bug (or a future upstream
@@ -243,18 +257,22 @@ fetch_parakeet() {
 # instead of shipping a model that loads but produces wrong or crashing
 # inference. models.lock.json ships in the repo, so its absence is a hard
 # failure — never a silently-skipped warning.
-assert_parakeet_complete() {
+# assert_stt_model_complete <model-id> <model-dir>
+assert_stt_model_complete() {
+    local model_id="$1" stt_dir="$2"
     if [[ ! -f "$LOCK_FILE" ]]; then
         die "$LOCK_FILE not found — it ships in the repo; a missing lock means this checkout is broken, not that verification is optional. Restore it (git checkout $LOCK_FILE) or regenerate it (./scripts/lock-model.sh) before trusting the fetched model."
     fi
 
     local lock_out
-    lock_out=$(manifest_vars "$LOCK_FILE" '
-stt = manifest["stt"]
-emit_array("LOCK_PATHS", [f["path"] for f in stt["files"]])
-emit_array("LOCK_SIZES", [str(f["size"]) for f in stt["files"]])
-emit_array("LOCK_SHA256S", [f["sha256"] for f in stt["files"]])
-') || die "failed to read $LOCK_FILE (see traceback above)"
+    lock_out=$(manifest_vars "$LOCK_FILE" "
+locked = manifest['models'].get('$model_id')
+if locked is None:
+    raise SystemExit('$model_id is not in the lock — run ./scripts/lock-model.sh $model_id')
+emit_array('LOCK_PATHS', [f['path'] for f in locked['files']])
+emit_array('LOCK_SIZES', [str(f['size']) for f in locked['files']])
+emit_array('LOCK_SHA256S', [f['sha256'] for f in locked['files']])
+") || die "failed to read $LOCK_FILE (see traceback above)"
     eval "$lock_out"
 
     local missing=() mismatched=()
@@ -262,7 +280,7 @@ emit_array("LOCK_SHA256S", [f["sha256"] for f in stt["files"]])
     for ((i = 0; i < ${#LOCK_PATHS[@]}; i++)); do
         path="${LOCK_PATHS[$i]}"
         expected_size="${LOCK_SIZES[$i]}"
-        dest="$PARAKEET_DIR/$path"
+        dest="$stt_dir/$path"
         if [[ ! -f "$dest" ]]; then
             missing+=("$path")
             continue
@@ -282,7 +300,7 @@ emit_array("LOCK_SHA256S", [f["sha256"] for f in stt["files"]])
     done
 
     if (( ${#missing[@]} > 0 || ${#mismatched[@]} > 0 )); then
-        log "ERROR: parakeet model tree is INCOMPLETE against $LOCK_FILE"
+        log "ERROR: $model_id tree is INCOMPLETE against $LOCK_FILE"
         for path in "${missing[@]:-}"; do
             [[ -z "$path" ]] && continue
             log "  MISSING        $path"
@@ -317,8 +335,8 @@ fetch_silero() {
     assert_silero_complete
 }
 
-# Silero has no per-file lock (models.lock.json only covers the parakeet
-# tree — a single small ONNX file doesn't warrant one), so this can only
+# Silero has no per-file lock (models.lock.json only covers the STT
+# models — a single small ONNX file doesn't warrant one), so this can only
 # assert existence and non-zero size, not a hash. That is still strictly
 # better than the prior no-check-at-all: download_file()'s scratch-then-
 # rename means a file present at all is at least a *complete* transfer, so
@@ -347,18 +365,27 @@ assert_silero_complete() {
 # ── Main ──────────────────────────────────────────────────────────────
 
 main() {
-    local want_parakeet=1
-    local want_silero=1
+    local target="${1:-all}"
+    local usage
+    usage="Usage: $0 [all|$(IFS='|'; echo "${STT_MODEL_IDS[*]}")|silero]"
 
-    case "${1:-all}" in
-        parakeet) want_parakeet=1; want_silero=0 ;;
-        silero)   want_parakeet=0; want_silero=1 ;;
-        all)      ;;
-        *)        echo "Usage: $0 [all|parakeet|silero]"; exit 1 ;;
+    case "$target" in
+        all)
+            for model_id in "${STT_MODEL_IDS[@]:-}"; do fetch_stt_model "$model_id"; done
+            fetch_silero
+            ;;
+        silero)
+            fetch_silero
+            ;;
+        *)
+            local known=0
+            for model_id in "${STT_MODEL_IDS[@]:-}"; do
+                [[ "$model_id" == "$target" ]] && known=1
+            done
+            (( known )) || die "unknown target: $target. $usage"
+            fetch_stt_model "$target"
+            ;;
     esac
-
-    if (( want_parakeet )); then fetch_parakeet; fi
-    if (( want_silero ));   then fetch_silero;   fi
 
     log "Done."
 }

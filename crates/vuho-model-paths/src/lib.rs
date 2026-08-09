@@ -28,9 +28,11 @@
 //! Std-only: no macOS-specific dependencies, so this crate builds on any
 //! host — only its callers are macOS-only.
 
+use std::collections::BTreeMap;
+use std::ffi::OsStr;
 use std::fmt::Write as _;
 use std::io::Write as _;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
 
@@ -47,7 +49,7 @@ const LOCK_JSON: &str = include_str!("../../../models.lock.json");
 pub struct Manifest {
     /// macOS bundle identifier (`CFBundleIdentifier`), e.g. `tech.iurii.vuho`.
     pub bundle_id: String,
-    /// The Parakeet-TDT STT model.
+    /// Every selectable STT model, keyed by model id.
     pub stt: SttManifest,
     /// Silero VAD provisioning metadata (fetched for a future direct-`ort`
     /// swap; the app's actual VAD path uses `voice_activity_detector`'s
@@ -56,22 +58,114 @@ pub struct Manifest {
     pub silero: SileroManifest,
 }
 
-/// The Parakeet-TDT STT model's manifest entry.
+/// Every selectable STT model, plus the env vars that override where the
+/// selected one is resolved from.
 #[derive(Debug, serde::Deserialize)]
 pub struct SttManifest {
+    /// Id of the model used when the user has expressed no preference.
+    pub default_model: String,
+    /// Env var that overrides the full resolved folder path.
+    pub env_folder: String,
+    /// Env var that overrides just `dir_name`.
+    pub env_name: String,
+    /// Every known STT model, keyed by model id.
+    pub models: BTreeMap<String, SttModel>,
+}
+
+/// One STT model's manifest entry.
+#[derive(Debug, serde::Deserialize)]
+pub struct SttModel {
+    /// Human-readable name for the Settings UI.
+    pub display_name: String,
+    /// Which engine implementation decodes this model.
+    pub backend: Backend,
     /// Upstream Hugging Face repo.
     pub repo: String,
     /// Pinned commit revision.
     pub revision: String,
     /// Directory name under `models/` (dev) or `Contents/Resources/`
-    /// (bundled) — the default, overridable via `env_name`.
+    /// (bundled) — the default, overridable via [`SttManifest::env_name`].
     pub dir_name: String,
-    /// Env var that overrides the full resolved folder path.
-    pub env_folder: String,
-    /// Env var that overrides just `dir_name`.
-    pub env_name: String,
-    /// Required `CoreML` component bundles plus the vocabulary file.
-    pub components: Vec<String>,
+    /// Lowest macOS version that can run this model, `"MAJOR.MINOR"`.
+    pub min_macos: String,
+    /// Every required asset, keyed by the role the backend loads it as
+    /// (`preprocessor`, `encoder`, …) — named roles rather than a
+    /// positional list, so a backend asks for the file it needs by name
+    /// instead of by index (ADR-019).
+    pub assets: BTreeMap<String, String>,
+}
+
+/// Which engine implementation decodes a model.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Backend {
+    /// Parakeet-TDT: RNN-T greedy decode over a sliding 15 s window.
+    ParakeetTdt,
+    /// Canary: attention encoder-decoder over a fixed 15 s window.
+    CanaryAed,
+}
+
+impl SttManifest {
+    /// The model registered under `id`.
+    #[must_use]
+    pub fn model(&self, id: &str) -> Option<&SttModel> {
+        self.models.get(id)
+    }
+
+    /// The model [`Self::default_model`] names.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `default_model` names no registered model — an invariant
+    /// of the embedded manifest, pinned by
+    /// `default_model_names_a_registered_model`.
+    #[must_use]
+    pub fn default_model_entry(&self) -> &SttModel {
+        self.model(&self.default_model)
+            .expect("manifest default_model must name a registered model")
+    }
+
+    /// The [`ModelSpec`] for `id`, for [`resolve_model_folder`].
+    ///
+    /// **The two env-var overrides are manifest-wide, not per model**:
+    /// [`Self::env_folder`] and [`Self::env_name`] live on the manifest, so
+    /// every id gets the same pair and a set `VUHO_MODEL_FOLDER` points
+    /// *every* model at that one directory. `availability_all` then reports
+    /// each of them `Ready`/`EnvOverride`, the Settings list offers them
+    /// all, and selecting one whose backend does not match the files in
+    /// that directory fails at load time.
+    ///
+    /// This is deliberate, not an oversight. The override exists for
+    /// `test-stt-ffi --model <id>`, `cargo test`, and packaging scripts,
+    /// which point it at whichever single model tree they are exercising
+    /// and select that model in the same breath. Scoping it to
+    /// [`Self::default_model`] would leave no way to override a non-default
+    /// model's folder at all, which is exactly what those callers do.
+    #[must_use]
+    pub fn spec_for(&self, id: &str) -> Option<ModelSpec<'_>> {
+        self.model(id).map(|model| ModelSpec {
+            env_folder: &self.env_folder,
+            env_name: &self.env_name,
+            default_dir_name: &model.dir_name,
+        })
+    }
+}
+
+impl SttModel {
+    /// The filename this model ships for `role`, e.g. `"encoder"`.
+    #[must_use]
+    pub fn asset(&self, role: &str) -> Option<&str> {
+        self.assets.get(role).map(String::as_str)
+    }
+
+    /// Every asset filename, sorted — the single source for existence
+    /// checks and download allow-patterns.
+    #[must_use]
+    pub fn components(&self) -> Vec<&str> {
+        let mut components: Vec<&str> = self.assets.values().map(String::as_str).collect();
+        components.sort_unstable();
+        components
+    }
 }
 
 /// Silero VAD's manifest entry (provisioning metadata for `fetch-model.sh`
@@ -114,8 +208,17 @@ pub fn manifest() -> &'static Manifest {
 pub struct Lock {
     /// Lock schema version — bumped whenever the shape below changes.
     pub schema_version: u32,
-    /// The Parakeet-TDT STT model's locked file set.
-    pub stt: SttLock,
+    /// Each model's locked file set, keyed by the same model id the
+    /// manifest uses.
+    pub models: BTreeMap<String, SttLock>,
+}
+
+impl Lock {
+    /// The locked file set for `id`.
+    #[must_use]
+    pub fn model(&self, id: &str) -> Option<&SttLock> {
+        self.models.get(id)
+    }
 }
 
 /// One model's locked file set: what a complete, untampered download must
@@ -123,10 +226,10 @@ pub struct Lock {
 #[derive(Debug, serde::Deserialize)]
 pub struct SttLock {
     /// Directory name under `user_models_dir()` this lock describes —
-    /// mirrors (and must match) `SttManifest::dir_name`.
+    /// mirrors (and must match) `SttModel::dir_name`.
     pub dir_name: String,
     /// Pinned commit revision this lock was generated against — mirrors
-    /// (and must match) `SttManifest::revision`.
+    /// (and must match) `SttModel::revision`.
     pub revision: String,
     /// Sum of every locked file's `size`, for progress totals and the
     /// `ModelStatus::Missing { total_bytes }` a resolver miss reports.
@@ -181,53 +284,94 @@ pub struct ModelSpec<'a> {
     pub default_dir_name: &'a str,
 }
 
-impl SttManifest {
-    /// This model's [`ModelSpec`], for [`resolve_model_folder`].
-    #[must_use]
-    pub fn spec(&self) -> ModelSpec<'_> {
-        ModelSpec {
-            env_folder: &self.env_folder,
-            env_name: &self.env_name,
-            default_dir_name: &self.dir_name,
-        }
-    }
-}
-
-/// No candidate location held an existing directory. Carries every
-/// candidate path the resolver actually tried, in the order it tried them,
-/// so callers can build an actionable, typed error naming all of them —
-/// not just the last.
+/// Why [`resolve_model`] could not name an existing model directory.
 #[derive(Debug, Clone)]
-pub struct ModelPathError {
-    /// Every candidate path tried, most to least authoritative (see
-    /// [`resolve_model_folder`]'s doc comment for the order).
-    pub tried: Vec<PathBuf>,
-}
-
-impl ModelPathError {
-    /// Every tried candidate, comma-joined, for embedding in a caller's own
-    /// error message.
-    #[must_use]
-    pub fn tried_display(&self) -> String {
-        self.tried
-            .iter()
-            .map(|p| p.display().to_string())
-            .collect::<Vec<_>>()
-            .join(", ")
-    }
+pub enum ModelPathError {
+    /// The directory name itself is unusable — see [`InvalidDirName`]. No
+    /// candidate was built, so nothing was tried.
+    InvalidDirName(InvalidDirName),
+    /// No candidate location held an existing directory. Carries every
+    /// candidate path the resolver actually tried, in the order it tried
+    /// them (most to least authoritative — see [`resolve_model_folder`]'s
+    /// doc comment), so callers can build an actionable, typed error naming
+    /// all of them, not just the last.
+    NotFound {
+        /// Every candidate path tried, in order.
+        tried: Vec<PathBuf>,
+    },
 }
 
 impl std::fmt::Display for ModelPathError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "model folder not found — tried: {}",
-            self.tried_display()
-        )
+        match self {
+            Self::InvalidDirName(invalid) => invalid.fmt(f),
+            Self::NotFound { tried } => {
+                let tried = tried
+                    .iter()
+                    .map(|p| p.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                write!(f, "model folder not found — tried: {tried}")
+            }
+        }
     }
 }
 
 impl std::error::Error for ModelPathError {}
+
+impl From<InvalidDirName> for ModelPathError {
+    fn from(invalid: InvalidDirName) -> Self {
+        Self::InvalidDirName(invalid)
+    }
+}
+
+/// A model directory name that is not a plain directory name.
+///
+/// The name is validated where it is produced ([`dir_name_for`]) rather
+/// than at the two places it is dangerous, because it is dangerous at both:
+/// `vuho-model-fetch` joins it onto [`user_models_dir`] to *download* into,
+/// and joins it again to recursively *delete*. `Path::starts_with` compares
+/// whole components, so `..` is simply another component and
+/// `<user_dir>/../../../../tmp/victim` starts with `<user_dir>` by that
+/// test while the OS resolves the `..` at open time onto an unrelated
+/// directory. One `Component::Normal` and nothing else is the property that
+/// makes the join mean what the guard reads it as.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InvalidDirName {
+    /// Where the rejected value came from: the env var that set it, or
+    /// [`MANIFEST_ORIGIN`] when the manifest's own `dir_name` is at fault.
+    pub origin: String,
+    /// The rejected value, verbatim.
+    pub value: String,
+}
+
+impl std::fmt::Display for InvalidDirName {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "model directory name {:?} (from {}) is not a single plain directory name — no separators, no `.` or `..`, no drive or root",
+            self.value, self.origin
+        )
+    }
+}
+
+impl std::error::Error for InvalidDirName {}
+
+/// [`InvalidDirName::origin`] for a name that came from the embedded
+/// manifest rather than from an env var.
+pub const MANIFEST_ORIGIN: &str = "models.manifest.json";
+
+/// `name` if it is exactly one [`Component::Normal`] and nothing else.
+fn plain_dir_name(name: String, origin: &str) -> Result<String, InvalidDirName> {
+    let mut components = Path::new(&name).components();
+    match (components.next(), components.next()) {
+        (Some(Component::Normal(only)), None) if only == OsStr::new(&name) => Ok(name),
+        _ => Err(InvalidDirName {
+            origin: origin.to_owned(),
+            value: name,
+        }),
+    }
+}
 
 fn non_empty_env(key: &str) -> Option<String> {
     std::env::var(key).ok().filter(|s| !s.is_empty())
@@ -316,9 +460,22 @@ pub fn user_models_dir() -> Option<PathBuf> {
 /// override, instead of `vuho-model-fetch` reading `Lock::stt.dir_name`
 /// directly and silently ignoring an operator's `VUHO_MODEL_NAME` override
 /// that `resolve_model_folder` already honors.
-#[must_use]
-pub fn dir_name_for(spec: &ModelSpec<'_>) -> String {
-    non_empty_env(spec.env_name).unwrap_or_else(|| spec.default_dir_name.to_owned())
+///
+/// `spec.env_name` is manifest-wide: one value renames the directory of
+/// **every** model, not just the selected one. See [`SttManifest::spec_for`]
+/// for why that is deliberate.
+///
+/// # Errors
+///
+/// Returns [`InvalidDirName`] when the name is anything but a single plain
+/// directory name — which is a hard refusal, never a fall back to the
+/// manifest default, because a caller that quietly got the default would
+/// then download into (or delete) a directory the operator did not ask for.
+pub fn dir_name_for(spec: &ModelSpec<'_>) -> Result<String, InvalidDirName> {
+    match non_empty_env(spec.env_name) {
+        Some(override_name) => plain_dir_name(override_name, spec.env_name),
+        None => plain_dir_name(spec.default_dir_name.to_owned(), MANIFEST_ORIGIN),
+    }
 }
 
 /// Every candidate model-directory location for `spec`, most to least
@@ -328,8 +485,8 @@ pub fn dir_name_for(spec: &ModelSpec<'_>) -> String {
 /// `.app`, no user-dir entry when `$HOME` is unset) — the returned list is
 /// exactly what gets tried, and exactly what [`ModelPathError::tried`]
 /// reports on failure.
-fn candidate_paths(spec: &ModelSpec<'_>) -> Vec<PathBuf> {
-    let dir_name = dir_name_for(spec);
+fn candidate_paths(spec: &ModelSpec<'_>) -> Result<Vec<Resolved>, InvalidDirName> {
+    let dir_name = dir_name_for(spec)?;
 
     // The full-path override is terminal, not merely first: if the operator
     // named a folder, that folder is the answer or there is no answer.
@@ -341,19 +498,57 @@ fn candidate_paths(spec: &ModelSpec<'_>) -> Vec<PathBuf> {
     // deliberately: the old `map_or_else` took its else-branch only when the
     // variable was unset.)
     if let Some(folder) = non_empty_env(spec.env_folder) {
-        return vec![PathBuf::from(folder)];
+        return Ok(vec![Resolved {
+            path: PathBuf::from(folder),
+            source: ModelSource::EnvOverride,
+        }]);
     }
 
     let mut candidates = Vec::with_capacity(3);
     if let Some(resources) = bundle_resources_dir() {
-        candidates.push(resources.join(&dir_name));
+        candidates.push(Resolved {
+            path: resources.join(&dir_name),
+            source: ModelSource::Bundle,
+        });
     }
-    candidates.push(dev_models_dir().join(&dir_name));
+    candidates.push(Resolved {
+        path: dev_models_dir().join(&dir_name),
+        source: ModelSource::DevTree,
+    });
     if let Some(user_dir) = user_models_dir() {
-        candidates.push(user_dir.join(&dir_name));
+        candidates.push(Resolved {
+            path: user_dir.join(&dir_name),
+            source: ModelSource::UserData,
+        });
     }
 
-    candidates
+    Ok(candidates)
+}
+
+/// Which of [`resolve_model`]'s candidate locations a model directory came
+/// from. Load-bearing beyond diagnostics: ADR-020 lets Vuho verify — and
+/// delete — only the tree it downloaded itself, i.e. only
+/// [`ModelSource::UserData`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ModelSource {
+    /// The `env_folder` full-path override.
+    EnvOverride,
+    /// The enclosing `.app`'s `Contents/Resources/<name>`.
+    Bundle,
+    /// The workspace-relative `models/<name>` dev directory.
+    DevTree,
+    /// `<name>` under [`user_models_dir`] — the one tree a downloader
+    /// writes into.
+    UserData,
+}
+
+/// A resolved model directory and the candidate location it came from.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Resolved {
+    /// The existing directory holding the model.
+    pub path: PathBuf,
+    /// Which candidate produced [`Self::path`].
+    pub source: ModelSource,
 }
 
 /// Resolve a model directory — the single chokepoint any caller learns
@@ -370,7 +565,12 @@ fn candidate_paths(spec: &ModelSpec<'_>) -> Vec<PathBuf> {
 /// 4. `<name>` under [`user_models_dir`] (ADR-020) — the one tree a
 ///    downloader ever writes into.
 ///
-/// `<name>` is `spec.env_name`'s override, or `spec.default_dir_name`.
+/// `<name>` is `spec.env_name`'s override, or `spec.default_dir_name`, and
+/// must be a single plain directory name either way ([`dir_name_for`]).
+///
+/// Both env vars are manifest-wide, so candidate 1 in particular answers
+/// for **every** model id, not only the one it was set for — see
+/// [`SttManifest::spec_for`].
 ///
 /// The order is deliberate, not incidental: candidate 3 before candidate 4
 /// preserves `cargo run` / `cargo test` / `test-stt-ffi` behavior exactly
@@ -385,13 +585,30 @@ fn candidate_paths(spec: &ModelSpec<'_>) -> Vec<PathBuf> {
 ///
 /// # Errors
 ///
-/// Returns [`ModelPathError`] naming every candidate tried if none of them
-/// is an existing directory.
+/// Returns [`ModelPathError::InvalidDirName`] for an unusable directory
+/// name, or [`ModelPathError::NotFound`] naming every candidate tried if
+/// none of them is an existing directory.
 pub fn resolve_model_folder(spec: &ModelSpec<'_>) -> Result<PathBuf, ModelPathError> {
-    let tried = candidate_paths(spec);
-    match tried.iter().find(|candidate| candidate.is_dir()) {
+    resolve_model(spec).map(|resolved| resolved.path)
+}
+
+/// [`resolve_model_folder`], plus which candidate location answered — the
+/// distinction ADR-020's "Vuho owns only bytes it fetched" invariant is
+/// built on.
+///
+/// # Errors
+///
+/// Returns [`ModelPathError::InvalidDirName`] when the directory name (or
+/// its `env_name` override) is not a single plain directory name, and
+/// [`ModelPathError::NotFound`] naming every candidate tried if none of
+/// them is an existing directory.
+pub fn resolve_model(spec: &ModelSpec<'_>) -> Result<Resolved, ModelPathError> {
+    let candidates = candidate_paths(spec)?;
+    match candidates.iter().find(|candidate| candidate.path.is_dir()) {
         Some(found) => Ok(found.clone()),
-        None => Err(ModelPathError { tried }),
+        None => Err(ModelPathError::NotFound {
+            tried: candidates.into_iter().map(|c| c.path).collect(),
+        }),
     }
 }
 
@@ -472,31 +689,80 @@ mod tests {
     fn embedded_manifest_parses_and_has_expected_shape() {
         let m = manifest();
         assert!(!m.bundle_id.is_empty());
-        assert!(!m.stt.components.is_empty());
+        assert!(!m.stt.models.is_empty());
         assert!(!m.silero.components.is_empty());
+        for (id, model) in &m.stt.models {
+            assert!(!model.display_name.is_empty(), "{id} has no display_name");
+            assert!(!model.repo.is_empty(), "{id} has no repo");
+            assert!(!model.dir_name.is_empty(), "{id} has no dir_name");
+            assert!(!model.min_macos.is_empty(), "{id} has no min_macos");
+            assert!(!model.components().is_empty(), "{id} has no assets");
+        }
+    }
+
+    /// A `default_model` naming nothing would make
+    /// `SttManifest::default_model_entry` panic on every caller.
+    #[test]
+    fn default_model_names_a_registered_model() {
+        let m = manifest();
+        assert!(
+            m.stt.model(&m.stt.default_model).is_some(),
+            "default_model {} is not among {:?}",
+            m.stt.default_model,
+            m.stt.models.keys().collect::<Vec<_>>()
+        );
     }
 
     /// The embedded lock must parse and carry the fields
-    /// `vuho-model-fetch`'s `availability()`/`download()` need, and must
-    /// describe the same model the manifest does.
+    /// `vuho-model-fetch`'s `availability()`/`download()` need, for every
+    /// model the manifest declares.
     #[test]
     fn embedded_lock_parses_and_matches_manifest() {
         let l = lock();
         let m = manifest();
-        assert_eq!(l.schema_version, 1);
-        assert_eq!(l.stt.dir_name, m.stt.dir_name);
-        assert_eq!(l.stt.revision, m.stt.revision);
-        assert!(!l.stt.files.is_empty());
-        assert_eq!(
-            l.stt.total_bytes,
-            l.stt.files.iter().map(|f| f.size).sum::<u64>()
-        );
-        for f in &l.stt.files {
-            assert_eq!(f.sha256.len(), 64, "sha256 must be 64 hex chars: {f:?}");
+        assert_eq!(l.schema_version, 2);
+        for (id, locked) in &l.models {
+            let model = m
+                .stt
+                .model(id)
+                .unwrap_or_else(|| panic!("lock names {id}, which the manifest does not"));
+            assert_eq!(locked.dir_name, model.dir_name, "{id} dir_name");
+            assert_eq!(locked.revision, model.revision, "{id} revision");
+            assert!(!locked.files.is_empty(), "{id} locks no files");
+            assert_eq!(
+                locked.total_bytes,
+                locked.files.iter().map(|f| f.size).sum::<u64>(),
+                "{id} total_bytes"
+            );
+            for f in &locked.files {
+                assert_eq!(f.sha256.len(), 64, "sha256 must be 64 hex chars: {f:?}");
+            }
         }
     }
 
+    /// Every manifest model must be locked and vice versa — a model in one
+    /// file only is a half-landed provisioning change that would fail at
+    /// download time instead of here.
+    #[test]
+    fn manifest_and_lock_describe_the_same_model_ids() {
+        let manifest_ids: Vec<&String> = manifest().stt.models.keys().collect();
+        let lock_ids: Vec<&String> = lock().models.keys().collect();
+        assert_eq!(manifest_ids, lock_ids);
+    }
+
     // ── `resolve_model_folder` candidate-ordering tests ─────────────────
+
+    /// The candidate list a `NotFound` carries, asserting the variant on
+    /// the way — an `InvalidDirName` here would mean the resolver never got
+    /// as far as trying anything.
+    fn tried(err: &ModelPathError) -> &[PathBuf] {
+        match err {
+            ModelPathError::NotFound { tried } => tried,
+            ModelPathError::InvalidDirName(invalid) => {
+                panic!("expected a NotFound, got {invalid}")
+            }
+        }
+    }
 
     /// A unique temp directory, removed on drop, for building fake
     /// candidate model directories in tests without touching the real
@@ -530,7 +796,7 @@ mod tests {
     /// swapped for a fake temp dir the way the other candidates can).
     ///
     /// `dev_models_dir()` resolves to the real workspace `models/` — the
-    /// same tree `./scripts/fetch-model.sh` provisions ~474 MB of real
+    /// same tree `./scripts/fetch-model.sh` provisions ~496 MB of real
     /// model weights into on a developer's machine. `name` must already be
     /// a test-unique string (every caller below passes one derived from its
     /// own test name), and this guard's `Drop` removes exactly that
@@ -604,7 +870,7 @@ mod tests {
         // user dir) depend on process-wide state (`$HOME`) this test does
         // not control, unlike the dedicated ordering tests below.
         assert_eq!(
-            err.tried.first(),
+            tried(&err).first(),
             Some(&PathBuf::from("/definitely/not/a/model"))
         );
     }
@@ -637,8 +903,9 @@ mod tests {
             &env_target.0.display().to_string(),
         );
 
-        let resolved = resolve_model_folder(&spec).expect("env override resolves");
-        assert_eq!(resolved, env_target.0);
+        let resolved = resolve_model(&spec).expect("env override resolves");
+        assert_eq!(resolved.path, env_target.0);
+        assert_eq!(resolved.source, ModelSource::EnvOverride);
     }
 
     /// Falsification target: a full-path override that does not exist must
@@ -666,8 +933,8 @@ mod tests {
         let err = resolve_model_folder(&spec)
             .expect_err("a nonexistent override must not resolve to the dev dir");
         assert_eq!(
-            err.tried,
-            vec![PathBuf::from(bogus)],
+            tried(&err),
+            &[PathBuf::from(bogus)],
             "the override must be the only candidate tried"
         );
     }
@@ -702,8 +969,9 @@ mod tests {
             default_dir_name: name,
         };
 
-        let resolved = resolve_model_folder(&spec).expect("dev dir resolves");
-        assert_eq!(resolved, dev_dir);
+        let resolved = resolve_model(&spec).expect("dev dir resolves");
+        assert_eq!(resolved.path, dev_dir);
+        assert_eq!(resolved.source, ModelSource::DevTree);
     }
 
     /// The user-data candidate (4) resolves when it's the only one that
@@ -731,8 +999,9 @@ mod tests {
             default_dir_name: name,
         };
 
-        let resolved = resolve_model_folder(&spec).expect("user dir resolves");
-        assert_eq!(resolved, user_dir);
+        let resolved = resolve_model(&spec).expect("user dir resolves");
+        assert_eq!(resolved.path, user_dir);
+        assert_eq!(resolved.source, ModelSource::UserData);
     }
 
     #[test]
@@ -744,11 +1013,11 @@ mod tests {
         };
         let err = resolve_model_folder(&spec).expect_err("unprovisioned dev dir must not resolve");
         assert!(
-            err.tried
+            tried(&err)
                 .iter()
                 .any(|p| p.ends_with("models/definitely-not-a-provisioned-model")),
             "expected a workspace-relative models/ path among tried candidates, got {:?}",
-            err.tried
+            tried(&err)
         );
     }
 
@@ -779,8 +1048,8 @@ mod tests {
 
         let err = resolve_model_folder(&spec).expect_err("nothing here should resolve");
         assert_eq!(
-            err.tried,
-            vec![
+            tried(&err),
+            &[
                 dev_models_dir().join(name),
                 fake_home
                     .0
@@ -791,6 +1060,82 @@ mod tests {
                     .join(name),
             ]
         );
+    }
+
+    // ── `dir_name_for` validation tests ──────────────────────────────────
+
+    fn name_spec(env_name: &'static str, default_dir_name: &'static str) -> ModelSpec<'static> {
+        ModelSpec {
+            env_folder: "VUHO_MODEL_PATHS_TEST_NAME_VALIDATION_FOLDER_UNSET",
+            env_name,
+            default_dir_name,
+        }
+    }
+
+    #[test]
+    fn a_plain_directory_name_is_accepted() {
+        let spec = name_spec(
+            "VUHO_MODEL_PATHS_TEST_NAME_PLAIN_UNSET",
+            "parakeet-tdt-0.6b-v3-coreml",
+        );
+        assert_eq!(
+            dir_name_for(&spec).expect("a plain name resolves"),
+            "parakeet-tdt-0.6b-v3-coreml"
+        );
+    }
+
+    /// Falsification target: the traversal that defeats `delete`'s
+    /// `starts_with` guard. `<user_dir>/../../../../tmp/victim` passes a
+    /// component-wise prefix test, so the name has to be refused here,
+    /// before either the downloader or the deleter ever joins it.
+    #[test]
+    fn a_name_that_escapes_the_user_directory_is_refused() {
+        for escape in [
+            "../../../../tmp/victim",
+            "..",
+            "/tmp/victim",
+            "sub/dir",
+            "models/",
+            ".",
+            "./models",
+        ] {
+            let spec = name_spec("VUHO_MODEL_PATHS_TEST_NAME_ESCAPE", "default-name");
+            let _guard = EnvGuard::set("VUHO_MODEL_PATHS_TEST_NAME_ESCAPE", escape);
+
+            let err = dir_name_for(&spec)
+                .expect_err("a name that is not one plain component must be refused");
+            assert_eq!(err.value, escape);
+            assert_eq!(err.origin, "VUHO_MODEL_PATHS_TEST_NAME_ESCAPE");
+        }
+    }
+
+    /// A refused name must never quietly fall back to the manifest default:
+    /// the operator would then download into, and later delete, a directory
+    /// they did not name.
+    #[test]
+    fn a_refused_override_does_not_fall_back_to_the_default() {
+        let spec = name_spec("VUHO_MODEL_PATHS_TEST_NAME_NO_FALLBACK", "default-name");
+        let _guard = EnvGuard::set("VUHO_MODEL_PATHS_TEST_NAME_NO_FALLBACK", "../escape");
+
+        let err = resolve_model(&spec).expect_err("resolution must not proceed");
+        assert!(
+            matches!(err, ModelPathError::InvalidDirName(ref invalid) if invalid.value == "../escape"),
+            "{err}"
+        );
+    }
+
+    /// Every `dir_name` the embedded manifest ships must already satisfy the
+    /// rule, or the default path would be refused before an operator ever
+    /// set an env var.
+    #[test]
+    fn every_manifest_dir_name_is_a_plain_directory_name() {
+        for (id, model) in &manifest().stt.models {
+            assert!(
+                plain_dir_name(model.dir_name.clone(), MANIFEST_ORIGIN).is_ok(),
+                "{id} has an unusable dir_name {:?}",
+                model.dir_name
+            );
+        }
     }
 
     // ── `resources_dir_for_exe` path-shape tests (finding 9) ────────────────

@@ -382,6 +382,12 @@ pub(crate) fn spawn_ui_drain(
                                 }
                             }
                         }
+                        crate::app_state::UiCommand::ModelList(models) => {
+                            let _ = status.update(&mut cx, |model, cx| {
+                                model.models = models;
+                                cx.notify();
+                            });
+                        }
                         crate::app_state::UiCommand::EngineReady(Ok(())) => {
                             let _ = status.update(&mut cx, |model, cx| {
                                 model.engine = crate::app_status::EngineState::Ready;

@@ -8,11 +8,13 @@ use std::path::Path;
 use std::sync::Mutex;
 
 use crate::coreml::{ComputeUnits, CoreMlModel, MlArray};
+use crate::stream::merge::MergeBounds;
+use crate::token::TokenAt;
+use crate::vocab::Vocab;
 use crate::EngineError;
 
 use super::decoder_state::DecoderState;
-use super::tdt::{StepModel, TokenAt};
-use super::vocab::Vocab;
+use super::tdt::StepModel;
 
 /// Encoder output feature dimension.
 const ENCODER_DIM: usize = 1024;
@@ -94,32 +96,30 @@ impl ParakeetModels {
     ///
     /// Returns `EngineError::LoadFailed` if the model layout is invalid or
     /// any model fails to load.
-    pub(crate) fn load(folder: &Path) -> Result<Self, EngineError> {
-        crate::validate_model_layout(folder)?;
+    pub(crate) fn load(model_id: &str, folder: &Path) -> Result<Self, EngineError> {
+        crate::validate_model_layout(model_id, folder)?;
+        let path = |role| crate::asset_path(model_id, role, folder);
 
-        log::info!("parakeet: loading Preprocessor (CPU)");
-        let preprocessor =
-            CoreMlModel::load(&folder.join("Preprocessor.mlmodelc"), ComputeUnits::CpuOnly)?;
-
-        log::info!("parakeet: loading ParakeetEncoder_15s (CPU+ANE)");
-        let encoder = CoreMlModel::load(
-            &folder.join("ParakeetEncoder_15s.mlmodelc"),
-            ComputeUnits::CpuAndNeuralEngine,
-        )?;
-
-        log::info!(
-            "parakeet: loading ParakeetDecoder (CPU — flexible-shape input, ANE unsupported)"
-        );
-        let decoder = CoreMlModel::load(
-            &folder.join("ParakeetDecoder.mlmodelc"),
+        log::info!("parakeet: loading the preprocessor (CPU)");
+        let preprocessor = CoreMlModel::load(
+            &path(crate::asset_role::PREPROCESSOR)?,
             ComputeUnits::CpuOnly,
         )?;
 
-        log::info!("parakeet: loading RNNTJoint (CPU — flexible-shape input, ANE unsupported)");
-        let joint = CoreMlModel::load(&folder.join("RNNTJoint.mlmodelc"), ComputeUnits::CpuOnly)?;
+        log::info!("parakeet: loading the encoder (CPU+ANE)");
+        let encoder = CoreMlModel::load(
+            &path(crate::asset_role::ENCODER)?,
+            ComputeUnits::CpuAndNeuralEngine,
+        )?;
+
+        log::info!("parakeet: loading the decoder (CPU — flexible-shape input, ANE unsupported)");
+        let decoder = CoreMlModel::load(&path(crate::asset_role::DECODER)?, ComputeUnits::CpuOnly)?;
+
+        log::info!("parakeet: loading the joint (CPU — flexible-shape input, ANE unsupported)");
+        let joint = CoreMlModel::load(&path(crate::asset_role::JOINT)?, ComputeUnits::CpuOnly)?;
 
         log::info!("parakeet: loading vocabulary");
-        let vocab = Vocab::load(&folder.join("parakeet_v3_vocab.json"))?;
+        let vocab = Vocab::load(&path(crate::asset_role::VOCAB)?, Some(super::tdt::BLANK))?;
 
         let models = Self {
             preprocessor,
@@ -182,18 +182,6 @@ impl ParakeetModels {
         Ok(emitted)
     }
 
-    /// Detokenize tokens to text using the loaded vocabulary.
-    pub(crate) fn detokenize(&self, tokens: &[TokenAt]) -> String {
-        self.vocab.detokenize(tokens)
-    }
-
-    /// `(is_word_initial, raw_piece_text)` for a token id — see
-    /// [`super::vocab::Vocab::piece_info`]. Borrows from `self` (`&str`,
-    /// not an owned clone, WP9).
-    pub(crate) fn piece_info(&self, id: u32) -> Option<(bool, &str)> {
-        self.vocab.piece_info(id)
-    }
-
     /// Run Preprocessor → Encoder, returning `(flat_encoder_output, frame_count)`.
     ///
     /// `flat_encoder_output` is `frame_count` frames of `ENCODER_DIM` each,
@@ -252,6 +240,40 @@ impl ParakeetModels {
         );
 
         Ok((encoder_output, valid_frames))
+    }
+}
+
+impl crate::window_inference::WindowInference for ParakeetModels {
+    /// Parakeet-TDT decodes without a language prompt, so `language` is
+    /// unused. Every window decodes from a fresh `DecoderState` at
+    /// `initial_t = 0` — carrying decoder state across independently
+    /// encoded windows is what caused the blank-lock content drop
+    /// (ADR-015; see `stream::session`'s module doc).
+    fn infer_window(
+        &self,
+        samples: &[f32],
+        global_frame_offset: usize,
+        _language: &str,
+    ) -> Result<Vec<TokenAt>, EngineError> {
+        let mut state = DecoderState::new();
+        Self::infer_window(self, samples, 0, global_frame_offset, &mut state)
+    }
+
+    fn piece_info(&self, id: u32) -> Option<(bool, &str)> {
+        self.vocab.piece_info(id)
+    }
+
+    fn detokenize(&self, tokens: &[TokenAt]) -> String {
+        self.vocab.detokenize(tokens)
+    }
+
+    /// Positions are real encoder frame indices, so both bounds derive
+    /// from the window overlap.
+    fn merge_bounds(&self) -> MergeBounds {
+        MergeBounds {
+            search: crate::stream::windower::OVERLAP_FRAMES,
+            tolerance: crate::stream::windower::OVERLAP_FRAMES / 2,
+        }
     }
 }
 

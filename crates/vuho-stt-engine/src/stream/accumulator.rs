@@ -30,15 +30,15 @@
 
 use vuho_domain::TranscriptSegment;
 
-use crate::parakeet::models::ParakeetModels;
-use crate::parakeet::tdt::{frame_ms, TokenAt};
+use crate::token::{frame_ms, TokenAt};
+use crate::window_inference::WindowInference;
 
 use super::merge::MergeOutcome;
 
 /// Owns the confirmed transcript state: committed tokens, the segments
 /// derived from them, and the next segment id.
 pub(crate) struct Accumulator {
-    /// All committed (confirmed) tokens, global-frame indexed.
+    /// All committed (confirmed) tokens, session-global-position indexed.
     committed: Vec<TokenAt>,
     segments: Vec<TranscriptSegment>,
     segment_id: u32,
@@ -64,7 +64,7 @@ impl Accumulator {
     /// [`TranscriptSegment`] for it and extend `committed` — the single
     /// home of this logic (see this module's doc comment for the
     /// `segments`/`full_text` trade-off it implies).
-    pub(crate) fn apply(&mut self, outcome: MergeOutcome, models: &ParakeetModels) {
+    pub(crate) fn apply(&mut self, outcome: MergeOutcome, models: &dyn WindowInference) {
         self.committed.truncate(outcome.keep_committed);
         if outcome.append.is_empty() {
             return;
@@ -75,7 +75,12 @@ impl Accumulator {
 
     /// Build a `TranscriptSegment` for a run of newly committed tokens and
     /// push it, advancing `segment_id`.
-    fn push_segment(&mut self, tokens: &[TokenAt], models: &ParakeetModels) {
+    ///
+    /// The segment's `start_ms`/`end_ms` are only as meaningful as the
+    /// backend's `TokenAt::pos` (opaque and possibly synthetic — see
+    /// [`TokenAt`]): informational, never a correctness gate, and read
+    /// only by `test-stt-ffi`'s diagnostic printout.
+    fn push_segment(&mut self, tokens: &[TokenAt], models: &dyn WindowInference) {
         let (Some(first), Some(last)) = (tokens.first(), tokens.last()) else {
             return;
         };
@@ -83,15 +88,15 @@ impl Accumulator {
         self.segments.push(TranscriptSegment::new(
             self.segment_id,
             text,
-            frame_ms(first.frame),
-            frame_ms(last.frame),
+            frame_ms(first.pos),
+            frame_ms(last.pos),
         ));
         self.segment_id += 1;
     }
 
     /// Detokenized `committed` — the correctness gate (see this module's
     /// doc comment).
-    pub(crate) fn full_text(&self, models: &ParakeetModels) -> String {
+    pub(crate) fn full_text(&self, models: &dyn WindowInference) -> String {
         models.detokenize(&self.committed)
     }
 
@@ -106,7 +111,7 @@ impl Accumulator {
     pub(crate) fn confirmed_unconfirmed_texts(
         &self,
         extra: &[TokenAt],
-        models: &ParakeetModels,
+        models: &dyn WindowInference,
     ) -> (String, String) {
         (models.detokenize(&self.committed), models.detokenize(extra))
     }

@@ -16,7 +16,8 @@
 
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
 use vuho_stt_engine::bench_support::{
-    fixed_step_model, merge, plan, tdt_greedy, token_at, DecoderState, TokenAt, OVERLAP_FRAMES,
+    fixed_step_model, merge, plan, tdt_greedy, token_at, DecoderState, MergeBounds, TokenAt,
+    OVERLAP_FRAMES,
 };
 
 /// Encoder feature dimension (matches `parakeet::models::ENCODER_DIM` —
@@ -34,6 +35,15 @@ const ENCODER_DIM: usize = 1024;
 /// `duration_s * (16_000 / 1280) ≈ 137.5` frame count, which is smaller
 /// because the model always processes a full padded window.
 const JFK_AUDIO_FRAMES: usize = 188;
+
+/// The merge bounds Parakeet supplies (`WindowInference::merge_bounds`),
+/// restated here because that method needs a loaded model this bench
+/// deliberately does not have — `OVERLAP_FRAMES` itself still comes from
+/// the crate.
+const PARAKEET_MERGE_BOUNDS: MergeBounds = MergeBounds {
+    search: OVERLAP_FRAMES,
+    tolerance: OVERLAP_FRAMES / 2,
+};
 
 /// Vocabulary size used to build a varied synthetic token stream for the
 /// `merge` bench — arbitrary but fixed so the id-cycling in
@@ -133,7 +143,7 @@ fn bench_merge(c: &mut Criterion) {
                 let outcome = merge(
                     black_box(&committed),
                     black_box(fresh),
-                    black_box(OVERLAP_FRAMES),
+                    black_box(PARAKEET_MERGE_BOUNDS),
                     synthetic_piece,
                 );
                 black_box(outcome)

@@ -486,10 +486,27 @@ reserialization correctly accounts for the *model's* returned strides, rather th
 answer it. This was the original incident behind the PR4 gate; it is resolved.
 
 **`Send`/`Sync` boundary:** a single documented newtype, `coreml::SendModel`, carries
-`unsafe impl Send + Sync` for the loaded model set — justified because Apple documents
-`MLModel` prediction as thread-safe, and because every caller in `parakeet/models.rs`
-serializes predictions onto one thread per session. No other `unsafe impl Send/Sync` exists in
-the engine.
+`unsafe impl Send + Sync` for a loaded model set — justified because Apple documents `MLModel`
+prediction as thread-safe, and because the one piece of interior-mutable state each backend
+holds (`padded`) is a `Mutex<Vec<f32>>`, so concurrent `&self` access blocks rather than races.
+
+> **Amended by ADR-022 — corrected on both counts.**
+>
+> *There are now two `unsafe impl` pairs, not one.* `SendModel<ParakeetModels>` was joined by
+> `SendModel<CanaryModels>` when the second backend landed (`coreml.rs`). A blanket
+> `unsafe impl<T> Send/Sync for SendModel<T>` is still **refused**: it would let any future `T`
+> — including one holding non-thread-safe, non-`CoreML` state — become `Send`/`Sync` for free
+> just by being wrapped here, silently widening this crate's one unsafe-impl invariant to types
+> it was never audited against. The price of that refusal is that a generic wrapper cannot
+> derive thread-safety, so `StreamingEngine<M>` carries `where SendModel<M>: Send + Sync`
+> explicitly. That is the intended cost, not an oversight.
+>
+> *The original justification above was stale.* It said the impl was justified partly "because
+> every caller in `parakeet/models.rs` serializes predictions onto one thread per session".
+> `coreml.rs`'s own SAFETY note says the opposite, and is the accurate one: since the `Mutex`
+> landed, the impl does **not** depend on that convention. A `Sync` type has to be sound under
+> *any* concurrent access the type system permits, not only the access pattern today's callers
+> happen to use. The sentence above is corrected accordingly.
 
 **Consequences:**
 - Zero Swift, zero FFI, zero `libloading` anywhere in the project (retires ADR-003's "WhisperKit
@@ -795,6 +812,30 @@ first-use is simpler, has no build-script maintenance burden, and the manifest i
 that runtime parsing cost is immaterial (measured: parsed once per process via the `OnceLock`,
 not per call).
 
+> **Amended by ADR-022 — the manifest holds N models, keyed by id, with named asset roles.**
+>
+> `stt` no longer describes one model. It carries `default_model`, the two env-var names, and a
+> `models` map keyed by model id (`parakeet-tdt-0.6b-v3`, `canary-1b-v2`), each entry holding
+> `display_name`, `backend`, `repo`, `revision`, `dir_name`, `min_macos`, and `assets`.
+> `models.lock.json` mirrors that shape (`schema_version: 2`, `models` keyed by the same ids),
+> and `vuho-model-paths`'s invariant tests assert the two id sets are identical and that
+> `default_model` names a model that exists.
+>
+> **`assets` is a named-role map, not a positional `components` array — and that closes a real
+> violation of this ADR rather than restating it.** While the manifest listed components
+> positionally, `parakeet/models.rs` hardcoded all five component filenames as `join()`
+> literals; `validate_model_layout` read the manifest. Two lists, no test tying them together.
+> The roles (`preprocessor`, `encoder`, `decoder`, `joint`, `projection`, `vocab`) give a
+> backend a way to *ask* for a file instead of naming one, through the single chokepoint
+> `vuho_stt_engine::asset_path(model_id, role, dir)`. Filenames now exist in exactly one place,
+> and the ADR's grep-falsifiable rule holds against the backends themselves.
+> `SttModel::components()` (the sorted `assets` values) remains the one list existence checks
+> and download allow-patterns derive from.
+>
+> **`silero` deliberately keeps its `components` array.** It is provisioned by
+> `scripts/fetch-model.sh` only, has no Rust asset-role consumer, and no backend ever resolves a
+> role against it — a role map there would be ceremony with no chokepoint behind it.
+
 ### ADR-020 — The model is a user resource, provisioned once, verified against a repo-pinned lock
 
 **Status:** Accepted. Supersedes ADR-008.
@@ -879,6 +920,40 @@ path, regardless of which candidate produced it — the design this ADR explicit
 "the central invariant" above): it would report `Missing` for every out-of-band-provisioned
 path, which is the DMG build, `cargo run`, `VUHO_MODEL_FOLDER`, and `test-stt-ffi` — i.e.
 everything except the one new path this ADR adds.
+
+> **Amended by ADR-022 — per-model provisioning, plus delete. The central invariant is
+> unchanged.**
+>
+> `availability(model_id) -> ModelAvailability` and `download(model_id, progress_tx)` now name
+> the model they act on; `availability_all()` returns one row per manifest model, the default
+> model first. `ModelAvailability` carries `id`, `display_name`, `status`, `source`,
+> `total_bytes`, and `supported_on_this_os` — `ModelStatus` itself is untouched, so every
+> existing `match` on it still compiles (ADR-018 kept it deliberately not `#[non_exhaustive]`).
+>
+> **Provenance is now carried, not inferred.** `vuho_model_paths::resolve_model` returns
+> `Resolved { path, source }`, where `ModelSource` is tagged as `candidate_paths` produces each
+> candidate — `EnvOverride` / `Bundle` / `DevTree` / `UserData`. Nothing re-derives "is this
+> Vuho's tree?" from a path prefix afterwards. `resolve_model_folder` stays as a
+> `.map(|r| r.path)` wrapper, so the one resolution chain remains one chain.
+>
+> **`delete(model_id)` is new, and it is restricted to `ModelSource::UserData`.** This is this
+> ADR's central invariant read in the other direction: Vuho verifies only bytes it downloaded,
+> and it removes only bytes it downloaded. A bundled, dev-tree, or `VUHO_MODEL_FOLDER` model
+> belongs to whoever provisioned it, and `delete` refuses it with
+> `FetchError::NotDeletable`. `ModelAvailability::deletable()` (`Ready` ∧ `source ==
+> Some(UserData)`) is the one predicate both the UI and the delete path read. A second,
+> belt-and-braces `path.starts_with(user_models_dir())` check runs immediately before the
+> recursive removal; any sibling `<dir>.partial` goes with it.
+>
+> Verification itself is unchanged: `source != UserData` ⇒ `Ready` with no sidecar check;
+> `source == UserData` ⇒ verified against the lock; an unresolvable model ⇒ `Missing` with
+> `source: None`. The per-model sidecar written inside a download directory keeps its shape —
+> the lock's `schema_version` bump guards only the repo-committed file.
+>
+> **Two models on disk is the reason Delete exists.** `models.lock.json`'s `total_bytes`,
+> which is also what the Settings list renders: Parakeet 496 MB, Canary 569 MB. `scripts/bundle-macos.sh` now loops over `VUHO_BUNDLE_MODELS`
+> (space-separated ids, defaulting to the manifest's `default_model`), so the DMG shape is
+> unchanged unless it is explicitly widened; `VUHO_BUNDLE_MODEL=0` still embeds none.
 
 ### ADR-021 — Single-panel UI
 
@@ -1016,7 +1091,8 @@ same fact structurally: `StatusModel.model: Option<ModelStatus>` starts (and, on
 permissions-blocked path, stays) `None` for the process lifetime — `wire_production`, the only
 code that ever calls `ui_tx.send(UiCommand::ModelStatus(..))` (via `wiring::send_phase_status`),
 never runs on that path — and every render site that would show a model row
-(`SettingsTab::render`'s `should_show_speech_model_section`, `PanelRoot::render_idle_status`'s
+(`SettingsTab::render`'s model card, whose rows come from `StatusModel::models`, itself only
+ever filled by `UiCommand::ModelList` from that same thread; `PanelRoot::render_idle_status`'s
 `CompositeStatus::ModelMissing`/`Downloading`/`Verifying` arms) is downstream of that same
 `Option`. A model row appearing on the gate path is therefore not a reachable state, not merely an
 unexercised one.
@@ -1071,6 +1147,241 @@ preserved two independent "let the user finish setup" implementations
 every time. Deleting the older one and keeping the single reads-`StatusModel` implementation is
 the one-source-of-truth outcome CONSTITUTION rule 26 asks for.
 
+### ADR-022 — Two selectable STT backends behind one `WindowInference` seam
+
+**Status:** Accepted. Amends ADR-014 (a second `SendModel` impl pair), ADR-015 (`MergeBounds`
+replaces the single `overlap_frames` parameter), ADR-019 (`assets` roles), and ADR-020
+(per-model `availability`/`download`, plus `delete`).
+
+**Problem:** Parakeet-TDT is one model with one contract. Its four `.mlmodelc` components, its
+token positions, and its vocabulary were reachable from `stream::session`,
+`stream::accumulator`, and `engine.rs` directly, as `&ParakeetModels`. A second model — NVIDIA
+Canary-1B-v2, an attention encoder-decoder with a completely different decode loop — could
+therefore only arrive as a second copy of the streaming lifecycle, or as a widened `ParakeetModels`.
+
+**Decision:** one trait, `vuho-stt-engine/src/window_inference.rs`, is the only thing the shared
+streaming pipeline knows about a backend:
+
+```rust
+pub(crate) trait WindowInference {
+    fn infer_window(&self, samples: &[f32], global_frame_offset: usize, language: &str)
+        -> Result<Vec<TokenAt>, EngineError>;
+    fn piece_info(&self, id: u32) -> Option<(bool, &str)>;
+    fn detokenize(&self, tokens: &[TokenAt]) -> String;
+    fn merge_bounds(&self) -> MergeBounds;
+}
+```
+
+`ParakeetModels` and `canary::models::CanaryModels` implement it. `StreamingEngine<M>`
+(`streaming_engine.rs`) holds the whole backend-independent half — batch windowing, the
+`"vuho-stt-session"` thread, the single live-session slot — so `ParakeetEngine` and
+`CanaryEngine` are thin wrappers, not two copies of one lifecycle.
+
+**The trait has no `Send + Sync` supertrait, deliberately.** `ParakeetModels` and `CanaryModels`
+both hold `Retained<MLModel>` handles, which are `!Send`/`!Sync`; the supertrait would simply
+fail to compile at both implementors. It is also unnecessary: a backend crosses a thread
+boundary as `Arc<SendModel<M>>` (the per-concrete-type wrapper ADR-014 introduced), and the
+`&dyn WindowInference` is only ever formed *inside* the session thread that already owns it.
+The cost of `SendModel`'s per-concrete-type `unsafe impl`s is that `StreamingEngine<M>` cannot
+derive thread-safety and must carry `where SendModel<M>: Send + Sync` explicitly. That clause is
+written out for exactly this reason, not as a style choice.
+
+**`TokenAt::frame` is renamed to `pos`, and its contract is now written down.** `pos` is a
+session-global **1280-sample encoder-frame index**, supplied by the backend — not "an opaque
+position in comparable units". `stream::merge` reads it as a frame index twice, and both reads
+are destructive when it is not one: `search` bounds the seam hunt to `OVERLAP_FRAMES` either
+side of `boundary_pos` (the last committed position), and the no-match fallback keeps all of
+`committed` and drops every fresh token whose `pos` is at or before `boundary_pos`. A backend
+whose positions restart or rescale between decodes therefore discards an entire decode silently
+— a green suite and an empty transcript.
+
+> **Corrected — the original claim here was false, and Canary shipped on it.** This ADR first
+> said a backend with no acoustic alignment "supplies a fixed synthetic stride instead of a
+> measured one, which is what makes the fallback safe rather than destructive". A fixed stride
+> (`POS_STRIDE = 4`) is frame-comparable at exactly one token density — the ≈47 tokens per
+> 188-frame window it was scaled to — and is destructive at every other. Measured by driving the
+> real `merge` with synthetic token streams at both ends of the range (`canary::models`'s
+> tests), with `OVERLAP_FRAMES = 25` and a 162-frame advance:
+>
+> - **≈20 tokens/window (slow speech).** The window's positions span 76 frames while its audio
+>   spans 188, so the next window's very first token (`offset + 162`) already sits past
+>   `boundary_pos + search`. The fresh side of the overlap comes out **empty**, no match is
+>   possible, the fallback drops **0** tokens, and the shared 2 s is transcribed twice.
+> - **≈80 tokens/window (fast speech).** Positions span 316 frames for the same 188 frames of
+>   audio, so the fallback drops **39** fresh tokens where the overlap holds about 10 — several
+>   seconds of speech deleted at any seam whose two decodes disagree about a word.
+>
+> **The fix is in the positions, not in `search`.** `canary::models::stamp_positions` spreads a
+> window's tokens over the `valid_frames` its own encoder reports. That is still an *estimate* —
+> Canary's decoder cannot produce a measured alignment — but it is an estimate on the right axis,
+> and it is density-free where it applies: a 2 s overlap spans ≈25 frames whether it holds three
+> tokens or eleven.
+>
+> **A plain interpolation is not enough, and measuring said so.** Uncapped, it deleted three words
+> from `jfk.wav` ×3 — the existing seam gate. A Canary decode does not always reach the end of its
+> window: window 0 there transcribes 13.4 s of its 15 s and stops, so spreading its 43 tokens over
+> all 188 frames puts the last one 1.4 s past the last word it actually produced, and the fallback
+> then drops fresh tokens carrying speech the committed side never had. The estimate is therefore
+> capped at `POS_STRIDE_CEILING` (4 frames ≈ 320 ms per token): it interpolates whenever that
+> packs tokens *closer* than the cap and holds to the cap otherwise. **The two error directions
+> are not equally bad** — a token placed too late deletes speech, one placed too early at worst
+> transcribes the overlap twice — so the estimate is deliberately biased early.
+>
+> **`merge`'s fresh-side search bound is anchored at `max(boundary_pos, fresh[0].pos)`.** An
+> estimate biased early can leave the last committed position *before* the fresh window even
+> begins, which under the old seam-only anchor emptied the fresh side of the overlap outright:
+> nothing to match against, so the whole overlap was appended a second time. The fresh side's
+> overlap is the head of `fresh`'s own window wherever the seam sits. Measured positions never
+> reach the `max`, so Parakeet is untouched.
+>
+> **Residual limit, measured and accepted.** A *sparse* window whose two decodes share no word at
+> all still drops nothing and transcribes its overlap twice: the cap holds its positions short of
+> the window's end, and the fallback keys off the last committed position. This is the safe
+> direction of the same trade-off, and it is pinned by
+> `a_sparse_window_with_no_shared_word_still_duplicates_its_overlap` so it stays a decision. It is
+> narrow — the overlap is the same audio decoded twice, so the two sides usually do share words,
+> and when they do the seam splices correctly at every density
+> (`an_agreed_seam_is_spliced_once_at_every_density`). Removing it needs a real per-token
+> alignment, which this export does not expose.
+
+**`MergeBounds { search, tolerance }` splits one previously overloaded parameter.** `merge`'s
+single `overlap_frames` argument served three roles at once: the search bound on either side of
+the overlap, the proximity conjunct in the word matcher (as `overlap_frames / 2`), and the
+fallback drop threshold. Canary needs the second widened and the first left alone, which one
+parameter cannot express. Parakeet passes `{ search: OVERLAP_FRAMES, tolerance: OVERLAP_FRAMES / 2 }`
+— byte-identical to the previous behavior. Canary passes `{ search: OVERLAP_FRAMES, tolerance:
+usize::MAX }`.
+
+> **Empirical finding, recorded so it is not "fixed" back:** `search: usize::MAX` was
+> implemented first, and it failed the multi-window seam test. An unbounded search makes the
+> matcher consider the whole transcript, and on repetitive speech it then prefers a long
+> spurious match far from the seam over the short true one; the re-splice deleted a whole
+> repetition (a buffer holding the same utterance three times came back with it twice).
+> **Widen `tolerance`, never `search`.** An interpolated position locates the overlap *region*
+> but a single word only to within however far that window's speech departs from an even rate —
+> seconds, on audio that starts or ends in silence — so the proximity gate must go; the region
+> itself is reliable, so the physical overlap really is where the match belongs. `merge` uses
+> `saturating_add` on both search predicates so `usize::MAX` degenerates to "consider the whole
+> slice" instead of overflowing.
+
+**Canary's contract** (`FluidInference/canary-1b-v2-coreml`, revision
+`75c1b536fe7ca6b589d2395ed9a43169d71f543b`, int4, four fixed-shape `.mlmodelc` components):
+
+- **Fixed 15 s window.** The preprocessor's input is a fixed `[1, 240 000]`, so the streaming
+  path's growing open buffer is zero-padded into a reused `Mutex<Vec<f32>>` scratch and the
+  **unpadded** sample count is passed separately as `audio_length` — the same shape
+  `ParakeetModels::run_encoder` already used. Without it every streaming partial fails on a
+  shape mismatch and only the final window works.
+- **Attention encoder-decoder, no KV cache.** This export resubmits the whole `[1, S]` token
+  tensor on **every** decode step, with `decoder_mask` marking how much of it is real; the
+  hidden state to project is row `pos - 1` of the decoder's `[1, S, 1024]` output. The token
+  tensor is **zero**-filled, not `pad_id`-filled — counter-intuitive against the shipped
+  `metadata.json` (`pad_id: 2`) and load-bearing. Each step runs inside
+  `objc2::rc::autoreleasepool`, because every step autoreleases MB-scale IOSurface-backed
+  outputs and a long decode otherwise exhausts IOSurface allocation.
+- **`S` is read from the model, never hardcoded.** `CoreMlModel::input_shape("input_ids")`'s
+  last dimension supplies it, because different builds of this same export ship different
+  sequence lengths; a decoder that declares none is a load failure, not a default.
+- **A 10-token canary2 transcribe prompt** seeds the decode: `[▁, <|startofcontext|>,
+  <|startoftranscript|>, <|emo:undefined|>, <src>, <tgt>, <|pnc|>, <|noitn|>, <|notimestamp|>,
+  <|nodiarize|>]`, with the same language id in both the source and the target slot. Same
+  source and target is what makes this transcription rather than translation.
+- **Greedy argmax over 16 384 logits, EOS id 3.** The loop breaks on EOS and does not emit it;
+  the prompt is stripped from the output.
+
+**`CoreML` pads an array's last dimension, and a dense read of a padded array returns silent
+garbage rather than an error.** The encoder declares `[1, 1024, 188]`; the stride probe
+(`coreml::tests`, `#[ignore]`d, run against the shipped bundle) measured
+`strides = [196608, 192, 1]` — the last dimension padded 188 → 192. The pre-existing
+`to_f32_vec_into` computes its length as `shape().iter().product()` and does a flat copy, so it
+would have read misaligned data and reported success. `MlArray::strides` and
+`MlArray::gather_f32_into` exist for exactly this: both the encoder→decoder transpose
+(`[1, 1024, 188]` channels-first → `[1, 188, 1024]`) and the single-hidden-row read are
+expressed as offset lists computed from the array's **real** strides, and an offset past the
+buffer `CoreML` reports is a typed error, never a garbage read.
+
+**Measured performance** (this development machine, warm `CoreML` cache, `models/` on local
+disk — re-measure before trusting these elsewhere): one 15 s window through
+Preprocessor → Encoder → greedy decode ≈ **800 ms** (813 ms on a re-run while writing this
+ADR); the `stop_stream` → final text path ≈ **803 ms** (826 ms on the same re-run) — a stop
+runs exactly one end-aligned final-window inference, so the two numbers measure the same work,
+and the second is the one a user actually feels on release; loading all four components ≈ **4 s**.
+Each number comes from its own test's `println!`, so both are re-measurable rather than
+remembered — but they come from **different** tests: the per-window figure from
+`tests/canary_batch.rs`, which times `transcribe` and nothing else, and the stop-to-text figure
+from `stream::session`'s `#[cfg(test)]`
+`canary_streams_jfk_wav_and_reports_its_stop_to_result_latency`, which is the only one that
+times from setting the stop flag to `join()` returning.
+
+**All four Canary components load `CpuOnly` — and whether the ANE would be faster is
+UNRESOLVED.** `CpuAndNeuralEngine` was the obvious first choice (fixed shapes, `<ios18>` int4
+bundles) and was attempted. On a cold `CoreML` cache the encoder's ANE plan compilation ran
+past **30 minutes** of `ANECompilerService` at ~100 % CPU without completing, with
+`MLModel::load` blocked on XPC the whole time (the process itself burned 38 s of CPU in those
+30 minutes — pure wait). It was **abandoned, not benchmarked**: no completed cold compile was
+ever observed, so there is no ANE number to compare against. CPU-only meets the latency this
+backend needs, and the shipped `metadata.json` asks for `CPU_ONLY` too (its `precision` and
+`deployment_target` fields are stale, but this field agrees with reality). Anyone reverting
+this must first measure a **completed** cold compile; the honest state of knowledge today is
+that we do not know what the ANE would cost or save here.
+
+**Transcribe only; an unsupported language is an error, never a fallback.** Canary must be
+*told* the source language — there is no auto-detect — so a wrong prompt token yields fluent,
+confident, wrong output. `canary::prompt` holds the 25 supported codes and their `<|xx|>` ids as
+the single source of truth (`tests/canary_batch.rs` asserts every one of them against the
+shipped `vocab.json`, so the check is not a table compared with itself), and
+`transcribe_prompt` returns `None` for anything else. `infer_window` turns that `None` into
+`EngineError::UnsupportedLanguage { model, language }`, which `vuho-dictation` surfaces as a
+recoverable `DictationEvent::Error` with **no** `SessionStarted`. Silently prompting `<|en|>`
+for a Japanese speaker would be exactly the hidden failure mode CONSTITUTION rule 2 forbids.
+Speech *translation* (Canary's AST mode) is out of scope: it needs its own target-language UI
+and degrades past 15 s. `vuho-os-integration::map_bcp47_to_whisper` was widened to all 25 codes
+in the same change — without it the OS layer could not *report* 17 of them, and Canary would
+have reached 8 of its 25 languages.
+
+**The macOS 15 int4 floor.** Canary's encoder and decoder are int4, which needs macOS 15; the
+project floor is 14.0. `min_macos` in the manifest is compared against the running system
+(`NSProcessInfo::isOperatingSystemAtLeastVersion`) and surfaces as
+`ModelAvailability::supported_on_this_os`, so a macOS 14 user sees "Needs macOS 15" instead of
+being offered a 569 MB download that cannot run. **Parakeet stays the manifest's
+`default_model` and still works on 14.0+** — this ADR adds a choice, it does not raise the
+floor.
+
+**Consequences:**
+- `TokenAt` and `frame_ms` move to `token.rs`, and `parakeet/vocab.rs` to `vocab.rs`: both are
+  backend-independent now, and `Vocab` is sized against the vocabulary's own upper bound rather
+  than Parakeet's `BLANK` constant.
+- `test-stt-ffi` takes `--model <id>` and builds the backend the manifest names for that id.
+  For a backend whose positions are synthetic it prints a segment **index** rather than a
+  fabricated timestamp, so the diagnostic never shows plausible-but-meaningless times.
+- Switching model in the Settings tab drops the `DictationSession` and reloads the engine
+  (`ProvisionCommand::SelectModel`), then drains stale dictation commands so a hotkey press
+  during the reload cannot leave the CapsLock LED on with no session behind it (ADR-007).
+- **The model directory name is validated where it is produced.** `dir_name_for` returns
+  `Result<String, InvalidDirName>` and accepts exactly one `Component::Normal`. `delete`'s
+  `path.starts_with(user_models_dir())` guard is component-wise, so a `VUHO_MODEL_NAME` of
+  `../../../../tmp/victim` joined onto the user directory passed both of that guard's checks
+  while the OS resolved the `..` at `remove_dir_all` time onto an unrelated directory. Adding a
+  Delete button is what turned that from a wrong path into a destructive one. Validating at the
+  producer covers the download destination too, not just the removal, and it is a refusal —
+  never a silent fall back to the manifest default, which would download into and later delete a
+  directory the operator did not name. `ModelPathError` becomes an enum
+  (`InvalidDirName`/`NotFound`) so `availability` can report the former as `Failed` with the
+  offending value rather than as a `Missing` that offers a download failing identically forever.
+- **The two env-var overrides are manifest-wide, not per model.** `env_folder`/`env_name` live
+  on `SttManifest`, so `spec_for(id)` hands every id the same pair: with `VUHO_MODEL_FOLDER`
+  set, `availability_all()` reports *both* models `Ready`/`EnvOverride` and selecting the one
+  the directory does not hold fails at load. Kept deliberately — the override exists for
+  `test-stt-ffi --model <id>`, `cargo test`, and the packaging scripts, which point it at one
+  model tree and select that model in the same breath; scoping it to `default_model` would leave
+  no way to override a non-default model's folder at all. Written down on `spec_for`,
+  `dir_name_for`, `resolve_model_folder`, and `availability` rather than left to be rediscovered.
+
+**Rejected alternatives:** a separate crate for Canary — rejected as YAGNI; it reuses
+`coreml.rs`, `vad.rs`, `stream/*`, and `vocab.rs`, and lives as `vuho-stt-engine/src/canary/`.
+A blanket `unsafe impl<T> Send/Sync for SendModel<T>` to make `StreamingEngine<M>` self-
+sufficient — rejected, see the amendment to ADR-014 below.
+
 ---
 
 ## Target architecture (after these ADRs)
@@ -1084,10 +1395,12 @@ added, ADR-020; no Swift package, ADR-014):**
 - `vuho-audio` *(reinstated, ADR-013)* — `cpal` capture thread owning the `!Send` `Stream`, `rtrb`
   ring buffer, `rubato` resample to 16 kHz mono, device enumeration, `AVCaptureDevice` mic
   permission (`objc2-av-foundation`). No `vuho-*` dependencies — a leaf crate the engine consumes.
-- `vuho-stt-engine` — `TranscriptionEngine` **trait** + `ParakeetEngine` (native CoreML,
-  ADR-014): loads the four Parakeet-TDT `.mlmodelc` components + vocab, runs greedy TDT decode
-  over a 15 s sliding window (batch, shipped) or a live growing buffer (streaming, **in
-  progress** — ADR-015). Also owns the Silero VAD wrapper (`vad.rs`, `voice_activity_detector`).
+- `vuho-stt-engine` — `TranscriptionEngine` **trait** + two backends behind one
+  `WindowInference` seam (ADR-022): `ParakeetEngine` (four Parakeet-TDT `.mlmodelc` components,
+  greedy TDT decode, native CoreML per ADR-014) and `CanaryEngine` (four Canary-1B-v2
+  components, greedy attention encoder-decoder, no KV cache). `StreamingEngine<M>` holds the
+  shared batch windowing and streaming session lifecycle, so each engine is a thin wrapper.
+  Also owns the Silero VAD wrapper (`vad.rs`, `voice_activity_detector`).
 - `vuho-dictation` — session state machine: `Toggle`/`Start`/`Stop` → `start_or_stop`; wires
   engine events → `DictationEvent`s; on stop → cleanup → inject (`handle_stop` +
   `emit_result`, split per CONSTITUTION rule 28).
@@ -1096,16 +1409,19 @@ added, ADR-020; no Swift package, ADR-014):**
 - `vuho-os-integration` — `objc2` impls: CapsLock/chord hotkey (`CGEventTap`), `inject_text`
   (`NSPasteboard` + `CGEvent` Cmd→V), TIS language detection, clipboard. No `arboard` anywhere.
   Settings-free — the `HotkeySetting` → hotkey-config mapping lives in `vuho-ui`.
-- `vuho-settings` — serde-only persistence: `HotkeySetting` preset + microphone device name,
-  atomic load/save to `~/.config/vuho/settings.json`.
+- `vuho-settings` — serde-only persistence: `HotkeySetting` preset, microphone device name, and
+  `speech_model: Option<String>` (`None` = the manifest's `default_model`, so no model id is
+  ever a literal in this crate), atomic load/save to `~/.config/vuho/settings.json`.
 - `vuho-model-paths` *(new, ADR-019)* — std-only chokepoint crate: embeds `models.manifest.json`
   at compile time, exposes typed manifest accessors and the single `resolve_model_folder`
   env-var → bundle → workspace-dev → user-data (ADR-020) resolution chain, plus the embedded
   `models.lock.json` accessors and the shared `atomic_write` helper. No macOS-specific
   dependencies.
 - `vuho-model-fetch` *(new, ADR-020)* — the **only** crate in the workspace permitted to perform
-  network I/O: `availability() -> ModelStatus` (the sidecar-and-lock verification chokepoint,
-  scoped to the user-data candidate only) and `download()` (hf-hub 1.0, Xet-first with automatic
+  network I/O: `availability(model_id) -> ModelAvailability` / `availability_all()` (the
+  sidecar-and-lock verification chokepoint, scoped to the user-data candidate only),
+  `delete(model_id)` (refused for anything but a `ModelSource::UserData` tree, ADR-022), and
+  `download(model_id, progress_tx)` (hf-hub 1.0, Xet-first with automatic
   HTTPS fallback; clears any leftover `<dir>.partial` → fetches into a fresh `<dir>.partial` →
   fully verifies it → writes the sidecar **inside** `<dir>.partial`, only once verification has
   passed → atomically renames `<dir>.partial` to `<dir>`, promoting the verified bytes and their

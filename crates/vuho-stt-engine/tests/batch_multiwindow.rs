@@ -43,7 +43,8 @@ fn jfk_repeated_three_times_has_no_seam_duplication() {
         eprintln!("skipping: JFK_WAV/jfk.wav not found in this environment");
         return;
     };
-    let Ok(model_folder) = vuho_stt_engine::resolve_model_folder() else {
+    let model_id = vuho_model_paths::manifest().stt.default_model.as_str();
+    let Ok(model_folder) = vuho_stt_engine::resolve_model_folder(model_id) else {
         eprintln!("skipping: no model folder resolved in this environment");
         return;
     };
@@ -54,7 +55,7 @@ fn jfk_repeated_three_times_has_no_seam_duplication() {
     samples.extend_from_slice(&one);
     samples.extend_from_slice(&one);
 
-    let engine = ParakeetEngine::load(model_folder).expect("engine load");
+    let engine = ParakeetEngine::load(model_id, model_folder).expect("engine load");
     let result = engine.transcribe(&samples, Some("en")).expect("transcribe");
 
     let lower = result.full_text.to_lowercase();

@@ -1,4 +1,4 @@
-//! [`download`] — fetches the Parakeet-TDT model from the Hub and leaves a
+//! [`download`] — fetches one manifest model from the Hub and leaves a
 //! complete, fully-verified tree under [`vuho_model_paths::user_models_dir`]
 //! (ADR-020).
 //!
@@ -20,9 +20,10 @@ use std::sync::Arc;
 
 use crossbeam_channel::Sender;
 use vuho_domain::ModelStatus;
-use vuho_model_paths::SttLock;
+use vuho_model_paths::{SttLock, SttModel};
 
 use crate::error::FetchError;
+use crate::partial::{partial_dir_for, remove_partial_dir};
 use crate::progress::ChannelProgress;
 use crate::verify::{self, VerifyDepth};
 
@@ -32,14 +33,9 @@ use crate::verify::{self, VerifyDepth};
 /// crate chooses it deliberately, not by omission.
 const MAX_DOWNLOAD_WORKERS: usize = 8;
 
-/// Suffix for the in-progress download directory, sibling to the final
-/// model directory. Never renamed to the final name until every locked
-/// file has been fully (hash) verified — see this function's doc comment.
-const PARTIAL_SUFFIX: &str = ".partial";
-
-/// Download the Parakeet-TDT model into [`vuho_model_paths::user_models_dir`],
-/// verify it against the embedded lock, and return the final model
-/// directory only once that verification has passed.
+/// Download `model_id` into [`vuho_model_paths::user_models_dir`], verify
+/// it against the embedded lock, and return the final model directory only
+/// once that verification has passed.
 ///
 /// Order, exactly:
 ///
@@ -71,48 +67,37 @@ const PARTIAL_SUFFIX: &str = ".partial";
 ///
 /// # Errors
 ///
-/// Returns [`FetchError`] on a missing `$HOME`, a network/transfer
+/// Returns [`FetchError`] on an unknown model id, a directory name that is
+/// not a single plain path component, a missing `$HOME`, a network/transfer
 /// failure, an I/O failure, or a post-download verification mismatch.
-pub fn download(progress_tx: &Sender<ModelStatus>) -> Result<PathBuf, FetchError> {
-    let user_dir = vuho_model_paths::user_models_dir().ok_or(FetchError::NoUserModelsDir)?;
-    fs::create_dir_all(&user_dir)?;
-
+pub fn download(model_id: &str, progress_tx: &Sender<ModelStatus>) -> Result<PathBuf, FetchError> {
     let manifest = vuho_model_paths::manifest();
-    let lock = vuho_model_paths::lock();
-    let stt = &lock.stt;
+    let (Some(model), Some(spec), Some(stt)) = (
+        manifest.stt.model(model_id),
+        manifest.stt.spec_for(model_id),
+        vuho_model_paths::lock().model(model_id),
+    ) else {
+        return Err(FetchError::UnknownModel(model_id.to_owned()));
+    };
+
     // The resolved directory name honors `VUHO_MODEL_NAME` exactly like
     // `resolve_model_folder` does — using `stt.dir_name` directly here
     // would silently ignore the override, writing bytes `availability()`
-    // (which resolves the same override-aware path) would never find.
-    let dir_name = vuho_model_paths::dir_name_for(&manifest.stt.spec());
+    // (which resolves the same override-aware path) would never find — and
+    // it validates the name, so the `join` below cannot leave `user_dir`.
+    // Ahead of `create_dir_all`, so a refused name creates nothing.
+    let dir_name = vuho_model_paths::dir_name_for(&spec)?;
+
+    let user_dir = vuho_model_paths::user_models_dir().ok_or(FetchError::NoUserModelsDir)?;
+    fs::create_dir_all(&user_dir)?;
 
     let final_dir = user_dir.join(&dir_name);
     let partial_dir = partial_dir_for(&final_dir);
-    clear_partial_dir(&partial_dir)?;
-    fetch_into(&partial_dir, stt, progress_tx)?;
+    remove_partial_dir(&partial_dir)?;
+    fetch_into(&partial_dir, model, stt, progress_tx)?;
 
     let _ = progress_tx.send(ModelStatus::Verifying);
     finish_download(&partial_dir, &final_dir, stt)
-}
-
-/// Remove any `.partial` left over from a prior interrupted attempt, so the
-/// upcoming [`fetch_into`] starts from a directory this run alone
-/// populates.
-///
-/// A leftover `.partial` must never be reused: `hf-hub`'s `local_dir` mode
-/// skips any destination file that merely [`std::path::Path::exists`], with
-/// no size/hash check (see this module's doc comment), so a truncated
-/// leftover would be treated as already-downloaded and fail verification
-/// the same way on every subsequent retry. Removing it first makes "the
-/// partial tree is exactly what this run downloaded" structurally true
-/// rather than assumed.
-fn clear_partial_dir(partial_dir: &std::path::Path) -> Result<(), FetchError> {
-    if let Err(e) = fs::remove_dir_all(partial_dir) {
-        if e.kind() != std::io::ErrorKind::NotFound {
-            return Err(e.into());
-        }
-    }
-    Ok(())
 }
 
 /// Verify an already-fetched `partial_dir` against `stt`, write its sidecar,
@@ -139,18 +124,6 @@ fn write_sidecar(partial_dir: &std::path::Path, stt: &SttLock) -> Result<(), Fet
     Ok(())
 }
 
-/// `<final_dir>` with [`PARTIAL_SUFFIX`] appended to its last path
-/// component — a sibling directory, so the eventual `rename` in
-/// [`finalize`] is a same-filesystem atomic move.
-fn partial_dir_for(final_dir: &std::path::Path) -> PathBuf {
-    let mut name = final_dir
-        .file_name()
-        .expect("model directory path always has a final component")
-        .to_os_string();
-    name.push(PARTIAL_SUFFIX);
-    final_dir.with_file_name(name)
-}
-
 /// Every allow-pattern needed to select `stt`'s components out of the
 /// upstream repo, derived entirely from the manifest — never a hardcoded
 /// model name or file list. Each component contributes two patterns: its
@@ -158,23 +131,23 @@ fn partial_dir_for(final_dir: &std::path::Path) -> PathBuf {
 /// (matches every file inside it, for a `.mlmodelc` directory component).
 /// Emitting both for every component avoids having to sniff which
 /// components are files versus directories.
-fn allow_patterns(components: &[String]) -> Vec<String> {
+fn allow_patterns(components: &[&str]) -> Vec<String> {
     components
         .iter()
-        .flat_map(|component| [component.clone(), format!("{component}/**")])
+        .flat_map(|component| [(*component).to_owned(), format!("{component}/**")])
         .collect()
 }
 
-/// Run `hf-hub`'s `snapshot_download` for `stt`'s components into
+/// Run `hf-hub`'s `snapshot_download` for `model`'s assets into
 /// `partial_dir`, reporting progress on `progress_tx`.
 fn fetch_into(
     partial_dir: &std::path::Path,
+    model: &SttModel,
     stt: &SttLock,
     progress_tx: &Sender<ModelStatus>,
 ) -> Result<(), FetchError> {
-    let manifest = vuho_model_paths::manifest();
-    let (owner, name) = hf_hub::split_id(&manifest.stt.repo);
-    let patterns = allow_patterns(&manifest.stt.components);
+    let (owner, name) = hf_hub::split_id(&model.repo);
+    let patterns = allow_patterns(&model.components());
     let handler = Arc::new(ChannelProgress::new(progress_tx.clone(), stt.total_bytes));
 
     let client = hf_hub::HFClientSync::new()?;
@@ -241,18 +214,8 @@ mod tests {
     }
 
     #[test]
-    fn partial_dir_appends_suffix_to_final_component() {
-        let final_dir = PathBuf::from("/home/user/Vuho/models/parakeet-tdt-0.6b-v3-coreml");
-        let partial = partial_dir_for(&final_dir);
-        assert_eq!(
-            partial,
-            PathBuf::from("/home/user/Vuho/models/parakeet-tdt-0.6b-v3-coreml.partial")
-        );
-    }
-
-    #[test]
     fn allow_patterns_covers_files_and_directories_for_every_component() {
-        let components = vec!["Preprocessor.mlmodelc".to_owned(), "vocab.json".to_owned()];
+        let components = ["Preprocessor.mlmodelc", "vocab.json"];
         let patterns = allow_patterns(&components);
         assert!(patterns.contains(&"Preprocessor.mlmodelc".to_owned()));
         assert!(patterns.contains(&"Preprocessor.mlmodelc/**".to_owned()));
@@ -276,46 +239,6 @@ mod tests {
         assert!(!partial.exists());
         assert!(final_dir.join("new.bin").exists());
         assert!(!final_dir.join("stale.bin").exists());
-    }
-
-    // ── Blocker 1: a leftover `.partial` must never be reused ──────────
-
-    /// Falsification target for Blocker 1. `hf-hub`'s `local_dir` mode
-    /// skips any destination file that merely exists, with no size/hash
-    /// check — so a `.partial` truncated by a prior interrupted download
-    /// must be gone before the next `fetch_into` call, or that call would
-    /// silently treat the truncated file as already-downloaded and every
-    /// retry would fail verification identically, with no way to recover
-    /// short of deleting `.partial` by hand.
-    ///
-    /// Against the pre-fix `download()` (which never removed `partial_dir`
-    /// and had no `clear_partial_dir` function at all), this test does not
-    /// compile — `git stash`ing the fix removes the function this test
-    /// calls, which is itself the demonstration that no such cleanup step
-    /// existed.
-    #[test]
-    fn clear_partial_dir_removes_a_leftover_truncated_partial() {
-        let tmp = tempfile::tempdir().unwrap();
-        let partial = tmp.path().join("model.partial");
-        fs::create_dir_all(&partial).unwrap();
-        fs::write(partial.join("weights.bin"), b"truncated-mid-transfer").unwrap();
-
-        clear_partial_dir(&partial).unwrap();
-
-        assert!(
-            !partial.exists(),
-            "a leftover .partial must be removed, not silently reused by the next download"
-        );
-    }
-
-    #[test]
-    fn clear_partial_dir_is_a_noop_when_nothing_exists() {
-        let tmp = tempfile::tempdir().unwrap();
-        let partial = tmp.path().join("model.partial");
-
-        clear_partial_dir(&partial).expect("a missing .partial is not an error");
-
-        assert!(!partial.exists());
     }
 
     // ── Blocker 2: the sidecar must only ever describe verified bytes ──

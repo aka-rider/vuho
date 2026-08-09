@@ -1,18 +1,41 @@
 {
   "bundle_id": "tech.iurii.vuho",
   "stt": {
-    "repo": "FluidInference/parakeet-tdt-0.6b-v3-coreml",
-    "revision": "aed02740059203c4a87495924f685de3722ae9ce",
-    "dir_name": "parakeet-tdt-0.6b-v3-coreml",
+    "default_model": "parakeet-tdt-0.6b-v3",
     "env_folder": "VUHO_MODEL_FOLDER",
     "env_name": "VUHO_MODEL_NAME",
-    "components": [
-      "Preprocessor.mlmodelc",
-      "ParakeetEncoder_15s.mlmodelc",
-      "ParakeetDecoder.mlmodelc",
-      "RNNTJoint.mlmodelc",
-      "parakeet_v3_vocab.json"
-    ]
+    "models": {
+      "canary-1b-v2": {
+        "display_name": "Canary 1B v2",
+        "backend": "canary_aed",
+        "repo": "FluidInference/canary-1b-v2-coreml",
+        "revision": "75c1b536fe7ca6b589d2395ed9a43169d71f543b",
+        "dir_name": "canary-1b-v2-coreml",
+        "min_macos": "15.0",
+        "assets": {
+          "preprocessor": "Preprocessor.mlmodelc",
+          "encoder": "EncoderInt4.mlmodelc",
+          "decoder": "DecoderInt4.mlmodelc",
+          "projection": "Projection.mlmodelc",
+          "vocab": "vocab.json"
+        }
+      },
+      "parakeet-tdt-0.6b-v3": {
+        "display_name": "Parakeet TDT 0.6B v3",
+        "backend": "parakeet_tdt",
+        "repo": "FluidInference/parakeet-tdt-0.6b-v3-coreml",
+        "revision": "aed02740059203c4a87495924f685de3722ae9ce",
+        "dir_name": "parakeet-tdt-0.6b-v3-coreml",
+        "min_macos": "14.0",
+        "assets": {
+          "preprocessor": "Preprocessor.mlmodelc",
+          "encoder": "ParakeetEncoder_15s.mlmodelc",
+          "decoder": "ParakeetDecoder.mlmodelc",
+          "joint": "RNNTJoint.mlmodelc",
+          "vocab": "parakeet_v3_vocab.json"
+        }
+      }
+    }
   },
   "silero": {
     "repo": "onnx-community/silero-vad",

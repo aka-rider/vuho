@@ -66,14 +66,15 @@ const PANEL_WIDTH: Pixels = px(460.0);
 /// ([`TAB_STRIP_HEIGHT`]) plus the 180px the dictation content occupies
 /// (unchanged from the old standalone overlay window's height).
 const OVERLAY_TAB_HEIGHT: Pixels = px(216.0);
-/// Height of the Settings tab: permission rows, dropdowns, and the speech
-/// model card routinely exceed 420px even before a download is in progress;
-/// the tab body scrolls (`PanelRoot::render_tab_body`), but the taller
-/// default keeps a first-launch scroll less likely. Referenced from
+/// Height of the Settings tab: permission rows, three dropdowns, and a
+/// speech-model card that now lists every known model routinely exceed
+/// 500px even before a download is in progress; the tab body scrolls
+/// (`PanelRoot::render_tab_body`), but the taller default keeps a
+/// first-launch scroll less likely. Referenced from
 /// [`panel_height`] in both builds (`Tab::Settings` exists in both — see
 /// that enum's doc comment — so the match must stay exhaustive even though
 /// a demo build never actually constructs that variant).
-const SETTINGS_TAB_HEIGHT: Pixels = px(480.0);
+const SETTINGS_TAB_HEIGHT: Pixels = px(560.0);
 
 /// Poll interval for re-checking permissions while the panel is open on the
 /// Settings tab. Matches the old readiness window's `GATE_POLL_INTERVAL` —

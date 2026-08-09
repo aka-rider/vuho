@@ -200,6 +200,7 @@ fn build_status_model(
 
     let status = cx.new(|_| StatusModel {
         model: None,
+        models: Vec::new(),
         engine: EngineState::Loading,
         recording: false,
         hotkey: HotkeyState::Active(initial_hotkey),

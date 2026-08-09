@@ -139,6 +139,25 @@ mod imp {
             dict
         }
 
+        /// The declared shape of the input feature `name`, or `None` if the
+        /// model has no such input or it is not a multi-array.
+        ///
+        /// Exists so a backend can read a dimension the export chose (e.g.
+        /// the decoder's maximum sequence length, which differs between
+        /// builds of the same model) out of the model itself instead of
+        /// hardcoding today's value.
+        pub(crate) fn input_shape(&self, name: &str) -> Option<Vec<usize>> {
+            let ns_name = NSString::from_str(name);
+            let description = unsafe { self.model.modelDescription() };
+            let inputs = unsafe { description.inputDescriptionsByName() };
+            let constraint = unsafe { inputs.objectForKey(&ns_name)?.multiArrayConstraint() }?;
+            let shape = unsafe { constraint.shape() };
+            // Tensor dimensions are always non-negative.
+            #[allow(clippy::cast_sign_loss)]
+            let dims = shape.iter().map(|n| n.integerValue() as usize).collect();
+            Some(dims)
+        }
+
         /// View an `NSMutableDictionary<NSString, MLFeatureValue>` as the
         /// `NSDictionary<NSString, AnyObject>` the feature-provider
         /// initializer expects.
@@ -153,6 +172,46 @@ mod imp {
             unsafe {
                 &*std::ptr::from_ref(dict)
                     .cast::<objc2_foundation::NSDictionary<NSString, AnyObject>>()
+            }
+        }
+    }
+
+    /// Bytes per element of an `MLMultiArray` data type.
+    ///
+    /// # Errors
+    ///
+    /// Returns `EngineError::CoreMl` for a type this crate cannot read.
+    fn element_size(dt: MLMultiArrayDataType) -> Result<usize, EngineError> {
+        match dt {
+            MLMultiArrayDataType::Float32 | MLMultiArrayDataType::Int32 => Ok(4),
+            MLMultiArrayDataType::Float16 => Ok(2),
+            other => Err(EngineError::CoreMl(format!(
+                "unsupported MLMultiArray data type: {other:?}"
+            ))),
+        }
+    }
+
+    /// Read one element of a raw `MLMultiArray` buffer as `f32`.
+    ///
+    /// SAFETY: `ptr` must point at a buffer of `dt`-typed elements and
+    /// `offset` must be within it — [`MlArray::gather_f32_into`], the only
+    /// caller, checks that against the size `CoreML` reports.
+    unsafe fn read_f32_at(ptr: NonNull<c_void>, dt: MLMultiArrayDataType, offset: usize) -> f32 {
+        unsafe {
+            match dt {
+                MLMultiArrayDataType::Float16 => {
+                    (*ptr.as_ptr().cast::<half::f16>().add(offset)).to_f32()
+                }
+                MLMultiArrayDataType::Int32 => {
+                    // Int32 arrays in this model set hold small counters
+                    // (lengths, indices), never near f32's 2^24
+                    // exact-integer boundary, so the precision loss this
+                    // lint warns about cannot occur in practice.
+                    #[allow(clippy::cast_precision_loss)]
+                    let widened = *ptr.as_ptr().cast::<i32>().add(offset) as f32;
+                    widened
+                }
+                _ => *ptr.as_ptr().cast::<f32>().add(offset),
             }
         }
     }
@@ -180,6 +239,12 @@ mod imp {
     }
 
     /// Opaque handle to an `MLMultiArray`.
+    ///
+    /// `Clone` is a retain, not a copy of the buffer: `predict` consumes
+    /// the `MlArray`s it is given, so a caller that submits the same input
+    /// on every step of a decode loop (Canary's encoder embeddings) shares
+    /// one allocation instead of rebuilding a megabyte per step.
+    #[derive(Clone)]
     pub(crate) struct MlArray {
         inner: Retained<MLMultiArray>,
     }
@@ -341,6 +406,88 @@ mod imp {
             Ok(())
         }
 
+        /// Element strides per dimension, as `CoreML` actually laid the
+        /// buffer out.
+        ///
+        /// Vendor quirk, and the reason this accessor exists at all:
+        /// `CoreML` pads an array's **last** dimension up to a 64-element
+        /// boundary, so a declared `[1, 1024, 188]` output is physically
+        /// `[1, 1024, 192]`. [`Self::to_f32_vec_into`]'s flat copy assumes
+        /// dense packing and would silently return misaligned garbage — not
+        /// an error — for such an array. Any reader of a possibly-padded
+        /// output must go through [`Self::gather_f32_into`] instead.
+        pub(crate) fn strides(&self) -> Vec<usize> {
+            let ns_arr = unsafe { self.inner.strides() };
+            // Strides are element counts, always positive and small.
+            #[allow(clippy::cast_sign_loss)]
+            let dims = ns_arr.iter().map(|n| n.integerValue() as usize).collect();
+            dims
+        }
+
+        /// Gather the elements at `offsets` (element offsets into this
+        /// array's physical buffer, as computed from [`Self::strides`])
+        /// into `out`, in `offsets` order.
+        ///
+        /// The one place this crate reads a strided/padded `MLMultiArray`
+        /// (CONSTITUTION rule 26). Callers express both a stride-aware
+        /// transpose and a single-row read as an offset list, so neither
+        /// re-derives buffer arithmetic of its own.
+        ///
+        /// `out` is cleared and resized, reusing its capacity across calls.
+        ///
+        /// # Errors
+        ///
+        /// Returns `EngineError::CoreMl` for an unsupported data type, or
+        /// if any offset lies outside the buffer `CoreML` reports — an
+        /// out-of-range offset means the layout assumption behind the
+        /// offsets is wrong, which must surface rather than read garbage.
+        pub(crate) fn gather_f32_into(
+            &self,
+            offsets: &[usize],
+            out: &mut Vec<f32>,
+        ) -> Result<(), EngineError> {
+            let dt = unsafe { self.inner.dataType() };
+            let element_size = element_size(dt)?;
+            let Some(&max_offset) = offsets.iter().max() else {
+                out.clear();
+                return Ok(());
+            };
+
+            out.clear();
+            out.resize(offsets.len(), 0.0);
+            let dst = out.as_mut_ptr();
+            let (src_offsets, count) = (offsets.as_ptr(), offsets.len());
+            let out_of_range = std::cell::Cell::new(None);
+
+            let block = block2::StackBlock::new(|ptr: NonNull<c_void>, size: NSInteger| {
+                // Byte counts from CoreML are always non-negative.
+                #[allow(clippy::cast_sign_loss)]
+                let capacity = size as usize / element_size;
+                if max_offset >= capacity {
+                    out_of_range.set(Some(capacity));
+                    return;
+                }
+                unsafe {
+                    let offsets = std::slice::from_raw_parts(src_offsets, count);
+                    for (i, &off) in offsets.iter().enumerate() {
+                        *dst.add(i) = read_f32_at(ptr, dt, off);
+                    }
+                }
+            });
+            unsafe { self.inner.getBytesWithHandler(&block) };
+
+            if let Some(capacity) = out_of_range.get() {
+                out.clear();
+                return Err(EngineError::CoreMl(format!(
+                    "strided read offset {max_offset} exceeds the {capacity}-element buffer \
+                     CoreML reports for shape {:?} / strides {:?}",
+                    self.shape(),
+                    self.strides()
+                )));
+            }
+            Ok(())
+        }
+
         /// Return the dimension sizes as a `Vec<usize>`.
         pub(crate) fn shape(&self) -> Vec<usize> {
             let ns_arr = unsafe { self.inner.shape() };
@@ -372,17 +519,19 @@ mod imp {
         }
     }
 
-    /// Thread-safe wrapper for the parts of `ParakeetModels` that aren't
-    /// inherently `Send`/`Sync` on their own: this is the crate's single
+    /// Thread-safe wrapper for a loaded backend's models, which aren't
+    /// inherently `Send`/`Sync` on their own: this is the crate's only
     /// `unsafe impl Send + Sync`.
     ///
-    /// Narrowed to the one concrete type this crate ever wraps
-    /// (`SendModel<ParakeetModels>`, from `engine.rs`) rather than a
-    /// blanket `impl<T>` — a blanket impl would let ANY future `T`
-    /// (including one holding non-thread-safe non-`CoreML` state) become
-    /// `Send`/`Sync` for free just by being wrapped here, silently
-    /// widening this crate's one unsafe-impl invariant to types it was
-    /// never audited against.
+    /// Written out per concrete wrapped type — today `ParakeetModels` and
+    /// `CanaryModels` — rather than as a blanket `impl<T>`. A blanket impl
+    /// would let ANY future `T` (including one holding non-thread-safe
+    /// non-`CoreML` state) become `Send`/`Sync` for free just by being
+    /// wrapped here, silently widening this crate's one unsafe-impl
+    /// invariant to types it was never audited against. The cost of that
+    /// refusal is that a generic wrapper over a backend cannot derive
+    /// thread-safety and must carry `where SendModel<M>: Send + Sync`
+    /// explicitly (see `streaming_engine`); that is the intended cost.
     pub(crate) struct SendModel<T>(pub T);
     // SAFETY: Apple documents `MLModel` prediction as thread-safe, so the
     // four `Retained<MLModel>` handles (`objc2`'s `Retained` is `!Send` /
@@ -400,6 +549,14 @@ mod imp {
     // happen to use.
     unsafe impl Send for SendModel<crate::parakeet::models::ParakeetModels> {}
     unsafe impl Sync for SendModel<crate::parakeet::models::ParakeetModels> {}
+    // SAFETY: identical reasoning for the Canary backend — four
+    // `Retained<MLModel>` handles (thread-safe to predict on per Apple's
+    // documentation), a plain-data `Vocab`, and one `Mutex<Vec<f32>>`
+    // scratch buffer, so concurrent `&self` access blocks rather than
+    // races. Written out again rather than folded into a blanket impl, for
+    // the reason this module's doc comment gives.
+    unsafe impl Send for SendModel<crate::canary::models::CanaryModels> {}
+    unsafe impl Sync for SendModel<crate::canary::models::CanaryModels> {}
 }
 
 #[cfg(target_os = "macos")]
@@ -436,6 +593,10 @@ mod not_macos {
             Err(EngineError::CoreMl(
                 "CoreML not available on this platform".into(),
             ))
+        }
+
+        pub(crate) fn input_shape(&self, _name: &str) -> Option<Vec<usize>> {
+            None
         }
     }
 
@@ -479,17 +640,33 @@ mod not_macos {
         pub(crate) fn shape(&self) -> Vec<usize> {
             vec![]
         }
+
+        pub(crate) fn strides(&self) -> Vec<usize> {
+            vec![]
+        }
+
+        pub(crate) fn gather_f32_into(
+            &self,
+            _offsets: &[usize],
+            _out: &mut Vec<f32>,
+        ) -> Result<(), EngineError> {
+            Err(EngineError::CoreMl(
+                "CoreML not available on this platform".into(),
+            ))
+        }
     }
 
     /// Non-macOS stub — narrowed the same way as the real `imp::SendModel`
     /// (see its doc comment) even though every method here just returns an
     /// error: consistency, not a live safety requirement on this platform.
     pub(crate) struct SendModel<T>(pub T);
-    // SAFETY: this platform's `ParakeetModels` holds only stub types that
-    // never touch any non-Send/Sync FFI state (every method is a stub
-    // returning `EngineError::CoreMl`).
+    // SAFETY: this platform's backends hold only stub types that never
+    // touch any non-Send/Sync FFI state (every method is a stub returning
+    // `EngineError::CoreMl`).
     unsafe impl Send for SendModel<crate::parakeet::models::ParakeetModels> {}
     unsafe impl Sync for SendModel<crate::parakeet::models::ParakeetModels> {}
+    unsafe impl Send for SendModel<crate::canary::models::CanaryModels> {}
+    unsafe impl Sync for SendModel<crate::canary::models::CanaryModels> {}
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -498,25 +675,39 @@ pub(crate) use not_macos::*;
 #[cfg(all(test, target_os = "macos"))]
 mod tests {
     use super::*;
+    use crate::EngineError;
 
-    /// Model-gated smoke test: loads `Preprocessor.mlmodelc` and runs one
-    /// prediction on a zeroed 15 s window, verifying the wrapper's
-    /// load/predict/array round trip end to end. Skips (not fails) when no
-    /// model is provisioned, so CI without `models/` stays green.
+    /// Load one asset of one model, or `None` when this environment has no
+    /// model provisioned (every test here skips rather than fails then, so
+    /// CI without `models/` stays green).
+    fn load_asset(model_id: &str, role: &str, units: ComputeUnits) -> Option<CoreMlModel> {
+        let folder = crate::resolve_model_folder(model_id).ok().or_else(|| {
+            eprintln!("skipping: no model folder resolved for {model_id}");
+            None
+        })?;
+        let path = crate::asset_path(model_id, role, &folder).ok()?;
+        match CoreMlModel::load(&path, units) {
+            Ok(m) => Some(m),
+            Err(e) => {
+                eprintln!("skipping: {model_id}/{role} failed to load: {e}");
+                None
+            }
+        }
+    }
+
+    /// Model-gated smoke test: loads the default model's preprocessor and
+    /// runs one prediction on a zeroed 15 s window, verifying the wrapper's
+    /// load/predict/array round trip end to end.
     #[test]
     fn preprocessor_predicts_on_zeros() {
-        let Ok(folder) = crate::resolve_model_folder() else {
-            eprintln!("skipping: no model folder resolved in this environment");
+        let default_model = vuho_model_paths::manifest().stt.default_model.as_str();
+        let Some(model) = load_asset(
+            default_model,
+            crate::asset_role::PREPROCESSOR,
+            ComputeUnits::CpuOnly,
+        ) else {
             return;
         };
-        let model =
-            match CoreMlModel::load(&folder.join("Preprocessor.mlmodelc"), ComputeUnits::CpuOnly) {
-                Ok(m) => m,
-                Err(e) => {
-                    eprintln!("skipping: Preprocessor failed to load: {e}");
-                    return;
-                }
-            };
         let audio_signal =
             MlArray::f32(&[1, 240_000], &vec![0.0f32; 240_000]).expect("build audio_signal");
         let audio_length = MlArray::i32(&[1], &[240_000]).expect("build audio_length");
@@ -530,5 +721,123 @@ mod tests {
         assert_eq!(mel.shape(), vec![1, 128, 1501]);
         let mel_data = mel.to_f32_vec().expect("mel to_f32_vec");
         assert_eq!(mel_data.len(), 128 * 1501);
+    }
+
+    /// An array this crate builds itself is densely packed, so `strides()`
+    /// equals the row-major dense strides — the baseline the padded case
+    /// below is a departure from. Model-free.
+    #[test]
+    fn a_dense_array_reports_dense_strides() {
+        let arr = MlArray::f32(&[1, 3, 4], &[0.0f32; 12]).expect("build array");
+        assert_eq!(arr.strides(), vec![12, 4, 1]);
+    }
+
+    /// A gather over an array's dense offsets reproduces its contents, and
+    /// an offset past the buffer is a typed error rather than a garbage
+    /// read. Model-free.
+    #[test]
+    fn gather_reads_by_offset_and_rejects_an_out_of_range_one() {
+        let data = [0.0f32, 1.0, 2.0, 3.0, 4.0, 5.0];
+        let arr = MlArray::f32(&[1, 2, 3], &data).expect("build array");
+
+        let mut out = Vec::new();
+        arr.gather_f32_into(&[5, 3, 0], &mut out).expect("gather");
+        assert_eq!(out, vec![5.0, 3.0, 0.0]);
+
+        let err = arr
+            .gather_f32_into(&[6], &mut out)
+            .expect_err("an offset past the buffer must be an error, not garbage");
+        assert!(
+            matches!(err, EngineError::CoreMl(_)),
+            "expected a CoreMl error, got {err:?}"
+        );
+    }
+
+    /// **WP6.S1 — the stride probe.** `CoreML` pads an array's last
+    /// dimension to a 64-element boundary, which makes a dense read of a
+    /// padded output return silent garbage. This proves empirically what
+    /// the Canary encoder's real layout is, against the actual shipped
+    /// model, before any decode logic relies on it.
+    ///
+    /// Loads with the same compute units the backend ships with, so what it
+    /// reports is the layout production actually sees.
+    ///
+    /// `#[ignore]`d: it loads two large models and is a diagnostic, not a
+    /// regression gate. Run with
+    /// `cargo test -p vuho-stt-engine -- --ignored canary_stride_probe --nocapture`.
+    #[test]
+    #[ignore = "diagnostic probe: loads the Canary preprocessor + encoder"]
+    fn canary_stride_probe() {
+        let Some(model_id) = crate::canary::manifest_model_id() else {
+            eprintln!("skipping: the manifest declares no Canary model");
+            return;
+        };
+        let Some(preprocessor) = load_asset(
+            model_id,
+            crate::asset_role::PREPROCESSOR,
+            ComputeUnits::CpuOnly,
+        ) else {
+            return;
+        };
+        let Some(encoder) = load_asset(model_id, crate::asset_role::ENCODER, ComputeUnits::CpuOnly)
+        else {
+            return;
+        };
+
+        let window = crate::stream::windower::WINDOW_SAMPLES;
+        let audio_signal = MlArray::f32(&[1, window], &vec![0.0f32; window]).expect("audio_signal");
+        #[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
+        let audio_length = MlArray::i32(&[1], &[window as i32]).expect("audio_length");
+        let prep = preprocessor
+            .predict(&[
+                ("audio_signal", audio_signal),
+                ("audio_length", audio_length),
+            ])
+            .expect("preprocessor predict");
+        let processed = prep.array("processed").expect("processed output");
+        println!(
+            "probe: processed shape={:?} strides={:?}",
+            processed.shape(),
+            processed.strides()
+        );
+
+        let enc = encoder
+            .predict(&[
+                ("features", processed),
+                (
+                    "features_length",
+                    prep.array("processed_length").expect("processed_length"),
+                ),
+            ])
+            .expect("encoder predict");
+        let encoder_out = enc.array("encoder").expect("encoder output");
+        let (shape, strides) = (encoder_out.shape(), encoder_out.strides());
+        println!("probe: encoder shape={shape:?} strides={strides:?}");
+
+        if let Some(decoder) =
+            load_asset(model_id, crate::asset_role::DECODER, ComputeUnits::CpuOnly)
+        {
+            println!(
+                "probe: decoder input_ids declared shape={:?}",
+                decoder.input_shape("input_ids")
+            );
+        }
+
+        let dense: Vec<usize> = shape
+            .iter()
+            .rev()
+            .scan(1usize, |acc, &d| {
+                let s = *acc;
+                *acc *= d;
+                Some(s)
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect();
+        println!(
+            "probe: dense strides would be {dense:?} — equal? {}",
+            dense == strides
+        );
     }
 }

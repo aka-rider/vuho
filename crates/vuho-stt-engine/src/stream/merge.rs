@@ -37,7 +37,7 @@
 //! `committed` to keep, not just a suffix to append — a deliberate
 //! departure from a strict "never mutate committed, only append" contract.
 
-use crate::parakeet::tdt::TokenAt;
+use crate::token::TokenAt;
 
 /// Result of [`merge`]: how much of `committed` the caller should keep
 /// (`committed.truncate(keep_committed)`), followed by the tokens to
@@ -52,35 +52,58 @@ pub struct MergeOutcome {
     pub(crate) append: Vec<TokenAt>,
 }
 
+/// How far a backend's positions may be trusted when reconciling an
+/// overlap: `search` bounds which tokens on each side are considered at
+/// all, and `tolerance` is how far apart two otherwise-identical words'
+/// positions may be and still count as the same word.
+///
+/// One overloaded `overlap_frames` parameter used to serve both roles.
+/// They are independent: a backend whose positions are a fixed synthetic
+/// stride rather than a measured frame index has meaningful ordering but
+/// no meaningful distance, so it widens `tolerance` without widening
+/// `search`.
+///
+/// `pub` (not `pub(crate)`): re-exported by `bench_support` for
+/// `benches/hot_paths.rs`.
+#[derive(Debug, Clone, Copy)]
+pub struct MergeBounds {
+    /// How far from the seam, in position units, to look for a match.
+    pub search: usize,
+    /// Maximum position difference between two matching words.
+    pub tolerance: usize,
+}
+
 /// Merge `fresh` tokens into `committed`, reconciling the overlap.
 ///
 /// `pub` (not `pub(crate)`): re-exported by `bench_support` for
 /// `benches/hot_paths.rs`.
 ///
-/// `overlap_frames` is the frame window for dedup matching (typically
-/// `OVERLAP_FRAMES = 25`). `piece(id)` returns `None` for a token with no
-/// vocabulary entry (including blank), and `Some((is_word_initial,
-/// raw_text))` otherwise.
+/// `bounds` comes from the backend ([`crate::window_inference::WindowInference::merge_bounds`]).
+/// `piece(id)` returns `None` for a token with no vocabulary entry
+/// (including blank), and `Some((is_word_initial, raw_text))` otherwise.
 ///
 /// Algorithm:
-/// 1. Restrict the search to each side's tokens within one `overlap_frames`
-///    window of the seam (`committed`'s last frame) — bounds the search to
-///    the physically-overlapping region instead of the whole history.
+/// 1. Restrict the search to each side's tokens within `bounds.search` of
+///    the overlap — bounds the search to the physically-overlapping region
+///    instead of the whole history. `committed`'s side is anchored at the
+///    seam (its last position); `fresh`'s is anchored at the later of the
+///    seam and `fresh`'s own first position, since the overlap is the head
+///    of `fresh`'s window wherever the seam happens to sit.
 /// 2. Segment each windowed slice into words (see `segment_words`, private).
 /// 3. Find the longest contiguous run of words whose normalized core text
 ///    matches (case-folded, edge punctuation stripped) AND whose first
-///    token's frame is within `overlap_frames / 2`, searched freely (not
+///    token's position is within `bounds.tolerance`, searched freely (not
 ///    anchored to either side's boundary).
 /// 4. If that run has at least 2 words: keep `committed` only up to the
 ///    start of the matched region, then append `fresh` from that same
 ///    matched region onward (using `fresh`'s copy of the seam).
 /// 5. Otherwise fall back to keeping all of `committed` and dropping every
-///    `fresh` token whose global frame is at or before the last committed
-///    frame.
+///    `fresh` token whose position is at or before the last committed
+///    position.
 pub fn merge<'p>(
     committed: &[TokenAt],
     fresh: Vec<TokenAt>,
-    overlap_frames: usize,
+    bounds: MergeBounds,
     piece: impl Fn(u32) -> Option<(bool, &'p str)>,
 ) -> MergeOutcome {
     if fresh.is_empty() || committed.is_empty() {
@@ -90,15 +113,27 @@ pub fn merge<'p>(
         };
     }
 
-    let boundary_frame = committed.last().map_or(0, |t| t.frame);
-    let tolerance = overlap_frames / 2;
+    let boundary_pos = committed.last().map_or(0, |t| t.pos);
 
     let overlap_committed_start =
-        committed.partition_point(|t| t.frame + overlap_frames < boundary_frame);
+        committed.partition_point(|t| t.pos.saturating_add(bounds.search) < boundary_pos);
     let overlap_committed = &committed[overlap_committed_start..];
+    // The fresh side's overlap is the head of `fresh`'s own window, so the
+    // bound is anchored at whichever is later: the seam, or `fresh`'s first
+    // position. Anchoring on the seam alone silently empties this slice
+    // whenever `committed`'s last position lands *before* `fresh` even
+    // starts — which a backend with estimated positions can produce (a
+    // sparse window's tokens are placed conservatively early, see
+    // `canary::models::stamp_positions`), and an empty fresh slice means no
+    // match is possible and the whole overlap is transcribed twice.
+    // Measured positions never trigger the `max`, so this leaves Parakeet
+    // exactly as it was.
+    let fresh_search_end = boundary_pos
+        .max(fresh.first().map_or(0, |t| t.pos))
+        .saturating_add(bounds.search);
     let overlap_fresh_end = fresh
         .iter()
-        .position(|t| t.frame > boundary_frame + overlap_frames)
+        .position(|t| t.pos > fresh_search_end)
         .unwrap_or(fresh.len());
     let overlap_fresh = &fresh[..overlap_fresh_end];
 
@@ -106,7 +141,7 @@ pub fn merge<'p>(
     let fresh_words = segment_words(overlap_fresh, &piece);
 
     if let Some((committed_word_start, fresh_word_start, len)) =
-        longest_contiguous_word_run(&committed_words, &fresh_words, tolerance)
+        longest_contiguous_word_run(&committed_words, &fresh_words, bounds.tolerance)
     {
         if len >= 2 {
             let keep_committed =
@@ -119,10 +154,7 @@ pub fn merge<'p>(
         }
     }
 
-    let drop_count = fresh
-        .iter()
-        .take_while(|t| t.frame <= boundary_frame)
-        .count();
+    let drop_count = fresh.iter().take_while(|t| t.pos <= boundary_pos).count();
     MergeOutcome {
         keep_committed: committed.len(),
         append: fresh[drop_count..].to_vec(),
@@ -130,14 +162,14 @@ pub fn merge<'p>(
 }
 
 /// One word: the token-index span `[token_start, token_end)` into the
-/// slice it was segmented from, the frame of its first token, and its
+/// slice it was segmented from, the position of its first token, and its
 /// normalized core text (all constituent tokens' raw text concatenated,
 /// lowercased, with leading/trailing non-alphanumeric characters
 /// stripped).
 struct Word {
     token_start: usize,
     token_end: usize,
-    frame: usize,
+    pos: usize,
     core: String,
 }
 
@@ -199,7 +231,7 @@ fn build_word<'p>(
     Word {
         token_start: start,
         token_end: end,
-        frame: tokens[start].frame,
+        pos: tokens[start].pos,
         core,
     }
 }
@@ -207,7 +239,7 @@ fn build_word<'p>(
 /// Find the longest contiguous run of matching words between `left` and
 /// `right`, searched freely (any starting offset in either slice) rather
 /// than anchored to a boundary. Two words match when both have a
-/// non-empty core, the cores are equal, and their frames are within
+/// non-empty core, the cores are equal, and their positions are within
 /// `tolerance`. Returns `(left_start, right_start, length)` for the best
 /// run found, or `None` if no pair matches at all.
 ///
@@ -219,7 +251,7 @@ fn longest_contiguous_word_run(
     tolerance: usize,
 ) -> Option<(usize, usize, usize)> {
     let matches = |a: &Word, b: &Word| {
-        !a.core.is_empty() && a.core == b.core && a.frame.abs_diff(b.frame) <= tolerance
+        !a.core.is_empty() && a.core == b.core && a.pos.abs_diff(b.pos) <= tolerance
     };
 
     let mut best: Option<(usize, usize, usize)> = None;
@@ -247,8 +279,17 @@ fn longest_contiguous_word_run(
 mod tests {
     use super::*;
 
-    fn tok(id: u32, frame: usize) -> TokenAt {
-        TokenAt { id, frame }
+    fn tok(id: u32, pos: usize) -> TokenAt {
+        TokenAt { id, pos }
+    }
+
+    /// The bounds Parakeet supplies (`OVERLAP_FRAMES = 25`), i.e. what
+    /// every one of these cases used to pass as a bare `25`.
+    fn bounds(search: usize) -> MergeBounds {
+        MergeBounds {
+            search,
+            tolerance: search / 2,
+        }
     }
 
     /// Test vocabulary: every id is its own whole word (`is_word_initial`
@@ -268,7 +309,7 @@ mod tests {
     fn exact_duplicate_overlap_drops_prefix() {
         let committed = vec![tok(1, 10), tok(2, 11), tok(3, 12)];
         let fresh = vec![tok(1, 10), tok(2, 11), tok(3, 12), tok(4, 13), tok(5, 14)];
-        let result = merge(&committed, fresh, 25, word_piece);
+        let result = merge(&committed, fresh, bounds(25), word_piece);
 
         assert_eq!(result.keep_committed, 0);
         assert_eq!(
@@ -278,10 +319,10 @@ mod tests {
     }
 
     #[test]
-    fn word_disagreement_falls_back_to_frame_drop() {
+    fn word_disagreement_falls_back_to_position_drop() {
         let committed = vec![tok(1, 10), tok(2, 11), tok(3, 12)];
         let fresh = vec![tok(99, 12), tok(4, 13), tok(5, 14)];
-        let result = merge(&committed, fresh, 25, word_piece);
+        let result = merge(&committed, fresh, bounds(25), word_piece);
 
         assert_eq!(result.keep_committed, committed.len());
         assert_eq!(result.append, vec![tok(4, 13), tok(5, 14)]);
@@ -291,7 +332,7 @@ mod tests {
     fn no_overlap_keeps_all_fresh() {
         let committed = vec![tok(1, 10)];
         let fresh = vec![tok(2, 20), tok(3, 21)];
-        let result = merge(&committed, fresh.clone(), 25, word_piece);
+        let result = merge(&committed, fresh.clone(), bounds(25), word_piece);
         assert_eq!(result.keep_committed, committed.len());
         assert_eq!(result.append, fresh);
     }
@@ -299,7 +340,7 @@ mod tests {
     #[test]
     fn empty_committed_returns_all_fresh() {
         let fresh = vec![tok(1, 10), tok(2, 11)];
-        let result = merge(&[], fresh.clone(), 25, word_piece);
+        let result = merge(&[], fresh.clone(), bounds(25), word_piece);
         assert_eq!(result.keep_committed, 0);
         assert_eq!(result.append, fresh);
     }
@@ -307,7 +348,7 @@ mod tests {
     #[test]
     fn empty_fresh_returns_empty() {
         let committed = vec![tok(1, 10)];
-        let result = merge(&committed, vec![], 25, word_piece);
+        let result = merge(&committed, vec![], bounds(25), word_piece);
         assert_eq!(result.keep_committed, committed.len());
         assert!(result.append.is_empty());
     }
@@ -315,7 +356,7 @@ mod tests {
     #[test]
     fn idempotence_self_merge() {
         let tokens = vec![tok(1, 10), tok(2, 11), tok(3, 12)];
-        let result = merge(&tokens, tokens.clone(), 25, word_piece);
+        let result = merge(&tokens, tokens.clone(), bounds(25), word_piece);
         assert_eq!(result.keep_committed, 0);
         assert_eq!(result.append, tokens);
     }
@@ -324,7 +365,7 @@ mod tests {
     fn all_fresh_behind_committed() {
         let committed = vec![tok(1, 100)];
         let fresh = vec![tok(2, 50), tok(3, 60)];
-        let result = merge(&committed, fresh, 25, word_piece);
+        let result = merge(&committed, fresh, bounds(25), word_piece);
         assert_eq!(result.keep_committed, committed.len());
         assert!(result.append.is_empty());
     }
@@ -333,7 +374,7 @@ mod tests {
     fn single_word_match_falls_back() {
         let committed = vec![tok(1, 10), tok(2, 11)];
         let fresh = vec![tok(1, 10), tok(3, 15)];
-        let result = merge(&committed, fresh, 25, word_piece);
+        let result = merge(&committed, fresh, bounds(25), word_piece);
 
         assert_eq!(result.keep_committed, committed.len());
         assert_eq!(result.append, vec![tok(3, 15)]);
@@ -347,7 +388,7 @@ mod tests {
     fn match_not_anchored_at_fresh_head_is_still_found() {
         let committed = vec![tok(1, 10), tok(2, 11), tok(3, 12)];
         let fresh = vec![tok(77, 9), tok(2, 11), tok(3, 12), tok(4, 13)];
-        let result = merge(&committed, fresh, 25, word_piece);
+        let result = merge(&committed, fresh, bounds(25), word_piece);
 
         assert_eq!(result.keep_committed, 1);
         assert_eq!(result.append, vec![tok(2, 11), tok(3, 12), tok(4, 13)]);
@@ -357,7 +398,7 @@ mod tests {
     fn match_found_within_overlap_window_not_just_at_tail() {
         let committed = vec![tok(1, 5), tok(2, 6), tok(3, 7), tok(4, 8)];
         let fresh = vec![tok(3, 7), tok(4, 8), tok(5, 9)];
-        let result = merge(&committed, fresh, 4, word_piece);
+        let result = merge(&committed, fresh, bounds(4), word_piece);
 
         assert_eq!(result.keep_committed, 2);
         assert_eq!(result.append, vec![tok(3, 7), tok(4, 8), tok(5, 9)]);
@@ -417,7 +458,7 @@ mod tests {
             }
         };
 
-        let result = merge(&committed, fresh, 25, piece);
+        let result = merge(&committed, fresh, bounds(25), piece);
         assert_eq!(result.keep_committed, 0);
         assert_eq!(
             result.append,
@@ -427,10 +468,10 @@ mod tests {
 
     #[test]
     fn longest_contiguous_word_run_prefers_the_longest_match() {
-        let mk = |core: &str, frame: usize| Word {
+        let mk = |core: &str, pos: usize| Word {
             token_start: 0,
             token_end: 1,
-            frame,
+            pos,
             core: core.to_string(),
         };
         let left = vec![mk("nine", 0), mk("one", 1), mk("two", 2), mk("three", 3)];
@@ -448,10 +489,10 @@ mod tests {
 
     #[test]
     fn longest_contiguous_word_run_none_when_no_match() {
-        let mk = |core: &str, frame: usize| Word {
+        let mk = |core: &str, pos: usize| Word {
             token_start: 0,
             token_end: 1,
-            frame,
+            pos,
             core: core.to_string(),
         };
         let left = vec![mk("one", 0), mk("two", 1)];
@@ -479,5 +520,72 @@ mod tests {
     #[test]
     fn segment_words_empty_slice() {
         assert!(segment_words(&[], &word_piece).is_empty());
+    }
+
+    /// A backend with estimated positions can place a sparse window's
+    /// tokens conservatively early, leaving `committed`'s last position
+    /// before `fresh`'s first. The fresh side of the overlap must still be
+    /// searched — anchoring its bound on the seam alone would empty the
+    /// slice, and an empty slice can match nothing, so the whole overlap
+    /// would be appended a second time.
+    #[test]
+    fn a_seam_behind_fresh_still_searches_freshs_head() {
+        let committed = vec![tok(1, 0), tok(2, 4), tok(3, 8)];
+        let fresh = vec![tok(2, 100), tok(3, 104), tok(4, 108)];
+        // Estimated positions come with `tolerance: usize::MAX` (text-only
+        // matching) — the proximity gate would reject this seam regardless
+        // of the search bound.
+        let estimated = MergeBounds {
+            search: 25,
+            tolerance: usize::MAX,
+        };
+        let result = merge(&committed, fresh, estimated, word_piece);
+
+        assert_eq!(
+            result.keep_committed, 1,
+            "the seam words must be found in fresh's head and re-spliced"
+        );
+        assert_eq!(result.append, vec![tok(2, 100), tok(3, 104), tok(4, 108)]);
+    }
+
+    /// A backend whose positions are a synthetic stride passes `usize::MAX`
+    /// for both bounds to mean "match on text alone, unbounded". Plain `+`
+    /// overflowed and panicked in debug builds; `saturating_add` makes both
+    /// search predicates degenerate to "consider the whole slice", which is
+    /// exactly the intended semantics.
+    #[test]
+    fn unbounded_search_and_tolerance_do_not_overflow() {
+        let unbounded = MergeBounds {
+            search: usize::MAX,
+            tolerance: usize::MAX,
+        };
+
+        let committed = vec![tok(1, 10), tok(2, 11), tok(3, 12)];
+        let fresh = vec![tok(2, 900), tok(3, 904), tok(4, 908)];
+        let result = merge(&committed, fresh, unbounded, word_piece);
+
+        assert_eq!(
+            result.keep_committed, 1,
+            "an unbounded search must still find the seam and re-splice from fresh"
+        );
+        assert_eq!(result.append, vec![tok(2, 900), tok(3, 904), tok(4, 908)]);
+    }
+
+    /// Unbounded bounds must also survive the no-match fallback path, where
+    /// an overflowing search bound panicked before any match could even be
+    /// attempted — positions near `usize::MAX` make that overflow certain.
+    #[test]
+    fn unbounded_bounds_survive_the_no_match_fallback() {
+        let unbounded = MergeBounds {
+            search: usize::MAX,
+            tolerance: usize::MAX,
+        };
+
+        let committed = vec![tok(1, usize::MAX - 1)];
+        let fresh = vec![tok(9, usize::MAX)];
+        let result = merge(&committed, fresh.clone(), unbounded, word_piece);
+
+        assert_eq!(result.keep_committed, committed.len());
+        assert_eq!(result.append, fresh);
     }
 }

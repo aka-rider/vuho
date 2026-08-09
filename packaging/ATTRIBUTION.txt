@@ -5,4 +5,8 @@ Parakeet TDT-0.6b-v3 Speech Recognition Model. Original model by NVIDIA Corporat
 
 Parakeet TDT-0.6b-v3 CoreML Conversion. Converted to CoreML format by FluidInference, also licensed under Creative Commons Attribution 4.0 International (CC-BY-4.0). Source: https://huggingface.co/FluidInference/parakeet-tdt-0.6b-v3-coreml
 
+Canary-1B-v2 Speech Recognition Model. Original model by NVIDIA Corporation, licensed under Creative Commons Attribution 4.0 International (CC-BY-4.0). Source: https://huggingface.co/nvidia/canary-1b-v2
+
+Canary-1B-v2 CoreML Conversion. Converted to CoreML format by FluidInference, also licensed under Creative Commons Attribution 4.0 International (CC-BY-4.0). Source: https://huggingface.co/FluidInference/canary-1b-v2-coreml
+
 Voice Activity Detection. Implemented using the Silero VAD model (MIT license, https://github.com/snakers4/silero-vad) via the voice_activity_detector Rust crate (MIT license, https://github.com/nkeenan38/voice_activity_detector).
