@@ -8,11 +8,13 @@
 # actionable from this repo.
 
 [graph]
-# Vuho is Apple Silicon macOS only (CLAUDE.md) — pruning the graph to this
-# target excludes gpui's Linux-only backends (wayland/x11/ashpd and their
-# transitive deps), which otherwise show up as unreachable "vulnerable"/
-# "unmaintained" noise for code that never builds on this platform.
-targets = ["aarch64-apple-darwin"]
+# Vuho targets Apple Silicon macOS and Linux (x86_64 and aarch64), so the
+# graph covers both OS families, including gpui's Linux backends.
+targets = [
+    "aarch64-apple-darwin",
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+]
 all-features = false
 no-default-features = false
 

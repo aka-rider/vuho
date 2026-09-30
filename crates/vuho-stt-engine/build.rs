@@ -6,14 +6,12 @@
 //! `tests/streaming.rs`) get silently denied rather than prompted, same as a
 //! bare `cargo run -p vuho-ui` would without `crates/vuho-ui/build.rs`.
 //!
-//! On non-macOS targets, degrades gracefully with a warning.
+//! On non-macOS targets, does nothing.
 
 use std::path::PathBuf;
 
 fn main() {
-    // Guard: only build on macOS.
     if !cfg_target_macos() {
-        println!("cargo:warning=macOS-only build step skipped on this target");
         return;
     }
 
