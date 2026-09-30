@@ -53,7 +53,7 @@ pub fn delete(model_id: &str) -> Result<(), FetchError> {
 /// The removal itself, with the resolver's answer and the user directory
 /// passed in — isolated this way so tests exercise every refusal branch
 /// against fabricated temporary directories, never the real
-/// `~/Library/Application Support` and never the workspace `models/` tree.
+/// user-data directory and never the workspace `models/` tree.
 fn delete_resolved(model_id: &str, resolved: &Resolved, user_dir: &Path) -> Result<(), FetchError> {
     if resolved.source != ModelSource::UserData {
         return Err(FetchError::NotDeletable(format!(
@@ -235,7 +235,7 @@ mod tests {
         let manifest = vuho_model_paths::manifest();
         let _guard = EnvGuard::set(manifest.stt.env_name.as_str(), "../../../../tmp/victim");
 
-        let err = delete(&manifest.stt.default_model)
+        let err = delete(manifest.stt.default_model())
             .expect_err("a traversing directory name must be refused");
         assert!(matches!(err, FetchError::InvalidDirName(_)), "{err:?}");
     }

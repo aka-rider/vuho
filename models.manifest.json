@@ -1,7 +1,10 @@
 {
   "bundle_id": "tech.iurii.vuho",
   "stt": {
-    "default_model": "parakeet-tdt-0.6b-v3",
+    "default_model": {
+      "macos": "parakeet-tdt-0.6b-v3",
+      "linux": "parakeet-tdt-0.6b-v3-onnx"
+    },
     "env_folder": "VUHO_MODEL_FOLDER",
     "env_name": "VUHO_MODEL_NAME",
     "models": {
@@ -11,7 +14,7 @@
         "repo": "FluidInference/canary-1b-v2-coreml",
         "revision": "75c1b536fe7ca6b589d2395ed9a43169d71f543b",
         "dir_name": "canary-1b-v2-coreml",
-        "min_macos": "15.0",
+        "requires": { "os": "macos", "min_version": "15.0" },
         "assets": {
           "preprocessor": "Preprocessor.mlmodelc",
           "encoder": "EncoderInt4.mlmodelc",
@@ -26,13 +29,27 @@
         "repo": "FluidInference/parakeet-tdt-0.6b-v3-coreml",
         "revision": "aed02740059203c4a87495924f685de3722ae9ce",
         "dir_name": "parakeet-tdt-0.6b-v3-coreml",
-        "min_macos": "14.0",
+        "requires": { "os": "macos", "min_version": "14.0" },
         "assets": {
           "preprocessor": "Preprocessor.mlmodelc",
           "encoder": "ParakeetEncoder_15s.mlmodelc",
           "decoder": "ParakeetDecoder.mlmodelc",
           "joint": "RNNTJoint.mlmodelc",
           "vocab": "parakeet_v3_vocab.json"
+        }
+      },
+      "parakeet-tdt-0.6b-v3-onnx": {
+        "display_name": "Parakeet TDT 0.6B v3 (ONNX)",
+        "backend": "parakeet_tdt_onnx",
+        "repo": "istupakov/parakeet-tdt-0.6b-v3-onnx",
+        "revision": "8f23f0c03c8761650bdb5b40aaf3e40d2c15f1ce",
+        "dir_name": "parakeet-tdt-0.6b-v3-onnx",
+        "requires": { "os": "linux" },
+        "assets": {
+          "preprocessor": "nemo128.onnx",
+          "encoder": "encoder-model.int8.onnx",
+          "decoder": "decoder_joint-model.int8.onnx",
+          "vocab": "vocab.txt"
         }
       },
       "voz": {
@@ -42,7 +59,7 @@
         "repo": "desert-ant-labs/voz",
         "revision": "e11906fe59d1ce9882eb8e82ed59f78bdc8e6153",
         "dir_name": "voz",
-        "min_macos": "15.0",
+        "requires": { "os": "macos", "min_version": "15.0" },
         "assets": {
           "preprocessor": "mel.mlmodelc",
           "encoder": "encoder.mlmodelc",

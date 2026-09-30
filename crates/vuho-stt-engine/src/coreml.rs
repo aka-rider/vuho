@@ -835,7 +835,7 @@ mod tests {
     /// load/predict/array round trip end to end.
     #[test]
     fn preprocessor_predicts_on_zeros() {
-        let default_model = vuho_model_paths::manifest().stt.default_model.as_str();
+        let default_model = vuho_model_paths::manifest().stt.default_model();
         let Some(model) = load_asset(
             default_model,
             crate::asset_role::PREPROCESSOR,

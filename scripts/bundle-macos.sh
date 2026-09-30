@@ -59,12 +59,12 @@ info() { echo "==> $*"; }
 
 manifest_out=$(manifest_vars "$MANIFEST" '
 emit("BUNDLE_ID", manifest["bundle_id"])
-emit("DEFAULT_MODEL", manifest["stt"]["default_model"])
+emit("DEFAULT_MODEL", manifest["stt"]["default_model"][host_os])
 ') || die "failed to read $MANIFEST (see traceback above)"
 eval "$manifest_out"
 
 # Which models get embedded (space-separated ids). Defaults to the
-# manifest's default_model, so the DMG shape is unchanged unless explicitly
+# manifest's macOS default_model, so the DMG shape is unchanged unless explicitly
 # widened; VUHO_BUNDLE_MODEL=0 still skips all of them.
 VUHO_BUNDLE_MODELS="${VUHO_BUNDLE_MODELS:-$DEFAULT_MODEL}"
 

@@ -521,7 +521,7 @@ mod tests {
                 "vuho-stt-engine-test-name-that-cannot-exist",
             );
         }
-        let err = resolve_model_folder(vuho_model_paths::manifest().stt.default_model.as_str())
+        let err = resolve_model_folder(vuho_model_paths::manifest().stt.default_model())
             .expect_err("nonexistent folder must not resolve");
         unsafe {
             std::env::remove_var("VUHO_MODEL_FOLDER");
@@ -541,7 +541,7 @@ mod tests {
     }
 
     fn default_model_id() -> &'static str {
-        vuho_model_paths::manifest().stt.default_model.as_str()
+        vuho_model_paths::manifest().stt.default_model()
     }
 
     /// Lay out `components` under a fresh `label` temp directory: a

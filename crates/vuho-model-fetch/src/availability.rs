@@ -25,7 +25,7 @@ use std::path::PathBuf;
 use vuho_domain::ModelStatus;
 use vuho_model_paths::{ModelPathError, ModelSource, Resolved, SttLock};
 
-use crate::os_support::min_macos_satisfied;
+use crate::os_support::{support, Support};
 use crate::verify::{self, VerifyDepth};
 
 /// One model's readiness, as the Settings UI needs to render its row.
@@ -47,8 +47,9 @@ pub struct ModelAvailability {
     /// Total download size from the lock, for progress totals and the
     /// "download this many MB" prompt.
     pub total_bytes: u64,
-    /// Whether the running macOS meets the manifest's `min_macos` floor.
-    pub supported_on_this_os: bool,
+    /// Whether the running OS meets the manifest's `requires`, and if not,
+    /// why.
+    pub support: Support,
 }
 
 impl ModelAvailability {
@@ -84,7 +85,7 @@ impl ModelAvailability {
 /// I/O errors while reading the user-data tree are never folded into
 /// [`ModelStatus::Missing`] (CONSTITUTION rule 2 — don't fabricate a fact
 /// the producer doesn't actually have): a permission-denied or otherwise
-/// broken `~/Library/Application Support` reports [`ModelStatus::Failed`]
+/// broken user-data directory reports [`ModelStatus::Failed`]
 /// so it diagnoses itself, instead of looping through a download that
 /// would fail the exact same way.
 #[must_use]
@@ -106,7 +107,7 @@ pub fn availability(model_id: &str) -> ModelAvailability {
         status,
         source,
         total_bytes: locked.total_bytes,
-        supported_on_this_os: min_macos_satisfied(&model.min_macos),
+        support: support(&model.requires),
     }
 }
 
@@ -116,12 +117,12 @@ pub fn availability(model_id: &str) -> ModelAvailability {
 #[must_use]
 pub fn availability_all() -> Vec<ModelAvailability> {
     let stt = &vuho_model_paths::manifest().stt;
-    std::iter::once(stt.default_model.as_str())
+    std::iter::once(stt.default_model())
         .chain(
             stt.models
                 .keys()
                 .map(String::as_str)
-                .filter(|id| *id != stt.default_model),
+                .filter(|id| *id != stt.default_model()),
         )
         .map(availability)
         .collect()
@@ -138,7 +139,7 @@ fn unknown_model(model_id: &str) -> ModelAvailability {
         },
         source: None,
         total_bytes: 0,
-        supported_on_this_os: false,
+        support: Support::Supported,
     }
 }
 
@@ -477,7 +478,7 @@ mod tests {
             status: ModelStatus::Ready,
             source: Some(ModelSource::UserData),
             total_bytes: 474,
-            supported_on_this_os: true,
+            support: Support::Supported,
         };
         assert!(ready_user_data.deletable());
 
@@ -514,7 +515,10 @@ mod tests {
         let stt = &vuho_model_paths::manifest().stt;
         let listed: Vec<String> = availability_all().into_iter().map(|m| m.id).collect();
 
-        assert_eq!(listed.first(), Some(&stt.default_model));
+        assert_eq!(
+            listed.first().map(String::as_str),
+            Some(stt.default_model())
+        );
         assert_eq!(listed.len(), stt.models.len());
         for id in stt.models.keys() {
             assert!(listed.contains(id), "{id} missing from availability_all()");
@@ -528,6 +532,5 @@ mod tests {
         assert_eq!(unknown.source, None);
         assert_eq!(unknown.total_bytes, 0);
         assert!(!unknown.deletable());
-        assert!(!unknown.supported_on_this_os);
     }
 }

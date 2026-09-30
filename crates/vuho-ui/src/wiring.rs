@@ -18,8 +18,8 @@ use crossbeam_channel::{unbounded, Receiver, Sender};
 use gpui::{App, Entity, WindowHandle};
 use vuho_dictation::DictationSession;
 use vuho_domain::{DictationCommand, DictationEvent, ModelStatus};
-use vuho_model_fetch::ModelAvailability;
-use vuho_model_paths::Backend;
+use vuho_model_fetch::{ModelAvailability, Support};
+use vuho_model_paths::{Backend, Os};
 use vuho_settings::SettingsStore;
 
 use crate::app_state::UiCommand;
@@ -587,11 +587,11 @@ pub(crate) fn selected_model_id(settings: &SettingsStore) -> String {
             log::warn!(
                 "settings: speech_model {unknown} names no model this build ships — falling back \
                  to {}",
-                stt.default_model
+                stt.default_model()
             );
-            stt.default_model.clone()
+            stt.default_model().to_owned()
         }
-        None => stt.default_model.clone(),
+        None => stt.default_model().to_owned(),
     }
 }
 
@@ -619,15 +619,13 @@ fn phase_for_availability(
     availability: ModelAvailability,
     load: &mut impl FnMut() -> Option<DictationSession>,
 ) -> Phase {
-    if !availability.supported_on_this_os {
+    if let Some(message) = unsupported_message(&availability) {
         log::warn!(
-            "provisioning: {} is not supported by this macOS version",
+            "provisioning: {} is not supported on this OS",
             availability.id
         );
         return Phase::NeedsModel {
-            status: ModelStatus::Failed {
-                message: unsupported_message(&availability),
-            },
+            status: ModelStatus::Failed { message },
             id: availability.id,
         };
     }
@@ -651,18 +649,16 @@ fn phase_for_availability(
     }
 }
 
-/// Why a model this macOS is too old for can't be selected, naming the
-/// floor from the manifest rather than a second copy of the version.
-fn unsupported_message(availability: &ModelAvailability) -> String {
-    match vuho_model_paths::manifest().stt.model(&availability.id) {
-        Some(model) => format!(
-            "{} needs macOS {} or later.",
-            availability.display_name, model.min_macos
-        ),
-        None => format!(
-            "{} is not supported on this Mac.",
-            availability.display_name
-        ),
+/// Why a model this OS cannot run can't be selected, naming the floor the
+/// manifest declared rather than a second copy of the version; `None` for a
+/// model this OS can run.
+fn unsupported_message(availability: &ModelAvailability) -> Option<String> {
+    let name = &availability.display_name;
+    match availability.support {
+        Support::Supported => None,
+        Support::NeedsMacos(version) => Some(format!("{name} needs macOS {version} or later.")),
+        Support::OtherOs(Os::Linux) => Some(format!("{name} runs only on Linux.")),
+        Support::OtherOs(Os::Macos) => Some(format!("{name} runs only on macOS.")),
     }
 }
 
@@ -805,11 +801,8 @@ fn start_download(
         log::warn!("provisioning: refusing to download {id} — no such model in the manifest");
         return (phase, ProvisionOutcome::Handled);
     }
-    if !availability.supported_on_this_os {
-        log::warn!(
-            "provisioning: refusing to download {id} — {}",
-            unsupported_message(&availability)
-        );
+    if let Some(message) = unsupported_message(&availability) {
+        log::warn!("provisioning: refusing to download {id} — {message}");
         return (phase, ProvisionOutcome::Handled);
     }
     log::info!("provisioning: starting download of {id}");
@@ -1025,6 +1018,11 @@ fn load_engine(
         Backend::ParakeetTdt => Box::new(vuho_stt_engine::ParakeetEngine::load(model_id, folder)?),
         Backend::CanaryAed => Box::new(vuho_stt_engine::CanaryEngine::load(model_id, folder)?),
         Backend::VozTdt => Box::new(vuho_stt_engine::VozEngine::load(model_id, folder)?),
+        Backend::ParakeetTdtOnnx => {
+            return Err(vuho_stt_engine::EngineError::UnknownModel(
+                model_id.to_owned(),
+            ))
+        }
     })
 }
 
@@ -1110,7 +1108,7 @@ mod tests {
     }
 
     fn default_model() -> &'static str {
-        vuho_model_paths::manifest().stt.default_model.as_str()
+        vuho_model_paths::manifest().stt.default_model()
     }
 
     /// `start_download` re-fetches `total_bytes` from the repo-pinned lock
@@ -1144,7 +1142,11 @@ mod tests {
             status,
             source: None,
             total_bytes: 100,
-            supported_on_this_os: supported,
+            support: if supported {
+                Support::Supported
+            } else {
+                Support::OtherOs(Os::Linux)
+            },
         }
     }
 

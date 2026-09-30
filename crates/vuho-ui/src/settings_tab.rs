@@ -26,8 +26,8 @@ use gpui::{
     div, prelude::*, px, Context, Div, Entity, Hsla, IntoElement, Render, SharedString, Window,
 };
 use vuho_domain::{DictationCommand, ModelStatus};
-use vuho_model_fetch::ModelAvailability;
-use vuho_model_paths::{Backend, ModelSource};
+use vuho_model_fetch::{ModelAvailability, Support};
+use vuho_model_paths::{Backend, ModelSource, Os};
 use vuho_os_integration::HotkeyListener;
 use vuho_settings::{HotkeySetting, SettingsStore};
 
@@ -619,11 +619,12 @@ fn shows_speech_model_section(status: &StatusModel) -> bool {
 
 /// Whether the model combobox may offer `model` at all: selecting a model
 /// that is not `Ready` would only fail the load, and one this macOS is too
-/// old for cannot run at all (WP8.S3 refuses both on the receiving end —
-/// this is the same rule stated where the user can see it).
+/// old for, or built for another OS, cannot run at all (WP8.S3 refuses both
+/// on the receiving end — this is the same rule stated where the user can
+/// see it).
 #[must_use]
 fn selectable(model: &ModelAvailability) -> bool {
-    model.status == ModelStatus::Ready && model.supported_on_this_os
+    model.status == ModelStatus::Ready && model.support.is_supported()
 }
 
 /// The combobox's current value: the selected model's display name, falling
@@ -661,7 +662,9 @@ fn reachable_languages(model_id: &str) -> Vec<&'static str> {
         Some(Backend::CanaryAed) => vuho_stt_engine::canary::prompt::supported_languages()
             .filter(|code| mapped.contains(code))
             .collect(),
-        Some(Backend::ParakeetTdt | Backend::VozTdt) | None => mapped.to_vec(),
+        Some(Backend::ParakeetTdt | Backend::ParakeetTdtOnnx | Backend::VozTdt) | None => {
+            mapped.to_vec()
+        }
     };
     codes.sort_unstable();
     codes
@@ -672,7 +675,8 @@ fn reachable_languages(model_id: &str) -> Vec<&'static str> {
 /// whole table is unit-testable without GPUI.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ModelRowControl {
-    /// This macOS is older than the model's manifest floor.
+    /// This OS cannot run the model: older than its manifest floor, or not
+    /// the OS it is built for.
     Unsupported(SharedString),
     Download,
     Downloading {
@@ -693,8 +697,8 @@ enum ModelRowControl {
 
 #[must_use]
 fn model_row_control(model: &ModelAvailability, is_selected: bool) -> ModelRowControl {
-    if !model.supported_on_this_os {
-        return ModelRowControl::Unsupported(min_macos_label(&model.id));
+    if let Some(label) = unsupported_label(model.support) {
+        return ModelRowControl::Unsupported(label);
     }
     match &model.status {
         ModelStatus::Missing { .. } => ModelRowControl::Download,
@@ -713,21 +717,21 @@ fn model_row_control(model: &ModelAvailability, is_selected: bool) -> ModelRowCo
     }
 }
 
-/// The macOS floor `model_id` declares in the manifest — read from there,
-/// never restated as a literal version in this view (ADR-019).
+/// Why a model row offers no action, or `None` for a model this OS can run.
+/// A macOS floor comes from the manifest via [`Support`] — never restated
+/// as a literal version in this view (ADR-019).
 #[must_use]
-fn min_macos_label(model_id: &str) -> SharedString {
-    vuho_model_paths::manifest()
-        .stt
-        .model(model_id)
-        .map_or_else(
-            || SharedString::from("Unsupported on this Mac"),
-            |model| SharedString::from(format!("Needs macOS {}", model.min_macos)),
-        )
+fn unsupported_label(support: Support) -> Option<SharedString> {
+    match support {
+        Support::Supported => None,
+        Support::NeedsMacos(version) => Some(SharedString::from(format!("Needs macOS {version}"))),
+        Support::OtherOs(Os::Linux) => Some(SharedString::from("Linux only")),
+        Support::OtherOs(Os::Macos) => Some(SharedString::from("macOS only")),
+    }
 }
 
 /// The credit `model_id`'s license requires next to it, read from the
-/// manifest like [`min_macos_label`] — never restated in this view.
+/// manifest like [`unsupported_label`] — never restated in this view.
 #[must_use]
 fn attribution_label(model_id: &str) -> Option<SharedString> {
     vuho_model_paths::manifest()
@@ -1213,7 +1217,7 @@ mod tests {
             status,
             source,
             total_bytes: 636_000_000,
-            supported_on_this_os: true,
+            support: Support::Supported,
         }
     }
 
@@ -1255,13 +1259,34 @@ mod tests {
     #[test]
     fn a_model_this_macos_is_too_old_for_offers_no_action_at_all() {
         let unsupported = ModelAvailability {
-            supported_on_this_os: false,
+            support: Support::OtherOs(Os::Linux),
             ..availability(ModelStatus::Missing { total_bytes: 1 }, None)
         };
         assert!(matches!(
             model_row_control(&unsupported, false),
             ModelRowControl::Unsupported(_)
         ));
+    }
+
+    #[test]
+    fn an_unsupported_model_row_says_what_it_needs() {
+        let floor = vuho_model_paths::MacosVersion {
+            major: 15,
+            minor: 0,
+        };
+        assert_eq!(unsupported_label(Support::Supported), None);
+        assert_eq!(
+            unsupported_label(Support::NeedsMacos(floor)),
+            Some(SharedString::from("Needs macOS 15.0"))
+        );
+        assert_eq!(
+            unsupported_label(Support::OtherOs(Os::Linux)),
+            Some(SharedString::from("Linux only"))
+        );
+        assert_eq!(
+            unsupported_label(Support::OtherOs(Os::Macos)),
+            Some(SharedString::from("macOS only"))
+        );
     }
 
     #[test]
@@ -1415,7 +1440,7 @@ mod tests {
             None
         )));
         assert!(!selectable(&ModelAvailability {
-            supported_on_this_os: false,
+            support: Support::OtherOs(Os::Linux),
             ..availability(ModelStatus::Ready, None)
         }));
     }

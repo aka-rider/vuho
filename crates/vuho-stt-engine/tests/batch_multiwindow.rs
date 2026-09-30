@@ -43,7 +43,7 @@ fn jfk_repeated_three_times_has_no_seam_duplication() {
         eprintln!("skipping: JFK_WAV/jfk.wav not found in this environment");
         return;
     };
-    let model_id = vuho_model_paths::manifest().stt.default_model.as_str();
+    let model_id = vuho_model_paths::manifest().stt.default_model();
     let Ok(model_folder) = vuho_stt_engine::resolve_model_folder(model_id) else {
         eprintln!("skipping: no model folder resolved in this environment");
         return;

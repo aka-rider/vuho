@@ -46,7 +46,7 @@ VUHO_BUNDLE_MODEL="${VUHO_BUNDLE_MODEL:-1}"
 die() { echo "ERROR: $*" >&2; exit 1; }
 
 manifest_out=$(manifest_vars "$MANIFEST" '
-emit("DEFAULT_MODEL", manifest["stt"]["default_model"])
+emit("DEFAULT_MODEL", manifest["stt"]["default_model"][host_os])
 ') || die "failed to read $MANIFEST (see traceback above)"
 eval "$manifest_out"
 
