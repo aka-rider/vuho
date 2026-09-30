@@ -15,7 +15,6 @@
 
 use vuho_model_paths::Backend;
 use vuho_stt_engine::test_support::{jfk_wav_path, load_wav_16k_mono_f32};
-use vuho_stt_engine::{CanaryEngine, ParakeetEngine, TranscriptionEngine, VozEngine};
 
 /// Sample rate every backend here expects (16 kHz mono).
 const STT_SAMPLE_RATE: u32 = 16_000;
@@ -69,21 +68,10 @@ fn main() {
 
     // ── Initialize STT engine ───────────────────────────────────────────
     println!("Initializing engine and loading models...");
-    let engine: Box<dyn TranscriptionEngine> = match model.backend {
-        Backend::ParakeetTdt => {
-            Box::new(ParakeetEngine::load(&model_id, model_folder).expect("Parakeet engine load"))
-        }
-        Backend::CanaryAed => {
-            Box::new(CanaryEngine::load(&model_id, model_folder).expect("Canary engine load"))
-        }
-        Backend::VozTdt => {
-            Box::new(VozEngine::load(&model_id, model_folder).expect("Voz engine load"))
-        }
-        Backend::ParakeetTdtOnnx => {
-            eprintln!("ERROR: {model_id} is a Linux model; this build has no engine for it");
-            std::process::exit(1);
-        }
-    };
+    let engine = vuho_stt_engine::load_engine(&model_id, model_folder).unwrap_or_else(|e| {
+        eprintln!("ERROR: {e}");
+        std::process::exit(1);
+    });
     println!("Models loaded.");
     println!();
 

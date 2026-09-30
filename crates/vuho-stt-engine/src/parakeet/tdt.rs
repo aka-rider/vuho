@@ -19,7 +19,7 @@ pub(crate) const LOGITS_LEN: usize = 8198;
 /// Maximum tokens emitted per 15s window (degenerate-chunk guard).
 const MAX_TOKENS_PER_WINDOW: usize = 150;
 /// Encoder feature dimension.
-const ENCODER_DIM: usize = 1024;
+pub(crate) const ENCODER_DIM: usize = 1024;
 
 /// One TDT model, as the greedy loop drives it: score an encoder frame,
 /// and learn which token (if any) was emitted.

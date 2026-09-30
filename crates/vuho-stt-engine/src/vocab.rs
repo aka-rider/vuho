@@ -55,28 +55,45 @@ pub(crate) struct Vocab {
 }
 
 impl Vocab {
-    /// Load the JSON vocabulary from `path`.
+    /// Load the vocabulary from `path`, in the format its extension names.
     ///
-    /// Two shapes are accepted, both meaning "token id → token string":
-    /// an object keyed by id as a string, e.g.
+    /// `.json` holds "token id → token string" in one of two shapes: an
+    /// object keyed by id as a string, e.g.
     /// `{"0":"<unk>","1":"<|nospeech|>","2":"▁hello",...}`, or an array
     /// whose index is the id, e.g. `["<unk>","<|nospeech|>","▁hello",...]`.
+    /// `.txt` holds one `piece id` pair per line, in id order, with `▁`
+    /// marking a word start (see [`Self::from_text_str`]). Any other
+    /// extension is refused rather than guessed at.
     ///
     /// `reserved_id` is an id the backend's decoder can emit but the
-    /// vocabulary file omits (Parakeet-TDT's blank); the table is sized to
-    /// cover it so [`Self::detokenize`] skips it instead of panicking. A
-    /// backend whose file already covers every emittable id passes `None`
-    /// — this is why the sizing rule is a parameter rather than a reach
-    /// into one backend's constant.
+    /// vocabulary must not name (Parakeet-TDT's blank); the table is sized
+    /// to cover it so [`Self::detokenize`] skips it instead of panicking,
+    /// and the `.txt` path (which lists the reserved id as its last line)
+    /// drops that line's entry and refuses a file of any other length;
+    /// the `.json` path keeps whatever entry the file gives it. A backend whose file
+    /// already covers every emittable id passes `None` — this is why the
+    /// sizing rule is a parameter rather than a reach into one backend's
+    /// constant.
     ///
     /// # Errors
     ///
-    /// Returns `EngineError::LoadFailed` if the file cannot be read or parsed.
+    /// Returns `EngineError::LoadFailed` if the file cannot be read or
+    /// parsed, or its extension is neither `json` nor `txt`.
     pub(crate) fn load(path: &Path, reserved_id: Option<u32>) -> Result<Self, EngineError> {
+        let parse = match path.extension().and_then(std::ffi::OsStr::to_str) {
+            Some("json") => Self::from_json_str,
+            Some("txt") => Self::from_text_str,
+            _ => {
+                return Err(EngineError::LoadFailed(format!(
+                    "vocab {} is neither a .json nor a .txt file",
+                    path.display()
+                )))
+            }
+        };
         let data = std::fs::read_to_string(path).map_err(|e| {
             EngineError::LoadFailed(format!("failed to read vocab {}: {e}", path.display()))
         })?;
-        Self::from_json_str(&data, reserved_id)
+        parse(&data, reserved_id)
     }
 
     /// Build the vocabulary from JSON text in either shape [`Self::load`]
@@ -88,18 +105,57 @@ impl Vocab {
     pub(crate) fn from_json_str(json: &str, reserved_id: Option<u32>) -> Result<Self, EngineError> {
         let file: VocabFile = serde_json::from_str(json)
             .map_err(|e| EngineError::LoadFailed(format!("failed to parse vocab JSON: {e}")))?;
+        Ok(Self::from_tokens(file.into_tokens(), reserved_id))
+    }
 
-        let mut tokens = file.into_tokens();
+    /// Build the vocabulary from the `piece id` line format: the id is what
+    /// follows the last space (a piece may itself contain spaces), ids
+    /// count up from 0 with no gap, and the `▁` word marker becomes the
+    /// leading space the JSON vocabulary uses, so both formats yield the
+    /// same table. The entry at `reserved_id` (the blank) is dropped.
+    ///
+    /// # Errors
+    ///
+    /// Returns `EngineError::LoadFailed` naming the first line that is not
+    /// `piece id` or whose id is not its line number.
+    pub(crate) fn from_text_str(text: &str, reserved_id: Option<u32>) -> Result<Self, EngineError> {
+        let mut tokens = Vec::new();
+        for (index, line) in text.lines().enumerate() {
+            let malformed = |why: &str| {
+                EngineError::LoadFailed(format!("vocab line {}: {why}: {line:?}", index + 1))
+            };
+            let (piece, id) = line
+                .rsplit_once(' ')
+                .ok_or_else(|| malformed("expected `piece id`"))?;
+            let id: usize = id.parse().map_err(|_| malformed("id is not a number"))?;
+            if id != index {
+                return Err(malformed("id is not the line number"));
+            }
+            tokens.push(Some(piece.replace('▁', " ")));
+        }
+        if let Some(blank) = reserved_id {
+            let expected = blank as usize + 1;
+            if tokens.len() != expected {
+                return Err(EngineError::LoadFailed(format!(
+                    "vocab has {} lines, expected {expected} (ids 0..={blank}, the last being the reserved id)",
+                    tokens.len()
+                )));
+            }
+            tokens[blank as usize] = None;
+        }
+        Ok(Self::from_tokens(tokens, reserved_id))
+    }
+
+    fn from_tokens(mut tokens: Vec<Option<String>>, reserved_id: Option<u32>) -> Self {
         let covered = reserved_id.map_or(0, |id| id as usize + 1);
         if tokens.len() < covered {
             tokens.resize(covered, None);
         }
         let has_byte_fallback = tokens.iter().flatten().any(|t| is_byte_fallback(t));
-
-        Ok(Self {
+        Self {
             tokens,
             has_byte_fallback,
-        })
+        }
     }
 
     /// Detokenize a sequence of tokens into text.
@@ -389,6 +445,57 @@ mod tests {
         assert_eq!(vocab.piece_info(3), None, "the reserved id has no entry");
         assert_eq!(vocab.tokens.len(), 4);
         assert_eq!(vocab.detokenize(&[tok(1), tok(2), tok(3)]), "hiic");
+    }
+
+    /// The line format yields the table the JSON format does once the `▁`
+    /// marker is read as the leading space, and the blank line is dropped.
+    #[test]
+    fn a_text_vocab_matches_the_json_table_and_drops_the_blank() {
+        let from_text = Vocab::from_text_str("<unk> 0\n▁hi 1\nic 2\n<blk> 3\n", Some(3))
+            .expect("valid text vocab");
+        let from_json = vocab_from(r#"["<unk>"," hi","ic"]"#, Some(3));
+
+        assert_eq!(from_text.tokens, from_json.tokens);
+        assert_eq!(from_text.piece_info(1), Some((true, " hi")));
+        assert_eq!(from_text.piece_info(3), None);
+        assert_eq!(from_text.detokenize(&[tok(1), tok(2), tok(3)]), "hiic");
+    }
+
+    #[test]
+    fn a_text_vocab_shorter_than_its_reserved_id_is_rejected_naming_both_counts() {
+        for truncated in ["", "<unk> 0\n▁hi 1\n"] {
+            let err = Vocab::from_text_str(truncated, Some(3)).expect_err("truncated vocab");
+            let message = err.to_string();
+            assert!(
+                message.contains(&format!("{} lines", truncated.lines().count()))
+                    && message.contains("expected 4"),
+                "got: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_text_vocab_piece_keeps_its_own_spaces() {
+        let vocab = Vocab::from_text_str("a b 0\n", None).expect("valid text vocab");
+        assert_eq!(vocab.piece_info(0), Some((false, "a b")));
+    }
+
+    #[test]
+    fn a_text_vocab_with_a_skipped_id_is_rejected() {
+        let err = Vocab::from_text_str("a 0\nb 2\n", None).expect_err("id 2 is on line 2");
+        assert!(matches!(err, EngineError::LoadFailed(msg) if msg.contains("line 2")));
+    }
+
+    #[test]
+    fn a_text_vocab_line_without_an_id_is_rejected() {
+        let err = Vocab::from_text_str("a 0\nnoid\n", None).expect_err("no id on line 2");
+        assert!(matches!(err, EngineError::LoadFailed(_)));
+    }
+
+    #[test]
+    fn a_vocab_file_of_an_unknown_extension_is_refused() {
+        let err = Vocab::load(Path::new("vocab.bin"), None).expect_err("unknown format");
+        assert!(matches!(err, EngineError::LoadFailed(msg) if msg.contains("vocab.bin")));
     }
 
     #[test]

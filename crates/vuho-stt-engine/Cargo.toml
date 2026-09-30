@@ -34,6 +34,10 @@ objc2-foundation = { workspace = true }
 objc2-core-ml = { workspace = true }
 block2 = { workspace = true }
 
+[target.'cfg(target_os = "linux")'.dependencies]
+ort = { workspace = true }
+num_cpus = { workspace = true }
+
 [dev-dependencies]
 # Self-dependency to turn on `test-fixtures` for this crate's own `cargo
 # test` run — both its unit tests (`vad.rs`/`stream/session.rs`, which use

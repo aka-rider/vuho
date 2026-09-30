@@ -739,11 +739,21 @@ mod tests {
         }
     }
 
+    /// The default model's backend, in the form a session thread can own.
     #[cfg(target_os = "macos")]
-    fn load_models() -> Option<crate::parakeet::models::ParakeetModels> {
+    type SessionModels = crate::coreml::SendModel<crate::parakeet::models::ParakeetModels>;
+    #[cfg(target_os = "linux")]
+    type SessionModels = crate::parakeet::onnx_models::OnnxParakeetModels;
+
+    fn load_models() -> Option<SessionModels> {
         let model_id = vuho_model_paths::manifest().stt.default_model();
         let folder = crate::resolve_model_folder(model_id).ok()?;
-        match crate::parakeet::models::ParakeetModels::load(model_id, &folder) {
+        #[cfg(target_os = "macos")]
+        let loaded = crate::parakeet::models::ParakeetModels::load(model_id, &folder)
+            .map(crate::coreml::SendModel);
+        #[cfg(target_os = "linux")]
+        let loaded = SessionModels::load(model_id, &folder);
+        match loaded {
             Ok(m) => Some(m),
             Err(e) => {
                 eprintln!("skipping: model load failed: {e}");
@@ -752,7 +762,6 @@ mod tests {
         }
     }
 
-    #[cfg(target_os = "macos")]
     fn tok(id: u32, pos: usize) -> TokenAt {
         TokenAt { id, pos }
     }
@@ -762,7 +771,6 @@ mod tests {
     /// — real "whole word" tokens to build a deterministic merge/promotion
     /// scenario against, without hardcoding ids the shipped vocab file
     /// happens to use today.
-    #[cfg(target_os = "macos")]
     fn find_word_initial_ids(models: &dyn WindowInference, count: usize) -> Vec<u32> {
         (0..8192u32)
             .filter(|&id| {
@@ -795,7 +803,6 @@ mod tests {
     /// on that code with exactly that duplicated sequence, and passes with
     /// `[A, B, C, D]` after the fix.
     #[test]
-    #[cfg(target_os = "macos")]
     fn promotion_applies_the_full_merge_outcome_not_just_append() {
         let Some(models) = load_models() else { return };
 
@@ -898,7 +905,6 @@ mod tests {
     /// call would either violate a `debug_assert!` on (debug builds) or
     /// silently truncate the excess audio on (release builds).
     #[test]
-    #[cfg(target_os = "macos")]
     fn oversized_chunk_commits_every_full_window_and_leaves_a_sane_tail() {
         let Some(models) = load_models() else { return };
 
@@ -1040,7 +1046,6 @@ mod tests {
     /// padded window however little of it is real audio, so the cost per
     /// call is ~constant and fewer, larger chunks keeps the test's wall
     /// time down.
-    #[cfg(target_os = "macos")]
     const FEED_CHUNK_SAMPLES: usize = 16_000;
 
     /// Send `samples` to a running session in [`FEED_CHUNK_SAMPLES`] chunks,
@@ -1061,7 +1066,6 @@ mod tests {
     /// (CONSTITUTION rule 32). `timeout` bounds only the failure case, so a
     /// genuinely broken streaming contract fails promptly instead of
     /// hanging.
-    #[cfg(target_os = "macos")]
     fn spawn_chunk_feeder(
         samples: Vec<f32>,
         chunk_tx: crossbeam_channel::Sender<Vec<f32>>,
@@ -1103,7 +1107,6 @@ mod tests {
     /// The stop is ordered by the first partial arriving — see
     /// [`spawn_chunk_feeder`].
     #[test]
-    #[cfg(target_os = "macos")]
     fn streams_jfk_wav_in_chunks_and_produces_partial_then_final() {
         /// Upper bound on how long the feeder waits for the first partial
         /// before giving up and flipping `stop` anyway — bounds the test's
@@ -1116,11 +1119,6 @@ mod tests {
             return;
         };
         let Some(models) = load_models() else { return };
-        // `MLModel` handles aren't `Send`; wrap for the cross-thread move,
-        // same as production (`ParakeetEngine`'s `Arc<SendModel<..>>`) —
-        // sound because all CoreML calls stay serialized on the one
-        // session thread below.
-        let models = crate::coreml::SendModel(models);
 
         let (chunk_tx, chunk_rx) = crossbeam_channel::unbounded::<Vec<f32>>();
         let (events_tx, events_rx) = crossbeam_channel::unbounded::<DictationEvent>();
@@ -1142,15 +1140,11 @@ mod tests {
 
         let stop_for_session = Arc::clone(&stop);
         let session = std::thread::spawn(move || {
-            // Rebind first: Rust 2021 disjoint closure capture would otherwise
-            // capture only the `.0` field below, losing `SendModel`'s `unsafe
-            // impl Send` (it applies to the whole newtype, not its field).
-            let models = models;
             run_session(
                 &chunk_rx,
                 &events_tx,
                 &stop_for_session,
-                &models.0,
+                &models,
                 audio_source,
                 "en",
                 Duration::ZERO,

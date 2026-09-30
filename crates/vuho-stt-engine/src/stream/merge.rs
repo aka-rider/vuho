@@ -110,8 +110,11 @@ impl MergeBounds {
 ///    start of the matched region, then append `fresh` from that same
 ///    matched region onward (using `fresh`'s copy of the seam).
 /// 5. Otherwise keep `committed` and drop `fresh` up to the last committed
-///    position. If that cut splits a `fresh` word: swap in `fresh`'s copy when
-///    `committed`'s last word is a strict prefix of it, else drop the whole word.
+///    position, except that the `fresh` word starting where `committed`'s
+///    last word starts replaces it when it is a strict prefix of that word
+///    (`"ask"` heard as `"asked"`). If the cut splits a `fresh` word: swap in
+///    `fresh`'s copy when `committed`'s last word is a strict prefix of it,
+///    else drop the whole word.
 pub fn merge<'p>(
     committed: &[TokenAt],
     fresh: Vec<TokenAt>,
@@ -171,6 +174,7 @@ pub fn merge<'p>(
         overlap_committed_start,
         &fresh,
         boundary_pos,
+        bounds.tolerance,
         &piece,
     )
 }
@@ -178,19 +182,36 @@ pub fn merge<'p>(
 /// The no-match fallback: `committed` stays, and `fresh` loses every token at
 /// or before `boundary_pos`. A `fresh` word straddling that cut is reconciled
 /// with `committed`'s last word rather than split.
+///
+/// The exception is `committed`'s last word being a guessed extension of a
+/// word the window edge cut (see [`replace_guessed_extension`]).
 fn merge_without_word_run<'p>(
     committed: &[TokenAt],
     committed_tail_start: usize,
     fresh: &[TokenAt],
     boundary_pos: usize,
+    tolerance: usize,
     piece: &impl Fn(u32) -> Option<(bool, &'p str)>,
 ) -> MergeOutcome {
     let drop_count = fresh.iter().take_while(|t| t.pos <= boundary_pos).count();
     let fresh_words = segment_words(fresh, piece);
+    let committed_tail = segment_words(&committed[committed_tail_start..], piece);
+
+    if let Some(outcome) = committed_tail.last().and_then(|committed_word| {
+        replace_guessed_extension(
+            committed_word,
+            &fresh_words,
+            fresh,
+            committed_tail_start,
+            tolerance,
+        )
+    }) {
+        return outcome;
+    }
+
     let straddling = fresh_words
         .iter()
         .find(|w| w.token_start < drop_count && drop_count < w.token_end);
-    let committed_tail = segment_words(&committed[committed_tail_start..], piece);
 
     match (straddling, committed_tail.last()) {
         (Some(fresh_word), Some(committed_word))
@@ -212,6 +233,36 @@ fn merge_without_word_run<'p>(
             append: fresh[drop_count..].to_vec(),
         },
     }
+}
+
+/// The `fresh` word that starts where `committed_word` starts (at most one
+/// frame earlier), if it is `committed_word` minus letters nobody heard:
+/// `fresh` then replaces `committed`'s guess from that word onward. A `fresh`
+/// word starting earlier belongs to other committed words and is never a
+/// candidate.
+fn replace_guessed_extension(
+    committed_word: &Word,
+    fresh_words: &[Word],
+    fresh: &[TokenAt],
+    committed_tail_start: usize,
+    tolerance: usize,
+) -> Option<MergeOutcome> {
+    let candidate = fresh_words
+        .iter()
+        .find(|fresh_word| fresh_word.pos.saturating_add(1) >= committed_word.pos)?;
+    extends_cut_word(committed_word, candidate, tolerance).then(|| MergeOutcome {
+        keep_committed: committed_tail_start + committed_word.token_start,
+        append: fresh[candidate.token_start..].to_vec(),
+    })
+}
+
+/// Whether `committed_word` is `fresh_word` plus letters nobody heard: the
+/// same place in the audio, and strictly longer.
+fn extends_cut_word(committed_word: &Word, fresh_word: &Word, tolerance: usize) -> bool {
+    !fresh_word.core.is_empty()
+        && committed_word.core != fresh_word.core
+        && committed_word.core.starts_with(&fresh_word.core)
+        && committed_word.pos.abs_diff(fresh_word.pos) <= tolerance
 }
 
 /// One word: the token-index span `[token_start, token_end)` into the
@@ -393,6 +444,7 @@ mod tests {
             51 => Some((false, "ic")),
             52 => Some((false, "ans")),
             53 => Some((true, " ask")),
+            54 => Some((false, "ed")),
             _ => None,
         }
     }
@@ -405,6 +457,55 @@ mod tests {
 
         assert_eq!(result.keep_committed, committed.len());
         assert_eq!(result.append, vec![tok(30, 190)]);
+    }
+
+    #[test]
+    fn a_fresh_word_replaces_committeds_guessed_extension_of_a_word_the_edge_cut() {
+        let committed = vec![tok(10, 176), tok(11, 179), tok(54, 186)];
+        let fresh = vec![tok(20, 178), tok(11, 182), tok(30, 186)];
+        let result = merge(&committed, fresh.clone(), bounds(25), seam_piece);
+
+        assert_eq!(result.keep_committed, 0);
+        assert_eq!(result.append, fresh);
+    }
+
+    #[test]
+    fn a_fresh_prefix_of_committeds_last_word_starting_earlier_does_not_replay_the_words_between() {
+        let piece = |id: u32| -> Option<(bool, &str)> {
+            match id {
+                1 => Some((true, " I")),
+                2 => Some((true, " think")),
+                3 => Some((true, " thank")),
+                4 => Some((true, " it")),
+                _ => None,
+            }
+        };
+        let committed = vec![tok(1, 100), tok(2, 104), tok(4, 108)];
+        let fresh = vec![tok(1, 100), tok(3, 104), tok(4, 108)];
+        let result = merge(&committed, fresh, bounds(25), piece);
+
+        assert_eq!(result.keep_committed, committed.len());
+        assert!(result.append.is_empty());
+    }
+
+    #[test]
+    fn a_fresh_word_starting_one_frame_before_committeds_guess_still_replaces_it() {
+        let committed = vec![tok(53, 186), tok(54, 188)];
+        let fresh = vec![tok(10, 185), tok(11, 187), tok(30, 190)];
+        let result = merge(&committed, fresh.clone(), bounds(25), seam_piece);
+
+        assert_eq!(result.keep_committed, 0);
+        assert_eq!(result.append, fresh);
+    }
+
+    #[test]
+    fn a_fresh_word_far_from_committeds_last_word_does_not_replace_it() {
+        let committed = vec![tok(50, 100), tok(51, 101), tok(52, 102)];
+        let fresh = vec![tok(20, 130), tok(30, 135)];
+        let result = merge(&committed, fresh, bounds(25), seam_piece);
+
+        assert_eq!(result.keep_committed, committed.len());
+        assert_eq!(result.append, vec![tok(20, 130), tok(30, 135)]);
     }
 
     #[test]

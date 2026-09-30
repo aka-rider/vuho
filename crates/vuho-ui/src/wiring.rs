@@ -19,7 +19,7 @@ use gpui::{App, Entity, WindowHandle};
 use vuho_dictation::DictationSession;
 use vuho_domain::{DictationCommand, DictationEvent, ModelStatus};
 use vuho_model_fetch::{ModelAvailability, Support};
-use vuho_model_paths::{Backend, Os};
+use vuho_model_paths::Os;
 use vuho_settings::SettingsStore;
 
 use crate::app_state::UiCommand;
@@ -574,7 +574,8 @@ fn run_provisioning_loop(
 /// The model the user picked, resolved against the embedded manifest: an
 /// absent setting means "the manifest's default" (ADR-019 keeps the id
 /// literal out of `vuho-settings`), and so does a setting naming a model
-/// this build no longer ships — a downgrade must fall back to something
+/// this build no longer ships or this OS has no engine for (a settings file
+/// synced from another OS) — a downgrade must fall back to something
 /// loadable rather than dead-end on an id nothing can resolve.
 ///
 /// The single place that decision is made (CONSTITUTION rule 26): the
@@ -582,11 +583,17 @@ fn run_provisioning_loop(
 pub(crate) fn selected_model_id(settings: &SettingsStore) -> String {
     let stt = &vuho_model_paths::manifest().stt;
     match settings.get().speech_model {
-        Some(id) if stt.model(&id).is_some() => id,
+        Some(id)
+            if stt
+                .model(&id)
+                .is_some_and(|m| vuho_stt_engine::runs_on_this_os(m)) =>
+        {
+            id
+        }
         Some(unknown) => {
             log::warn!(
-                "settings: speech_model {unknown} names no model this build ships — falling back \
-                 to {}",
+                "settings: speech_model {unknown} names no model this build can run — falling \
+                 back to {}",
                 stt.default_model()
             );
             stt.default_model().to_owned()
@@ -975,7 +982,10 @@ fn load_engine_and_session(
 ) -> Option<DictationSession> {
     log::info!("warmup: loading engine");
     let started = std::time::Instant::now();
-    let engine = match load_engine(&selected_model_id(settings)) {
+    let model_id = selected_model_id(settings);
+    let engine = match vuho_stt_engine::resolve_model_folder(&model_id)
+        .and_then(|folder| vuho_stt_engine::load_engine(&model_id, folder))
+    {
         Ok(engine) => engine,
         Err(e) => {
             log::error!("warmup: engine unavailable: {e}");
@@ -1000,30 +1010,6 @@ fn load_engine_and_session(
     let session = DictationSession::new(event_tx.clone(), engine, settings.clone(), injector);
     let _ = ui_tx.send(UiCommand::EngineReady(Ok(())));
     Some(session)
-}
-
-/// Build the engine `model_id`'s manifest entry calls for — the one place a
-/// [`Backend`] becomes a concrete engine, so adding a backend is one
-/// match arm here rather than a second load path.
-fn load_engine(
-    model_id: &str,
-) -> Result<Box<dyn vuho_stt_engine::TranscriptionEngine + Send>, vuho_stt_engine::EngineError> {
-    let backend = vuho_model_paths::manifest()
-        .stt
-        .model(model_id)
-        .map(|model| model.backend)
-        .ok_or_else(|| vuho_stt_engine::EngineError::UnknownModel(model_id.to_owned()))?;
-    let folder = vuho_stt_engine::resolve_model_folder(model_id)?;
-    Ok(match backend {
-        Backend::ParakeetTdt => Box::new(vuho_stt_engine::ParakeetEngine::load(model_id, folder)?),
-        Backend::CanaryAed => Box::new(vuho_stt_engine::CanaryEngine::load(model_id, folder)?),
-        Backend::VozTdt => Box::new(vuho_stt_engine::VozEngine::load(model_id, folder)?),
-        Backend::ParakeetTdtOnnx => {
-            return Err(vuho_stt_engine::EngineError::UnknownModel(
-                model_id.to_owned(),
-            ))
-        }
-    })
 }
 
 /// Spawn the thread that performs the blocking download itself, reporting

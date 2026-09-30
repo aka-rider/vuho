@@ -28,6 +28,7 @@ const SCAFFOLD: [i32; PROMPT_LEN] = [16053, 7, 4, 16, 0, 0, 5, 9, 11, 13];
 
 /// The language the load-time warmup inference decodes silence as. Its only
 /// requirement is membership in [`LANGUAGES`], pinned by a unit test below.
+#[cfg(any(target_os = "macos", test))]
 pub(crate) const WARMUP_LANGUAGE: &str = "en";
 
 /// End-of-sequence id: the decode loop stops here and does not emit it.

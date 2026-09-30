@@ -5,11 +5,11 @@ on:
     branches: [main]
   pull_request:
 
-# Vuho is Apple Silicon macOS only (CLAUDE.md) — Metal (via GPUI) is
-# required to build, so this can only run on a macOS runner. macos-15 is
-# the current GA arm64 runner image; macos-14 is deprecated (GitHub's
-# runner-images docs, checked 2026-07) — pin to a label that's still
-# provisioned rather than one riding toward removal out from under CI.
+# The full workspace builds on macOS only (the UI needs Metal via GPUI), so
+# `check` runs on a macOS runner; `linux` runs the crates that are real on
+# Linux (ADR-024). macos-15 is the current GA arm64 runner image; macos-14
+# is deprecated (GitHub's runner-images docs, checked 2026-07) — pin to a
+# label that's still provisioned rather than one riding toward removal.
 jobs:
   check:
     runs-on: macos-15
@@ -51,6 +51,7 @@ jobs:
   linux:
     runs-on: ubuntu-24.04
     env:
+      LINUX_CRATES: -p vuho-domain -p vuho-postprocess -p vuho-model-paths -p vuho-settings -p vuho-model-fetch -p vuho-audio -p vuho-stt-engine -p test-stt-ffi
       APT_PACKAGES: pkg-config libssl-dev libasound2-dev libwayland-dev libxkbcommon-dev libfontconfig-dev libvulkan1 mesa-vulkan-drivers clang cmake
     steps:
       - uses: actions/checkout@v7
@@ -79,5 +80,8 @@ jobs:
       - name: cargo fmt --check
         run: cargo fmt --check
 
+      - name: Clippy (Linux-ready crates, deny warnings)
+        run: cargo clippy ${{ env.LINUX_CRATES }} --all-targets -- -D warnings
+
       - name: Test (Linux-ready crates)
-        run: cargo test -p vuho-domain -p vuho-postprocess
+        run: cargo test ${{ env.LINUX_CRATES }}

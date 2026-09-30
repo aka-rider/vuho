@@ -23,15 +23,14 @@
 //!
 //! The `CoreML` backends, and everything that only they reach, exist on
 //! macOS only; the backend-independent half (windowing, merge, session
-//! lifecycle, vocabulary, the TDT decode loop) builds everywhere.
-
-// TEMP: no backend exists off macOS yet, so the shared half has no caller
-// there. The expectation turns into a compile error the moment one lands.
-#![cfg_attr(not(target_os = "macos"), expect(dead_code))]
+//! lifecycle, vocabulary, the TDT decode loop) builds everywhere. Linux has
+//! one backend, `OnnxParakeetEngine`: the same Parakeet-TDT weights, exported
+//! to ONNX and run by ONNX Runtime.
 
 use std::path::{Path, PathBuf};
 
 use vuho_domain::TranscriptionResult;
+use vuho_model_paths::{Backend, SttModel};
 
 pub mod vad;
 
@@ -45,8 +44,9 @@ mod mic_permission;
 #[cfg(target_os = "macos")]
 pub use mic_permission::{mic_permission_status, request_mic_permission, MicAuthStatus};
 
-// Parakeet-TDT: the decode loop is shared, its `CoreML` components are
-// macOS-only (see `parakeet::mod`).
+#[cfg(target_os = "linux")]
+mod onnx;
+
 mod parakeet;
 
 // Canary-1B-v2 model components. `pub` for its `prompt` module alone: the
@@ -80,6 +80,8 @@ mod stream;
 mod canary_engine;
 #[cfg(target_os = "macos")]
 mod engine;
+#[cfg(target_os = "linux")]
+mod onnx_engine;
 #[cfg(target_os = "macos")]
 mod voz_engine;
 
@@ -208,6 +210,12 @@ pub enum EngineError {
     #[cfg(target_os = "macos")]
     #[error("CoreML error: {0}")]
     CoreMl(String),
+    /// An ONNX Runtime failure: session creation, tensor construction, a
+    /// run, or copying an output out. Distinct from [`Self::Transcribe`], like
+    /// [`Self::CoreMl`] on macOS.
+    #[cfg(target_os = "linux")]
+    #[error("ONNX Runtime error: {0}")]
+    Onnx(String),
     /// A batch or streaming transcription call failed for a reason that
     /// isn't an inference-runtime call itself — e.g. output shape/length
     /// invariants the decode algorithm expects but a model didn't satisfy.
@@ -245,6 +253,13 @@ pub enum EngineError {
     /// asset list to resolve it with.
     #[error("unknown model id: {0}")]
     UnknownModel(String),
+    /// The model is in the manifest but belongs to another OS's backend — e.g.
+    /// a settings file synced from a Mac naming a `CoreML` model on Linux.
+    #[error("model {model} is for another operating system")]
+    ModelForOtherOs {
+        /// The manifest id of the model.
+        model: String,
+    },
     /// The OS failed to spawn the streaming session's background thread.
     #[error("failed to spawn streaming session thread: {0}")]
     SpawnFailed(String),
@@ -320,10 +335,14 @@ pub(crate) mod asset_role {
     pub(crate) const PREPROCESSOR: &str = "preprocessor";
     pub(crate) const ENCODER: &str = "encoder";
     pub(crate) const DECODER: &str = "decoder";
+    #[cfg(target_os = "macos")]
     pub(crate) const JOINT: &str = "joint";
+    #[cfg(target_os = "macos")]
     pub(crate) const PROJECTION: &str = "projection";
     pub(crate) const VOCAB: &str = "vocab";
+    #[cfg(target_os = "macos")]
     pub(crate) const EMBEDDING: &str = "embedding";
+    #[cfg(target_os = "macos")]
     pub(crate) const META: &str = "meta";
 }
 
@@ -442,8 +461,88 @@ pub trait TranscriptionEngine {
 pub use canary_engine::CanaryEngine;
 #[cfg(target_os = "macos")]
 pub use engine::ParakeetEngine;
+#[cfg(target_os = "linux")]
+pub use onnx_engine::OnnxParakeetEngine;
 #[cfg(target_os = "macos")]
 pub use voz_engine::VozEngine;
+
+/// The backends this OS has an engine for — the manifest's [`Backend`]
+/// narrowed to what this build can run.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum HostBackend {
+    /// `ParakeetEngine`.
+    #[cfg(target_os = "macos")]
+    ParakeetTdt,
+    /// `CanaryEngine`.
+    #[cfg(target_os = "macos")]
+    CanaryAed,
+    /// `VozEngine`.
+    #[cfg(target_os = "macos")]
+    VozTdt,
+    /// `OnnxParakeetEngine`.
+    #[cfg(target_os = "linux")]
+    ParakeetTdtOnnx,
+}
+
+/// The backend that runs `model` on this OS, or `None` when the model is
+/// for another OS — the one place a manifest [`Backend`] is checked against
+/// the OS this binary was built for.
+#[must_use]
+pub(crate) fn host_backend(model: &SttModel) -> Option<HostBackend> {
+    match model.backend {
+        #[cfg(target_os = "macos")]
+        Backend::ParakeetTdt => Some(HostBackend::ParakeetTdt),
+        #[cfg(target_os = "macos")]
+        Backend::CanaryAed => Some(HostBackend::CanaryAed),
+        #[cfg(target_os = "macos")]
+        Backend::VozTdt => Some(HostBackend::VozTdt),
+        #[cfg(target_os = "macos")]
+        Backend::ParakeetTdtOnnx => None,
+        #[cfg(target_os = "linux")]
+        Backend::ParakeetTdt | Backend::CanaryAed | Backend::VozTdt => None,
+        #[cfg(target_os = "linux")]
+        Backend::ParakeetTdtOnnx => Some(HostBackend::ParakeetTdtOnnx),
+    }
+}
+
+/// Whether `model` has an engine on the OS this binary was built for — the
+/// one place a manifest model meets the running OS.
+#[must_use]
+pub fn runs_on_this_os(model: &SttModel) -> bool {
+    host_backend(model).is_some()
+}
+
+/// Load the engine `model_id`'s manifest entry calls for, from an
+/// already-resolved model `folder` — the one place a model becomes a
+/// concrete engine, so adding a backend is one arm here.
+///
+/// # Errors
+///
+/// `EngineError::UnknownModel` if `model_id` is not in the manifest,
+/// `EngineError::ModelForOtherOs` if it belongs to another OS, otherwise
+/// whatever the backend's own `load` returns.
+pub fn load_engine(
+    model_id: &str,
+    folder: PathBuf,
+) -> Result<Box<dyn TranscriptionEngine + Send>, EngineError> {
+    let model = vuho_model_paths::manifest()
+        .stt
+        .model(model_id)
+        .ok_or_else(|| EngineError::UnknownModel(model_id.to_owned()))?;
+    let backend = host_backend(model).ok_or_else(|| EngineError::ModelForOtherOs {
+        model: model_id.to_owned(),
+    })?;
+    Ok(match backend {
+        #[cfg(target_os = "macos")]
+        HostBackend::ParakeetTdt => Box::new(ParakeetEngine::load(model_id, folder)?),
+        #[cfg(target_os = "macos")]
+        HostBackend::CanaryAed => Box::new(CanaryEngine::load(model_id, folder)?),
+        #[cfg(target_os = "macos")]
+        HostBackend::VozTdt => Box::new(VozEngine::load(model_id, folder)?),
+        #[cfg(target_os = "linux")]
+        HostBackend::ParakeetTdtOnnx => Box::new(OnnxParakeetEngine::load(model_id, folder)?),
+    })
+}
 
 /// List the names of available audio input devices.
 ///
@@ -505,6 +604,48 @@ mod tests {
             }
             other => panic!("expected ModelFolderMissing, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn a_model_has_a_host_backend_exactly_when_it_targets_this_os() {
+        for (id, model) in &vuho_model_paths::manifest().stt.models {
+            assert_eq!(
+                runs_on_this_os(model),
+                model.requires.os() == vuho_model_paths::HOST_OS,
+                "{id}: runs_on_this_os and the manifest's `requires` disagree"
+            );
+        }
+    }
+
+    #[test]
+    fn the_default_model_runs_on_this_os() {
+        let default = vuho_model_paths::manifest().stt.default_model_entry();
+        assert!(runs_on_this_os(default));
+    }
+
+    #[test]
+    fn a_model_for_another_os_is_a_typed_error_not_an_engine() {
+        let other_os = vuho_model_paths::manifest()
+            .stt
+            .models
+            .iter()
+            .find(|(_, model)| !runs_on_this_os(model))
+            .map(|(id, _)| id.as_str())
+            .expect("the manifest has a model for each OS");
+
+        let err = load_engine(other_os, PathBuf::from("/nonexistent-model"))
+            .err()
+            .expect("another OS's model has no engine here");
+
+        assert!(matches!(err, EngineError::ModelForOtherOs { model } if model == other_os));
+    }
+
+    #[test]
+    fn an_unknown_model_id_has_no_engine() {
+        let err = load_engine("no-such-model", PathBuf::from("/nonexistent-model"))
+            .err()
+            .expect("unknown id");
+        assert!(matches!(err, EngineError::UnknownModel(_)));
     }
 
     fn default_model_id() -> &'static str {
