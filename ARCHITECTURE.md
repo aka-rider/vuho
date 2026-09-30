@@ -24,9 +24,10 @@ what's shipped vs. still in progress. The ADRs below resolve the open architectu
   used to expose a C ABI (`@_cdecl`) loaded by Rust at runtime via `libloading`. Fully removed;
   kept here only because older ADR text below still uses the term.
 - **STT engine port** — the Rust `TranscriptionEngine` trait that dictation orchestration talks
-  to. `ParakeetEngine` (native CoreML, in-process — no dylib, no FFI) is now the only
-  implementation; the trait remains because ADR-004's variation-is-real argument still holds
-  (nothing else changed), not because a second engine is imminent.
+  to. `ParakeetEngine` (native CoreML, in-process — no dylib, no FFI) was the only
+  implementation when this entry was written; `CanaryEngine` (ADR-022) and `VozEngine`
+  (ADR-023) have since joined it, so ADR-004's variation-is-real argument now has three
+  witnesses.
 - **Session** — one dictation episode: hotkey-start → speak → hotkey-confirm-end → cleanup → inject.
   Boundaries are **explicit (hotkey-driven)**, not VAD-driven.
 - **Committed / fresh tokens** — the current streaming/windowing vocabulary (replaces the old
@@ -501,6 +502,9 @@ holds (`padded`) is a `Mutex<Vec<f32>>`, so concurrent `&self` access blocks rat
 > derive thread-safety, so `StreamingEngine<M>` carries `where SendModel<M>: Send + Sync`
 > explicitly. That is the intended cost, not an oversight.
 >
+> *Amended by ADR-023: three pairs.* `SendModel<VozModels>` joined the other two, again written
+> out per concrete type; the blanket impl is still refused for the same reason.
+>
 > *The original justification above was stale.* It said the impl was justified partly "because
 > every caller in `parakeet/models.rs` serializes predictions onto one thread per session".
 > `coreml.rs`'s own SAFETY note says the opposite, and is the accurate one: since the `Mutex`
@@ -832,6 +836,13 @@ not per call).
 > `SttModel::components()` (the sorted `assets` values) remains the one list existence checks
 > and download allow-patterns derive from.
 >
+> **Amended by ADR-023 — a third model, two more roles.** `models` now also holds `voz`
+> (`backend: "voz_tdt"`), and the role list above is no longer exhaustive: `embedding`
+> (`embedding.f16`) and `meta` (`meta.json`) joined `preprocessor`, `encoder`, `decoder`,
+> `joint`, `projection` and `vocab`. `voz` has no `joint` because the joint is fused into its
+> decoder. The invariant tests (same id sets in manifest and lock, `default_model` exists) cover
+> it unchanged.
+>
 > **`silero` deliberately keeps its `components` array.** It is provisioned by
 > `scripts/fetch-model.sh` only, has no Rust asset-role consumer, and no backend ever resolves a
 > role against it — a role map there would be ceremony with no chokepoint behind it.
@@ -950,7 +961,8 @@ everything except the one new path this ADR adds.
 > `source: None`. The per-model sidecar written inside a download directory keeps its shape —
 > the lock's `schema_version` bump guards only the repo-committed file.
 >
-> **Two models on disk is the reason Delete exists.** `models.lock.json`'s `total_bytes`,
+> **Two models on disk is the reason Delete exists.** *(Amended by ADR-023: three now — voz is
+> 485 MB in the same list.)* `models.lock.json`'s `total_bytes`,
 > which is also what the Settings list renders: Parakeet 496 MB, Canary 569 MB. `scripts/bundle-macos.sh` now loops over `VUHO_BUNDLE_MODELS`
 > (space-separated ids, defaulting to the manifest's `default_model`), so the DMG shape is
 > unchanged unless it is explicitly widened; `VUHO_BUNDLE_MODEL=0` still embeds none.
@@ -1172,7 +1184,8 @@ pub(crate) trait WindowInference {
 }
 ```
 
-`ParakeetModels` and `canary::models::CanaryModels` implement it. `StreamingEngine<M>`
+`ParakeetModels` and `canary::models::CanaryModels` implement it (*amended by ADR-023:
+`voz::models::VozModels` does too, and `VozEngine` is a third thin wrapper*). `StreamingEngine<M>`
 (`streaming_engine.rs`) holds the whole backend-independent half — batch windowing, the
 `"vuho-stt-session"` thread, the single live-session slot — so `ParakeetEngine` and
 `CanaryEngine` are thin wrappers, not two copies of one lifecycle.
@@ -1194,6 +1207,13 @@ side of `boundary_pos` (the last committed position), and the no-match fallback 
 `committed` and drops every fresh token whose `pos` is at or before `boundary_pos`. A backend
 whose positions restart or rescale between decodes therefore discards an entire decode silently
 — a green suite and an empty transcript.
+
+> **Amended by ADR-023 — the fallback reconciles a word the seam cuts.** The no-match fallback
+> described above stopped at `boundary_pos` and could cut a fresh word in half, gluing a stray
+> fragment onto the committed word ("ask" + "sk"). When the cut splits a fresh word, the
+> fallback now reconciles that word with `committed`'s last word instead (`merge_without_word_run`),
+> for every backend. Positions, `search` and the "drop at or before `boundary_pos`" rule are
+> unchanged.
 
 > **Corrected — the original claim here was false, and Canary shipped on it.** This ADR first
 > said a backend with no acoustic alignment "supplies a fixed synthetic stride instead of a
@@ -1339,7 +1359,9 @@ and degrades past 15 s. `vuho-os-integration::map_bcp47_to_whisper` was widened 
 in the same change — without it the OS layer could not *report* 17 of them, and Canary would
 have reached 8 of its 25 languages.
 
-**The macOS 15 int4 floor.** Canary's encoder and decoder are int4, which needs macOS 15; the
+**The macOS 15 int4 floor.** *(Amended by ADR-023: voz also needs macOS 15, for its `<ios18>`
+programs and the `functionName` selector rather than int4.)* Canary's encoder and decoder are
+int4, which needs macOS 15; the
 project floor is 14.0. `min_macos` in the manifest is compared against the running system
 (`NSProcessInfo::isOperatingSystemAtLeastVersion`) and surfaces as
 `ModelAvailability::supported_on_this_os`, so a macOS 14 user sees "Needs macOS 15" instead of
@@ -1370,8 +1392,8 @@ floor.
   offending value rather than as a `Missing` that offers a download failing identically forever.
 - **The two env-var overrides are manifest-wide, not per model.** `env_folder`/`env_name` live
   on `SttManifest`, so `spec_for(id)` hands every id the same pair: with `VUHO_MODEL_FOLDER`
-  set, `availability_all()` reports *both* models `Ready`/`EnvOverride` and selecting the one
-  the directory does not hold fails at load. Kept deliberately — the override exists for
+  set, `availability_all()` reports *every* model (both, when this was written; three since
+  ADR-023) `Ready`/`EnvOverride` and selecting one the directory does not hold fails at load. Kept deliberately — the override exists for
   `test-stt-ffi --model <id>`, `cargo test`, and the packaging scripts, which point it at one
   model tree and select that model in the same breath; scoping it to `default_model` would leave
   no way to override a non-default model's folder at all. Written down on `spec_for`,
@@ -1381,6 +1403,251 @@ floor.
 `coreml.rs`, `vad.rs`, `stream/*`, and `vocab.rs`, and lives as `vuho-stt-engine/src/canary/`.
 A blanket `unsafe impl<T> Send/Sync for SendModel<T>` to make `StreamingEngine<M>` self-
 sufficient — rejected, see the amendment to ADR-014 below.
+
+### ADR-023 — Voz as a third selectable backend
+
+**Status:** Accepted. Amends ADR-014 (a third `SendModel` impl pair; `coreml.rs` gains fp16 input
+and multifunction-bundle loading), ADR-015 (the seam merge's no-match fallback), ADR-019 (two
+new asset roles), ADR-020 (sizes) and ADR-022 (three backends behind the same seam).
+
+**Context:** `voz` (`desert-ant-labs/voz`, Desert Ant Labs) is a second `CoreML` export of the
+**same weights** as the default model — NVIDIA Parakeet-TDT 0.6B v3 — so it adds no new
+recognition capability and no new language. What differs is the compiled graph:
+
+| | Parakeet (FluidInference, ADR-014) | Voz (Desert Ant Labs) |
+|---|---|---|
+| Components | Preprocessor, Encoder, Decoder, RNNTJoint (+ vocab) | `mel`, `encoder`, `decoder` (+ `embedding.f16`, `meta.json`, `vocab.json`) |
+| Joint | a separate `RNNTJoint` call per decoded frame | the encoder's joint projection is folded into the encoder output (`enc_proj`); the joint and both heads are fused into the decoder |
+| Decoder call | one frame per call | one call scores up to 8 consecutive encoder frames (`decode_width`) against one LSTM state |
+| Encoder weights | see ADR-014 | 6-bit palettized (per the export's card) |
+| Precision / OS | Float32 inputs, macOS 14+ | fp16 I/O everywhere, `<ios18>` programs, macOS 15+ |
+| Locked size | 496 MB | 485 MB (485,338,884 bytes, 16 files) |
+
+The reason to carry it anyway is the fused step: the greedy TDT walk is dominated by many small
+decoder-side calls, and voz turns "one joint call per frame" into "one call per token, looking
+eight frames ahead". **The measured gain is real but modest, and this ADR does not claim more.**
+Like-for-like on this development machine (release build, `test-stt-ffi`, jfk.wav, one 11 s
+window, warm caches, two runs each — re-measure elsewhere): Parakeet 57.5 / 54.5 ms, voz
+49.4 / 47.9 ms, i.e. ≈ 12–15 % faster per window. The `cargo test` figures (the unoptimized
+test profile, so larger in absolute terms and not comparable to the release ones): one window
+162–180 ms, jfk×3 (33 s) ≈ 655–680 ms, `stop_stream` → final text 209–240 ms
+(Canary's is ≈ 850 ms, ADR-022). A backend that is only ~15 % faster than the default does
+**not** justify becoming the default, and it costs a macOS 15 floor, a source-available license
+with an attribution duty, and a first-run ANE compile (below) — so it is offered as a choice,
+and Parakeet stays the manifest's `default_model`.
+
+**Decision:** `voz::models::VozModels` implements `WindowInference`; `VozEngine` is the third
+thin wrapper over `StreamingEngine<M>`. Nothing in `stream::*` changed shape for it. The pieces
+that are voz-specific, all under `vuho-stt-engine/src/voz/`:
+
+- **`meta.json` is the one source of geometry, and it is cross-checked twice.** Every number
+  (`n_samples`, `hop_length`, `n_rows`, `enc_frames`, `decode_width`, `n_logits`, durations, …)
+  is read from the file the export ships rather than restated in Rust. `Meta::load` first
+  checks the numbers against each other and against the pipeline's own window geometry (15 s,
+  1280-sample encoder frames); `Meta::verify_models` then compares **14 tensor shapes** the
+  three loaded models declare against what `meta.json` implies, so a `meta.json` and a bundle
+  from different exports fail at load with the tensor named instead of decoding garbage.
+- **Front end on the host.** `mel.mlmodelc` takes the audio pre-framed as `audio_rows
+  [1, 160, 1, 1503]` (row `i % 160`, column `i / 160`, with `n_fft / 2` zeros on the left and
+  the pre-emphasis decay of the last sample on the right only when the window is exactly full)
+  plus a `mel_mask`; the encoder takes an additive `key_bias` (0 for attended frames, −40 000 for
+  padding). `voz::frontend` builds all of it; the formulas come from the vendor's runtime and
+  the `.mil` files. **`pad_mask` is all ones, always** — zeroing it explodes BatchNorm in this
+  export, so it is written down as a vendor quirk rather than derived.
+- **One multifunction decoder, one function.** `decoder.mlmodelc` holds `main` (16 lanes) and
+  `decoder_8/4/2/1`. Dictation decodes one window at a time, so `main` would spend fifteen
+  lanes on zeros; Vuho loads `decoder_1` through `MLModelConfiguration.functionName`
+  (`CoreMlModel::load_function`). That selector is macOS 15 API and is sent as an ordinary
+  Objective-C message rather than linked, so the binary still launches on 14. `load_function`
+  checks `respondsToSelector:` first and returns `EngineError::LoadFailed` naming the function
+  when the selector is absent, so the load fails on its own terms on macOS 14 instead of
+  depending on the manifest's `min_macos` having refused the model earlier.
+- **A failed warm-up is fatal at load.** `VozModels::load` ends with one inference on a zeroed
+  window (which also triggers the ANE plan compile) and turns its failure into
+  `EngineError::LoadFailed`, so a broken bundle is reported when the model is selected. Parakeet
+  and Canary still log a failed warm-up and carry on, surfacing it only at the first real
+  session; that difference is deliberate for now and tracked in `TODO.md`.
+- **The LSTM state is explicit tensors, not `MLState`.** The export takes `h_in`/`c_in` and
+  returns `h_out`/`c_out` (`[1, 1280, 1, 1]`, two layers stacked); the host threads them. The
+  token embedding is a host-side lookup into `embedding.f16` (raw little-endian half floats,
+  `[8193, 640]`, the blank's row last), whose byte length is validated against `meta.json` at
+  load.
+- **The decode walk** (`voz::tdt`, pure — the decoder is a `DecoderStep`, so the walk is tested
+  without `CoreML`). One call scores up to 8 frames from `position`; the walk reads them left to
+  right, hopping over each blank by its predicted duration (at least one frame), and stops at
+  the first token. Every frame before it was blank and left the state as it was, so the state
+  advances **only** on a token, and the next call starts at `position + offset + duration`
+  with that token as the label. Ten zero-duration emissions in a row, with the position not
+  advancing in between, force one frame of progress, so a degenerate output cannot loop; the
+  count restarts whenever the position moves. That limit is `token::MAX_EMISSIONS_PER_POSITION`,
+  one constant shared with Parakeet's loop, which used to keep its own copy. `argmax_f32` is
+  shared with Parakeet's loop too (CONSTITUTION rule 26). State is fresh per window (ADR-015),
+  as for Parakeet.
+- **Compute units: mel and encoder `CpuAndNeuralEngine`, decoder `CpuOnly`.** That is the split
+  the export's author measured best, and the reason is dispatch cost: the fused step is small
+  and called many times, so an ANE round trip per call costs more than the CPU does. It was not
+  re-derived here — only adopted, then checked to work.
+- **No language prompt.** Like Parakeet, voz is multilingual with automatic language
+  identification; `infer_window` ignores `language`. There is therefore no
+  `UnsupportedLanguage` path, and `reachable_languages` in `settings_tab.rs` groups it with
+  Parakeet. (The export's card lists the same 25 European languages as Parakeet v3; the Settings
+  line under the combobox still shows the OS-mapped set for Parakeet-family backends, as it did
+  before.)
+- **Positions are measured, so the merge bounds are Parakeet's.** A voz token's `pos` is the
+  real 80 ms encoder frame it was read at. `MergeBounds::measured_positions()` (`{ search:
+  OVERLAP_FRAMES, tolerance: OVERLAP_FRAMES / 2 }`) is now the one place those bounds are
+  written, and both `ParakeetModels` and `VozModels` call it.
+
+**What the `CoreML` wrapper gained, all of it shared:**
+
+- `CoreMlModel::load_function` (above) and `output_shape` (the output-side twin of
+  `input_shape`, on a shared `declared_shape` helper) for the `meta.json` cross-check.
+- `MlArray::f16(shape, &[f32])`: `CoreML` rejects a Float32 array for an fp16 input rather than
+  converting it, so voz builds half-precision inputs (via the `half` crate, which is now an
+  unconditional dependency of the crate instead of a macOS-only one).
+- **`MlArray::f32`/`i32`/`f16` now share one writer, `filled`, and it refuses a padded
+  array.** The writers previously copied densely, trusting that `CoreML` would allocate a
+  dense buffer for an input. `filled` reads the strides `CoreML` reports and returns a typed
+  `EngineError::CoreMl` if they are not the dense row-major strides of the shape — the write-side
+  twin of the read-side rule below, instead of a silently misaligned input.
+- `Vocab::load` accepts either on-disk shape — the id-keyed object Parakeet and Canary ship, or
+  voz's plain array whose index is the id — through one untagged-enum reader, split into a file
+  read and `Vocab::from_json_str` so the two shapes are tested without a file. A second
+  vocabulary loader was rejected (CONSTITUTION rule 26).
+
+**Padding, a second and third data point for ADR-022's rule.** Measured on the shipped bundle:
+`enc_proj` declares `[1, 640, 1, 188]` and reports strides `[122880, 192, 192, 1]` (188 → 192);
+the decoder's `logits` declares `[1, 8198, 1, 8]` and reports `[262336, 32, 32, 1]` (8 → 32);
+`h_out`/`c_out` declare `[1, 1280, 1, 1]` and report `[40960, 32, 32, 1]` (1 → 32). The padding
+is not specific to a large last dimension: it hits a single column. Every voz read goes through
+`column_major_offsets` — offsets computed from the array's **real** strides — and
+`MlArray::gather_f32_into`; there is no dense read of a voz output anywhere.
+
+**A seam-merge defect this backend exposed, and it changed every backend.** `jfk.wav` ×3 with
+voz came back as "…**asksk** not what your country…". Two facts about the cause are established
+and one is not.
+
+*Established.* An independent review dumped the seam tokens of voz and Parakeet through the
+same windower. Voz's committed tail was `…▁a@176 sk@179`; Parakeet's was `…a@176 sk@178
+not@181 .@186`; the fresh head was identical for both, `▁A@178 sk@182 ▁not@190`. Positions
+agree within about one frame, so voz's positions are not offset from Parakeet's, and the second
+window did **not** begin in the middle of "Americans" (this ADR first said it did; that was
+wrong). The difference is in what window 1 emitted: voz read `sk@179` with duration 4, jumped
+to frame 183, and saw only blanks from 183 to 187, so it never emitted the "not"@181 that
+Parakeet did. The overlap therefore held one shared word, too little to splice on, and `merge`
+took its no-match fallback. That fallback dropped every fresh token at or before the last
+committed position (179): `▁A@178` went, `sk@182` stayed. The cut fell *between* the two pieces
+of one word: the committed side already held "ask" whole, and fresh's leftover `sk` was glued
+onto it. Turning off the full-window pre-emphasis tail on the `mel` input did
+not change voz's tokens, so that was ruled out.
+
+*Hypothesis, not proven.* Why voz's window-1 decode misses "not" at the window edge is
+unexplained. The best guess is that the 6-bit palettized encoder behaves differently from
+Parakeet's at the last frames of a window. It is consistent with one more observation: on a
+single `jfk.wav`, voz also drops the final "." that Parakeet keeps. No experiment here isolated
+the encoder as the cause, and the merge rule below does not depend on it.
+
+*The first fix was wrong.* The first repair dropped the continuation pieces of any word the
+seam cuts. It lost real text when `committed` itself ended mid-word: committed `▁Amer@159
+ic@163`, fresh `▁Amer@160 ic@162 ans@167 ▁ask@176` came out as "Americ ask". That version was
+replaced, not patched.
+
+**The rule now in `merge_without_word_run`** (the no-match fallback, every backend):
+
+1. Drop fresh tokens at or before the last committed position, as before.
+2. If that cut does not split a fresh word, that is all — the old behavior exactly.
+3. If it splits a fresh word, reconcile that word with `committed`'s last word (segmented from
+   the overlap tail with the existing `segment_words`):
+   - committed's last word is a **non-empty strict prefix** of the fresh word — committed was
+     cut short at the window edge — so swap in fresh's complete copy: `keep_committed` shrinks
+     to before that word and the whole fresh word is appended;
+   - otherwise (the words are equal, or unrelated) keep committed and drop the fresh word
+     whole, so a leftover fragment is never glued onto it.
+
+This is a general seam-robustness fix that voz happened to expose, and it is judged on that
+footing, not as a voz special case. It fires only inside the fallback and only when the cut
+splits a word, so a decode that spliced normally is untouched. Pinned by five model-free
+specifications in `stream::merge`:
+`a_fresh_copy_of_the_word_the_seam_cuts_is_dropped_whole`,
+`a_fresh_that_starts_mid_word_keeps_what_it_has`,
+`a_word_cut_short_at_the_window_edge_is_completed_by_fresh`,
+`an_unrelated_word_across_the_seam_never_gets_glued_to_committed` and
+`a_fresh_word_starting_after_the_seam_is_kept_untouched`; and end to end by
+`voz_crosses_a_window_seam_without_dropping_or_duplicating`.
+
+**Measured, and what was not** (this development machine — re-measure elsewhere): `VozEngine::
+load` ≈ 0.29–0.36 s with a warm `CoreML` cache; **≈ 17 s** the one time the ANE plan
+compilation for `mel` and `encoder` ran cold (the export's author quotes ≈ 20 s). That is a
+single cold observation on a machine whose cache was otherwise warm — **no clean-machine
+number exists**, and this ADR does not pretend one does, the same standing caveat CLAUDE.md
+carries for Parakeet's warmup. `wiring::wire_production` warms the engine on a background
+thread, so the cost is a longer `Loading model…`, not a frozen UI. The `test-stt-ffi --model voz`
+transcript is "And so, my fellow Americans, ask not what your country can do for you, ask what
+you can do for your country". Unlike Canary, no ANE compile was abandoned: the encoder is an
+ordinary ANE plan that compiled to completion.
+
+**Consequences:**
+- `models.manifest.json` gains a `voz` entry (`backend: "voz_tdt"`, `min_macos: "15.0"`, pinned
+  revision `e11906fe59d1ce9882eb8e82ed59f78bdc8e6153`, the repository's `main` at the time);
+  `models.lock.json` locks its 16 files. The repository is **not gated** on Hugging Face, so no
+  token is involved. `vuho_model_paths::Backend::VozTdt` is the third variant, and the three
+  `match`es on `Backend` (`wiring::load_engine`, `settings_tab::reachable_languages`,
+  `test-stt-ffi`) each gained an arm — the compiler found them all, which is the point of the
+  enum. `vuho_stt_engine::voz::manifest_model_id()` finds the model by backend, not by name, so
+  no model id is a literal in the crate.
+- **macOS 15 floor, second reason.** Canary needs 15 for int4 (ADR-022); voz needs it for the
+  `<ios18>` programs and the `functionName` selector. The project floor stays 14.0 and
+  Parakeet stays the default; a macOS 14 user sees "Needs macOS 15" on both rows.
+- **License and attribution.** The export is under the Desert Ant Labs Source-Available
+  License 1.0 (https://license.desertant.com/1.0), not a permissive one: free below 100 000
+  monthly active devices per platform, a user-visible **"Powered by Desert Ant Labs"**
+  attribution is required, and using it to train competing on-device models is forbidden. The
+  base model remains CC-BY-4.0. Both are recorded in `packaging/ATTRIBUTION.txt` and the README.
+  The in-app credit is implemented: `SttModel.attribution: Option<String>` (`#[serde(default)]`,
+  so the other models need no entry) is set to "Powered by Desert Ant Labs" on the voz manifest
+  entry, and the Settings tab renders it as a line under that model's row
+  (`settings_tab::attribution_label(model_id)`, the same manifest-read pattern as
+  `min_macos_label`, so the text is written down once). **The chosen reading of "visible to
+  users":** a line in the Settings tab's model list, shown whenever the voz row is shown —
+  whether or not voz is selected — satisfies it. That is a judgment about the vendor license,
+  not something the license text settles; if the vendor reads it as requiring the credit on the
+  overlay or an About surface, this ADR is wrong and the line moves.
+- **Provisioning had a hole this backend fell into.** `scripts/fetch-model.sh` refused any model
+  absent from `models.lock.json`, and `lock-model.sh` hashes files already on disk — so a
+  brand-new model could not be fetched at all. The script now bootstraps: for an unlocked model
+  it fetches, skips the hash check (there is nothing to check against), prints `UNLOCKED`, and
+  exits **non-zero after the files land**, so no CI or packaging caller can mistake it for a
+  verified fetch. Run `./scripts/lock-model.sh <id>`, commit the lock, and the next fetch is a
+  verified no-op. A model that *is* locked is verified exactly as before.
+- **Sizes and the DMG.** The Settings list shows 485 MB for voz next to Parakeet 496 MB and
+  Canary 569 MB (`models.lock.json`'s `total_bytes`, decimal MB). `VUHO_BUNDLE_MODELS` still
+  defaults to the manifest's `default_model`, so the DMG embeds Parakeet only, unchanged.
+- **Tests** (all model-gated; each skips with an `eprintln` when `models/` is absent):
+  `tests/voz_batch.rs` — `meta.json`/`vocab.json` versus the shipped files, the JFK quote, jfk×3
+  across window seams (each half of the quote exactly three times), and no `<|…|>` special
+  leaking into the transcript; `stream::session`'s
+  `voz_streams_jfk_wav_and_reports_its_stop_to_result_latency` (the Canary latency test's body
+  was extracted into one generic helper, `stream_jfk_and_report_stop_latency`, used by both).
+  Model-free: `voz::tdt` (the walk, against a scripted decoder, including that blanks between
+  zero-duration tokens keep the run from building), `voz::frontend`, `voz::meta`,
+  `voz::embedding`, `voz::models::column_major_offsets`, `MlArray::f16`, the five seam
+  specifications in `stream::merge`, the vocabulary's two shapes, and
+  `settings_tab`'s attribution test. `cargo run -p test-stt-ffi -- --model voz` must print
+  `PASS`.
+
+**Rejected alternatives:** making voz the default — ≈ 15 % per window does not pay for a macOS
+15 floor, an attribution licence and a cold compile. A separate crate — same reasoning as
+ADR-022: it reuses `coreml.rs`, `vad.rs`, `stream/*`, `vocab.rs`, and Parakeet's `argmax_f32`.
+The 16-lane `main` function, or `decoder_2/4/8` — one window is decoded at a time, so wider
+lanes only add zeros. `MLState` for `h`/`c` — the export exposes them as ordinary tensors and
+has no state input to bind. Float32 inputs — `CoreML` rejects them for an fp16 model. Hardcoding
+the geometry in Rust — `meta.json` ships beside the bundles and is the only thing that cannot
+drift from them; it is loaded and cross-checked instead. Sending `pad_mask` zeros for padded
+frames — the obvious reading of its name, and the one that breaks the encoder; `key_bias` alone
+carries the attention mask. A second vocabulary loader for the array shape — one loader, two
+shapes.
+
+---
 
 ---
 
@@ -1395,10 +1662,12 @@ added, ADR-020; no Swift package, ADR-014):**
 - `vuho-audio` *(reinstated, ADR-013)* — `cpal` capture thread owning the `!Send` `Stream`, `rtrb`
   ring buffer, `rubato` resample to 16 kHz mono, device enumeration, `AVCaptureDevice` mic
   permission (`objc2-av-foundation`). No `vuho-*` dependencies — a leaf crate the engine consumes.
-- `vuho-stt-engine` — `TranscriptionEngine` **trait** + two backends behind one
-  `WindowInference` seam (ADR-022): `ParakeetEngine` (four Parakeet-TDT `.mlmodelc` components,
-  greedy TDT decode, native CoreML per ADR-014) and `CanaryEngine` (four Canary-1B-v2
-  components, greedy attention encoder-decoder, no KV cache). `StreamingEngine<M>` holds the
+- `vuho-stt-engine` — `TranscriptionEngine` **trait** + three backends behind one
+  `WindowInference` seam (ADR-022, ADR-023): `ParakeetEngine` (four Parakeet-TDT `.mlmodelc`
+  components, greedy TDT decode, native CoreML per ADR-014), `CanaryEngine` (four Canary-1B-v2
+  components, greedy attention encoder-decoder, no KV cache) and `VozEngine` (Desert Ant Labs'
+  fp16 re-export of Parakeet-TDT: three components, a fused decoder scoring eight frames per
+  call, macOS 15+). `StreamingEngine<M>` holds the
   shared batch windowing and streaming session lifecycle, so each engine is a thin wrapper.
   Also owns the Silero VAD wrapper (`vad.rs`, `voice_activity_detector`).
 - `vuho-dictation` — session state machine: `Toggle`/`Start`/`Stop` → `start_or_stop`; wires
@@ -1490,7 +1759,8 @@ except where amended above.
 ## Verification
 
 - **Batch regression (CI-able, no mic; shipped):** `cargo run -p test-stt-ffi` — file-based
-  `transcribe` on `jfk.wav` asserts the JFK quote. The deterministic gate.
+  `transcribe` on `jfk.wav` asserts the JFK quote. The deterministic gate; `-- --model
+  canary-1b-v2` and `-- --model voz` (ADR-022/ADR-023) run it against the other backends.
 - **Streaming smoke (shipped, ADR-015):** the non-ignored, model-gated
   `stream::session` test drives `run_session` with `jfk.wav` in 100 ms chunks and asserts a
   `PartialTranscript` arrives before the final result containing the quote; `streaming_smoke`

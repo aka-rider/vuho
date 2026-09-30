@@ -77,6 +77,9 @@ pub struct SttManifest {
 pub struct SttModel {
     /// Human-readable name for the Settings UI.
     pub display_name: String,
+    /// Credit the model's license requires the UI to show, if any.
+    #[serde(default)]
+    pub attribution: Option<String>,
     /// Which engine implementation decodes this model.
     pub backend: Backend,
     /// Upstream Hugging Face repo.
@@ -103,6 +106,9 @@ pub enum Backend {
     ParakeetTdt,
     /// Canary: attention encoder-decoder over a fixed 15 s window.
     CanaryAed,
+    /// Voz: Desert Ant Labs' re-export of Parakeet-TDT with the joint folded
+    /// into a single fused decode step over a fixed 15 s window.
+    VozTdt,
 }
 
 impl SttManifest {
@@ -697,6 +703,15 @@ mod tests {
             assert!(!model.dir_name.is_empty(), "{id} has no dir_name");
             assert!(!model.min_macos.is_empty(), "{id} has no min_macos");
             assert!(!model.components().is_empty(), "{id} has no assets");
+        }
+    }
+
+    #[test]
+    fn only_the_voz_model_carries_an_attribution() {
+        for (id, model) in &manifest().stt.models {
+            let expected =
+                (model.backend == Backend::VozTdt).then_some("Powered by Desert Ant Labs");
+            assert_eq!(model.attribution.as_deref(), expected, "{id}");
         }
     }
 

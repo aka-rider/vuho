@@ -6,7 +6,7 @@ build:
 	cargo build --release -p vuho-ui
 
 package: build
-	./scripts/package.sh
+	VUHO_BUNDLE_MODEL=0 SIGN_ID="Vuho Dev" ./scripts/package.sh
 
 run: package
 	open Vuho.app

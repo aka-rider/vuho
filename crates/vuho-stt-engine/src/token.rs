@@ -6,6 +6,10 @@
 //! shared streaming pipeline (`stream::merge`, `stream::accumulator`,
 //! `stream::session`) consumes them.
 
+/// Emissions at one encoder position after which a TDT walk moves on a
+/// frame regardless, so a degenerate output can never loop forever.
+pub(crate) const MAX_EMISSIONS_PER_POSITION: usize = 10;
+
 /// Duration of one encoder frame in milliseconds (1280 samples @ 16kHz = 80ms).
 const FRAME_MS: usize = 80;
 

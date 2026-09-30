@@ -2,8 +2,8 @@
 //! streaming session lifecycle, and the single live-session slot.
 //!
 //! Everything here is generic over a [`WindowInference`] backend, so
-//! `ParakeetEngine` and `CanaryEngine` are thin wrappers rather than two
-//! copies of the same lifecycle (CONSTITUTION rule 26). The backend only
+//! `ParakeetEngine`, `CanaryEngine` and `VozEngine` are thin wrappers rather
+//! than three copies of the same lifecycle (CONSTITUTION rule 26). The backend only
 //! supplies one-window decoding, a vocabulary, and its merge bounds.
 //!
 //! `where SendModel<M>: Send + Sync` appears on the impl block by

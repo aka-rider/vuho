@@ -26,13 +26,13 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 voice_activity_detector = { workspace = true }
 hound = { workspace = true, optional = true }
+half = { workspace = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = { workspace = true }
 objc2-foundation = { workspace = true }
 objc2-core-ml = { workspace = true }
 block2 = { workspace = true }
-half = { workspace = true }
 
 [dev-dependencies]
 # Self-dependency to turn on `test-fixtures` for this crate's own `cargo

@@ -15,7 +15,7 @@
 
 use vuho_model_paths::Backend;
 use vuho_stt_engine::test_support::{jfk_wav_path, load_wav_16k_mono_f32};
-use vuho_stt_engine::{CanaryEngine, ParakeetEngine, TranscriptionEngine};
+use vuho_stt_engine::{CanaryEngine, ParakeetEngine, TranscriptionEngine, VozEngine};
 
 /// Sample rate every backend here expects (16 kHz mono).
 const STT_SAMPLE_RATE: u32 = 16_000;
@@ -75,6 +75,9 @@ fn main() {
         }
         Backend::CanaryAed => {
             Box::new(CanaryEngine::load(&model_id, model_folder).expect("Canary engine load"))
+        }
+        Backend::VozTdt => {
+            Box::new(VozEngine::load(&model_id, model_folder).expect("Voz engine load"))
         }
     };
     println!("Models loaded.");
@@ -138,7 +141,7 @@ fn selected_model_id() -> String {
 /// time that means nothing (CONSTITUTION rule 2).
 fn segment_label(backend: Backend, seg: &vuho_domain::TranscriptSegment, index: usize) -> String {
     match backend {
-        Backend::ParakeetTdt => {
+        Backend::ParakeetTdt | Backend::VozTdt => {
             #[allow(clippy::cast_precision_loss)]
             // display-only duration; ms timestamps never approach 2^52
             let (start_s, end_s) = (seg.start_ms as f64 / 1000.0, seg.end_ms as f64 / 1000.0);

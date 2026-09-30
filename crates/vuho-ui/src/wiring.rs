@@ -1010,7 +1010,7 @@ fn load_engine_and_session(
 }
 
 /// Build the engine `model_id`'s manifest entry calls for — the one place a
-/// [`Backend`] becomes a concrete engine, so adding a third backend is one
+/// [`Backend`] becomes a concrete engine, so adding a backend is one
 /// match arm here rather than a second load path.
 fn load_engine(
     model_id: &str,
@@ -1024,6 +1024,7 @@ fn load_engine(
     Ok(match backend {
         Backend::ParakeetTdt => Box::new(vuho_stt_engine::ParakeetEngine::load(model_id, folder)?),
         Backend::CanaryAed => Box::new(vuho_stt_engine::CanaryEngine::load(model_id, folder)?),
+        Backend::VozTdt => Box::new(vuho_stt_engine::VozEngine::load(model_id, folder)?),
     })
 }
 

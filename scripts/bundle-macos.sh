@@ -8,8 +8,9 @@
 #   - Valid Info.plist, code-signed with mic entitlement
 #
 # Two distribution shapes come out of this one script:
-#   - VUHO_BUNDLE_MODEL=1 (default) — the ~500 MB DMG-style bundle with the
-#     Parakeet-TDT model embedded, offline from first launch.
+#   - VUHO_BUNDLE_MODEL=1 (default) — the DMG-style bundle with the
+#     VUHO_BUNDLE_MODELS set embedded (default: the manifest's default model,
+#     ~500 MB), offline from first launch.
 #   - VUHO_BUNDLE_MODEL=0 — the model-less bundle for Homebrew cask
 #     distribution (binary + icon + attribution, no model; measured ≈40 MB
 #     on disk / ≈15 MB as the gzipped release tarball — this grows with the

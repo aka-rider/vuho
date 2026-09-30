@@ -34,6 +34,23 @@
           "joint": "RNNTJoint.mlmodelc",
           "vocab": "parakeet_v3_vocab.json"
         }
+      },
+      "voz": {
+        "display_name": "Voz (Parakeet 0.6B v3)",
+        "attribution": "Powered by Desert Ant Labs",
+        "backend": "voz_tdt",
+        "repo": "desert-ant-labs/voz",
+        "revision": "e11906fe59d1ce9882eb8e82ed59f78bdc8e6153",
+        "dir_name": "voz",
+        "min_macos": "15.0",
+        "assets": {
+          "preprocessor": "mel.mlmodelc",
+          "encoder": "encoder.mlmodelc",
+          "decoder": "decoder.mlmodelc",
+          "embedding": "embedding.f16",
+          "meta": "meta.json",
+          "vocab": "vocab.json"
+        }
       }
     }
   },

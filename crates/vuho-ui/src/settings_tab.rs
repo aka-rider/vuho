@@ -283,7 +283,11 @@ impl SettingsTab {
             .child(model_status_line(
                 readiness::format_mb(model.total_bytes),
                 theme::TEXT_TERTIARY,
-            ));
+            ))
+            .children(
+                attribution_label(&model.id)
+                    .map(|credit| model_status_line(credit, theme::TEXT_TERTIARY)),
+            );
         self.append_row_control(
             row,
             &model.id,
@@ -657,7 +661,7 @@ fn reachable_languages(model_id: &str) -> Vec<&'static str> {
         Some(Backend::CanaryAed) => vuho_stt_engine::canary::prompt::supported_languages()
             .filter(|code| mapped.contains(code))
             .collect(),
-        Some(Backend::ParakeetTdt) | None => mapped.to_vec(),
+        Some(Backend::ParakeetTdt | Backend::VozTdt) | None => mapped.to_vec(),
     };
     codes.sort_unstable();
     codes
@@ -720,6 +724,18 @@ fn min_macos_label(model_id: &str) -> SharedString {
             || SharedString::from("Unsupported on this Mac"),
             |model| SharedString::from(format!("Needs macOS {}", model.min_macos)),
         )
+}
+
+/// The credit `model_id`'s license requires next to it, read from the
+/// manifest like [`min_macos_label`] — never restated in this view.
+#[must_use]
+fn attribution_label(model_id: &str) -> Option<SharedString> {
+    vuho_model_paths::manifest()
+        .stt
+        .model(model_id)?
+        .attribution
+        .clone()
+        .map(SharedString::from)
 }
 
 /// Who provisioned a model Vuho may not delete. A `None` source is a model
@@ -1199,6 +1215,41 @@ mod tests {
             total_bytes: 636_000_000,
             supported_on_this_os: true,
         }
+    }
+
+    #[test]
+    fn a_model_whose_license_requires_credit_shows_it_and_others_show_none() {
+        let manifest = vuho_model_paths::manifest();
+        let credited = manifest
+            .stt
+            .models
+            .iter()
+            .filter(|(_, m)| m.attribution.is_some());
+        let uncredited = manifest
+            .stt
+            .models
+            .iter()
+            .filter(|(_, m)| m.attribution.is_none());
+
+        assert!(
+            credited.clone().count() > 0,
+            "no manifest model carries a credit"
+        );
+        assert!(
+            uncredited.clone().count() > 0,
+            "every manifest model carries a credit"
+        );
+        for (id, model) in credited {
+            assert_eq!(
+                attribution_label(id).map(|credit| credit.to_string()),
+                model.attribution,
+                "{id}"
+            );
+        }
+        for (id, _) in uncredited {
+            assert_eq!(attribution_label(id), None, "{id}");
+        }
+        assert_eq!(attribution_label("no-such-model"), None);
     }
 
     #[test]

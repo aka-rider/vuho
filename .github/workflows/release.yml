@@ -119,7 +119,7 @@ jobs:
 
           echo "version=$TAG_VERSION" >> "$GITHUB_OUTPUT"
 
-      # Model-less package: VUHO_BUNDLE_MODEL=0 skips the ~474 MB Parakeet-TDT
+      # Model-less package: VUHO_BUNDLE_MODEL=0 skips the ~500 MB default-model
       # copy and its preconditions, so this build never touches the Hugging
       # Face download. models.lock.json (committed) is only needed for the
       # runtime download path, not for building the app itself.

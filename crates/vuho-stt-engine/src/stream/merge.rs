@@ -73,6 +73,18 @@ pub struct MergeBounds {
     pub tolerance: usize,
 }
 
+impl MergeBounds {
+    /// The bounds for a backend whose token positions are measured encoder
+    /// frames (Parakeet, voz): both derive from the window overlap.
+    #[must_use]
+    pub(crate) fn measured_positions() -> Self {
+        Self {
+            search: crate::stream::windower::OVERLAP_FRAMES,
+            tolerance: crate::stream::windower::OVERLAP_FRAMES / 2,
+        }
+    }
+}
+
 /// Merge `fresh` tokens into `committed`, reconciling the overlap.
 ///
 /// `pub` (not `pub(crate)`): re-exported by `bench_support` for
@@ -97,9 +109,9 @@ pub struct MergeBounds {
 /// 4. If that run has at least 2 words: keep `committed` only up to the
 ///    start of the matched region, then append `fresh` from that same
 ///    matched region onward (using `fresh`'s copy of the seam).
-/// 5. Otherwise fall back to keeping all of `committed` and dropping every
-///    `fresh` token whose position is at or before the last committed
-///    position.
+/// 5. Otherwise keep `committed` and drop `fresh` up to the last committed
+///    position. If that cut splits a `fresh` word: swap in `fresh`'s copy when
+///    `committed`'s last word is a strict prefix of it, else drop the whole word.
 pub fn merge<'p>(
     committed: &[TokenAt],
     fresh: Vec<TokenAt>,
@@ -154,10 +166,51 @@ pub fn merge<'p>(
         }
     }
 
+    merge_without_word_run(
+        committed,
+        overlap_committed_start,
+        &fresh,
+        boundary_pos,
+        &piece,
+    )
+}
+
+/// The no-match fallback: `committed` stays, and `fresh` loses every token at
+/// or before `boundary_pos`. A `fresh` word straddling that cut is reconciled
+/// with `committed`'s last word rather than split.
+fn merge_without_word_run<'p>(
+    committed: &[TokenAt],
+    committed_tail_start: usize,
+    fresh: &[TokenAt],
+    boundary_pos: usize,
+    piece: &impl Fn(u32) -> Option<(bool, &'p str)>,
+) -> MergeOutcome {
     let drop_count = fresh.iter().take_while(|t| t.pos <= boundary_pos).count();
-    MergeOutcome {
-        keep_committed: committed.len(),
-        append: fresh[drop_count..].to_vec(),
+    let fresh_words = segment_words(fresh, piece);
+    let straddling = fresh_words
+        .iter()
+        .find(|w| w.token_start < drop_count && drop_count < w.token_end);
+    let committed_tail = segment_words(&committed[committed_tail_start..], piece);
+
+    match (straddling, committed_tail.last()) {
+        (Some(fresh_word), Some(committed_word))
+            if !committed_word.core.is_empty()
+                && committed_word.core != fresh_word.core
+                && fresh_word.core.starts_with(&committed_word.core) =>
+        {
+            MergeOutcome {
+                keep_committed: committed_tail_start + committed_word.token_start,
+                append: fresh[fresh_word.token_start..].to_vec(),
+            }
+        }
+        (Some(fresh_word), _) => MergeOutcome {
+            keep_committed: committed.len(),
+            append: fresh[fresh_word.token_end..].to_vec(),
+        },
+        (None, _) => MergeOutcome {
+            keep_committed: committed.len(),
+            append: fresh[drop_count..].to_vec(),
+        },
     }
 }
 
@@ -326,6 +379,72 @@ mod tests {
 
         assert_eq!(result.keep_committed, committed.len());
         assert_eq!(result.append, vec![tok(4, 13), tok(5, 14)]);
+    }
+
+    fn seam_piece(id: u32) -> Option<(bool, &'static str)> {
+        match id {
+            10 => Some((true, " a")),
+            11 => Some((false, "sk")),
+            20 => Some((true, " A")),
+            30 => Some((true, " not")),
+            40 => Some((true, " be")),
+            41 => Some((false, "ll")),
+            50 => Some((true, " Amer")),
+            51 => Some((false, "ic")),
+            52 => Some((false, "ans")),
+            53 => Some((true, " ask")),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn a_fresh_copy_of_the_word_the_seam_cuts_is_dropped_whole() {
+        let committed = vec![tok(10, 176), tok(11, 179)];
+        let fresh = vec![tok(20, 178), tok(11, 182), tok(30, 190)];
+        let result = merge(&committed, fresh, bounds(25), seam_piece);
+
+        assert_eq!(result.keep_committed, committed.len());
+        assert_eq!(result.append, vec![tok(30, 190)]);
+    }
+
+    #[test]
+    fn a_fresh_that_starts_mid_word_keeps_what_it_has() {
+        let committed = vec![tok(10, 100)];
+        let fresh = vec![tok(11, 110), tok(30, 115)];
+        let result = merge(&committed, fresh.clone(), bounds(25), seam_piece);
+
+        assert_eq!(result.keep_committed, committed.len());
+        assert_eq!(result.append, fresh);
+    }
+
+    #[test]
+    fn a_word_cut_short_at_the_window_edge_is_completed_by_fresh() {
+        let committed = vec![tok(50, 159), tok(51, 163)];
+        let fresh = vec![tok(50, 160), tok(51, 162), tok(52, 167), tok(53, 176)];
+        let result = merge(&committed, fresh.clone(), bounds(25), seam_piece);
+
+        assert_eq!(result.keep_committed, 0);
+        assert_eq!(result.append, fresh);
+    }
+
+    #[test]
+    fn an_unrelated_word_across_the_seam_never_gets_glued_to_committed() {
+        let committed = vec![tok(10, 176), tok(11, 179)];
+        let fresh = vec![tok(40, 178), tok(41, 182), tok(30, 190)];
+        let result = merge(&committed, fresh, bounds(25), seam_piece);
+
+        assert_eq!(result.keep_committed, committed.len());
+        assert_eq!(result.append, vec![tok(30, 190)]);
+    }
+
+    #[test]
+    fn a_fresh_word_starting_after_the_seam_is_kept_untouched() {
+        let committed = vec![tok(10, 176)];
+        let fresh = vec![tok(20, 170), tok(30, 190)];
+        let result = merge(&committed, fresh, bounds(25), seam_piece);
+
+        assert_eq!(result.keep_committed, committed.len());
+        assert_eq!(result.append, vec![tok(30, 190)]);
     }
 
     #[test]

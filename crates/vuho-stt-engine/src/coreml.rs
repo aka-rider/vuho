@@ -1,4 +1,4 @@
-//! Thin `objc2-core-ml` wrapper for Parakeet-TDT inference.
+//! Thin `objc2-core-ml` wrapper for every backend's `CoreML` inference.
 //!
 //! Loads `.mlmodelc` bundles, builds feature dictionaries, runs predictions,
 //! and extracts `f32` results from `MLMultiArray` outputs — including
@@ -19,12 +19,15 @@ mod imp {
 
     use objc2::rc::Retained;
     use objc2::runtime::{AnyObject, ProtocolObject};
-    use objc2::AnyThread;
+    use objc2::{sel, AnyThread};
     use objc2_core_ml::{
-        MLComputeUnits, MLDictionaryFeatureProvider, MLFeatureProvider, MLFeatureValue, MLModel,
-        MLModelConfiguration, MLMultiArray, MLMultiArrayDataType,
+        MLComputeUnits, MLDictionaryFeatureProvider, MLFeatureDescription, MLFeatureProvider,
+        MLFeatureValue, MLModel, MLModelConfiguration, MLMultiArray, MLMultiArrayDataType,
     };
-    use objc2_foundation::{NSArray, NSInteger, NSMutableDictionary, NSNumber, NSString, NSURL};
+    use objc2_foundation::{
+        NSArray, NSDictionary, NSInteger, NSMutableDictionary, NSNumber, NSObjectProtocol,
+        NSString, NSURL,
+    };
 
     use crate::EngineError;
 
@@ -64,8 +67,35 @@ mod imp {
         ///
         /// Returns `EngineError::LoadFailed` if `CoreML` cannot load the bundle.
         pub(crate) fn load(mlmodelc_dir: &Path, units: ComputeUnits) -> Result<Self, EngineError> {
+            Self::open(mlmodelc_dir, units, None)
+        }
+
+        /// Load one named function of a multifunction `.mlmodelc` bundle.
+        ///
+        /// `MLModelConfiguration.functionName` is a macOS 15 selector, sent as
+        /// an ordinary Objective-C message so the binary still launches on
+        /// macOS 14. The selector is probed before it is sent: an unrecognized
+        /// one would abort the process.
+        ///
+        /// # Errors
+        ///
+        /// Returns `EngineError::LoadFailed` on macOS 14, if `CoreML` cannot
+        /// load the bundle, or if the bundle has no such function.
+        pub(crate) fn load_function(
+            mlmodelc_dir: &Path,
+            units: ComputeUnits,
+            function: &str,
+        ) -> Result<Self, EngineError> {
+            Self::open(mlmodelc_dir, units, Some(function))
+        }
+
+        fn open(
+            mlmodelc_dir: &Path,
+            units: ComputeUnits,
+            function: Option<&str>,
+        ) -> Result<Self, EngineError> {
             let url = Self::file_url(mlmodelc_dir);
-            let config = Self::make_config(units);
+            let config = Self::make_config(units, function)?;
             let model =
                 unsafe { MLModel::modelWithContentsOfURL_configuration_error(&url, &config) }
                     .map_err(|e| {
@@ -83,10 +113,22 @@ mod imp {
             NSURL::fileURLWithPath_isDirectory(&ns_path, true)
         }
 
-        fn make_config(units: ComputeUnits) -> Retained<MLModelConfiguration> {
+        fn make_config(
+            units: ComputeUnits,
+            function: Option<&str>,
+        ) -> Result<Retained<MLModelConfiguration>, EngineError> {
             let config = unsafe { MLModelConfiguration::new() };
             unsafe { config.setComputeUnits(units.into_ml()) };
-            config
+            if let Some(function) = function {
+                if !config.respondsToSelector(sel!(setFunctionName:)) {
+                    return Err(EngineError::LoadFailed(format!(
+                        "multifunction CoreML models need macOS 15 (cannot select '{function}')"
+                    )));
+                }
+                let name = NSString::from_str(function);
+                unsafe { config.setFunctionName(Some(&name)) };
+            }
+            Ok(config)
         }
 
         /// Run a prediction with the given feature map.
@@ -147,15 +189,20 @@ mod imp {
         /// builds of the same model) out of the model itself instead of
         /// hardcoding today's value.
         pub(crate) fn input_shape(&self, name: &str) -> Option<Vec<usize>> {
-            let ns_name = NSString::from_str(name);
             let description = unsafe { self.model.modelDescription() };
             let inputs = unsafe { description.inputDescriptionsByName() };
-            let constraint = unsafe { inputs.objectForKey(&ns_name)?.multiArrayConstraint() }?;
-            let shape = unsafe { constraint.shape() };
-            // Tensor dimensions are always non-negative.
-            #[allow(clippy::cast_sign_loss)]
-            let dims = shape.iter().map(|n| n.integerValue() as usize).collect();
-            Some(dims)
+            declared_shape(&inputs, name)
+        }
+
+        /// The declared shape of the output feature `name`, or `None` if the
+        /// model has no such output or it is not a multi-array.
+        ///
+        /// The output-side twin of [`Self::input_shape`], for a backend that
+        /// validates its constants file against what the models report.
+        pub(crate) fn output_shape(&self, name: &str) -> Option<Vec<usize>> {
+            let description = unsafe { self.model.modelDescription() };
+            let outputs = unsafe { description.outputDescriptionsByName() };
+            declared_shape(&outputs, name)
         }
 
         /// View an `NSMutableDictionary<NSString, MLFeatureValue>` as the
@@ -174,6 +221,30 @@ mod imp {
                     .cast::<objc2_foundation::NSDictionary<NSString, AnyObject>>()
             }
         }
+    }
+
+    /// Row-major element strides of a densely packed array of `shape`.
+    fn dense_strides(shape: &[usize]) -> Vec<usize> {
+        let mut strides = vec![1; shape.len()];
+        for i in (0..shape.len().saturating_sub(1)).rev() {
+            strides[i] = strides[i + 1] * shape[i + 1];
+        }
+        strides
+    }
+
+    /// The multi-array shape declared for feature `name` in a model
+    /// description's input or output table.
+    fn declared_shape(
+        features: &NSDictionary<NSString, MLFeatureDescription>,
+        name: &str,
+    ) -> Option<Vec<usize>> {
+        let ns_name = NSString::from_str(name);
+        let constraint = unsafe { features.objectForKey(&ns_name)?.multiArrayConstraint() }?;
+        let shape = unsafe { constraint.shape() };
+        // Tensor dimensions are always non-negative.
+        #[allow(clippy::cast_sign_loss)]
+        let dims = shape.iter().map(|n| n.integerValue() as usize).collect();
+        Some(dims)
     }
 
     /// Bytes per element of an `MLMultiArray` data type.
@@ -259,17 +330,7 @@ mod imp {
         /// Returns `EngineError::CoreMl` if `data.len()` does not match
         /// the product of `shape`, or if `CoreML` allocation fails.
         pub(crate) fn f32(shape: &[usize], data: &[f32]) -> Result<Self, EngineError> {
-            let inner = Self::alloc(shape, MLMultiArrayDataType::Float32, data.len())?;
-            let (src, len) = (data.as_ptr(), data.len());
-            let block = block2::StackBlock::new(
-                move |ptr: NonNull<c_void>,
-                      _size: NSInteger,
-                      _strides: NonNull<NSArray<NSNumber>>| unsafe {
-                    std::ptr::copy_nonoverlapping(src, ptr.as_ptr().cast::<f32>(), len);
-                },
-            );
-            unsafe { inner.getMutableBytesWithHandler(&block) };
-            Ok(Self { inner })
+            Self::filled(shape, MLMultiArrayDataType::Float32, data)
         }
 
         /// Create a new `MLMultiArray` from i32 data (row-major layout).
@@ -279,17 +340,61 @@ mod imp {
         /// Returns `EngineError::CoreMl` if `data.len()` does not match
         /// the product of `shape`, or if `CoreML` allocation fails.
         pub(crate) fn i32(shape: &[usize], data: &[i32]) -> Result<Self, EngineError> {
-            let inner = Self::alloc(shape, MLMultiArrayDataType::Int32, data.len())?;
+            Self::filled(shape, MLMultiArrayDataType::Int32, data)
+        }
+
+        /// Create a new **Float16** `MLMultiArray` from `f32` data, rounding
+        /// each element to half precision (row-major layout).
+        ///
+        /// For a model whose I/O is fp16 (voz): `CoreML` rejects a Float32
+        /// array for such an input rather than converting it.
+        ///
+        /// # Errors
+        ///
+        /// Returns `EngineError::CoreMl` if `data.len()` does not match
+        /// the product of `shape`, or if `CoreML` allocation fails.
+        pub(crate) fn f16(shape: &[usize], data: &[f32]) -> Result<Self, EngineError> {
+            let halves: Vec<half::f16> = data.iter().map(|&v| half::f16::from_f32(v)).collect();
+            Self::filled(shape, MLMultiArrayDataType::Float16, &halves)
+        }
+
+        /// Allocate an array of `data_type` and copy `data` into it — the
+        /// one place an input array is written.
+        ///
+        /// `T` must be the Rust type of `data_type`'s elements. The copy is
+        /// dense, so an array `CoreML` laid out with padded strides is an
+        /// error here rather than a silently misaligned input.
+        fn filled<T: Copy>(
+            shape: &[usize],
+            data_type: MLMultiArrayDataType,
+            data: &[T],
+        ) -> Result<Self, EngineError> {
+            let inner = Self::alloc(shape, data_type, data.len())?;
             let (src, len) = (data.as_ptr(), data.len());
+            let dense = std::cell::Cell::new(true);
             let block = block2::StackBlock::new(
-                move |ptr: NonNull<c_void>,
-                      _size: NSInteger,
-                      _strides: NonNull<NSArray<NSNumber>>| unsafe {
-                    std::ptr::copy_nonoverlapping(src, ptr.as_ptr().cast::<i32>(), len);
+                |ptr: NonNull<c_void>, _size: NSInteger, strides: NonNull<NSArray<NSNumber>>| {
+                    let strides = unsafe { strides.as_ref() };
+                    let reported: Vec<usize> = strides
+                        .iter()
+                        .map(|n| usize::try_from(n.integerValue()).unwrap_or(usize::MAX))
+                        .collect();
+                    if reported != dense_strides(shape) {
+                        dense.set(false);
+                        return;
+                    }
+                    unsafe { std::ptr::copy_nonoverlapping(src, ptr.as_ptr().cast::<T>(), len) };
                 },
             );
             unsafe { inner.getMutableBytesWithHandler(&block) };
-            Ok(Self { inner })
+            if dense.get() {
+                Ok(Self { inner })
+            } else {
+                Err(EngineError::CoreMl(format!(
+                    "CoreML laid out a {shape:?} input array with padded strides; \
+                     a dense write would misalign it"
+                )))
+            }
         }
 
         fn alloc(
@@ -523,11 +628,11 @@ mod imp {
     /// inherently `Send`/`Sync` on their own: this is the crate's only
     /// `unsafe impl Send + Sync`.
     ///
-    /// Written out per concrete wrapped type — today `ParakeetModels` and
-    /// `CanaryModels` — rather than as a blanket `impl<T>`. A blanket impl
-    /// would let ANY future `T` (including one holding non-thread-safe
-    /// non-`CoreML` state) become `Send`/`Sync` for free just by being
-    /// wrapped here, silently widening this crate's one unsafe-impl
+    /// Written out per concrete wrapped type — today `ParakeetModels`,
+    /// `CanaryModels` and `VozModels` — rather than as a blanket `impl<T>`.
+    /// A blanket impl would let ANY future `T` (including one holding
+    /// non-thread-safe non-`CoreML` state) become `Send`/`Sync` for free
+    /// just by being wrapped here, silently widening this crate's one unsafe-impl
     /// invariant to types it was never audited against. The cost of that
     /// refusal is that a generic wrapper over a backend cannot derive
     /// thread-safety and must carry `where SendModel<M>: Send + Sync`
@@ -557,6 +662,14 @@ mod imp {
     // the reason this module's doc comment gives.
     unsafe impl Send for SendModel<crate::canary::models::CanaryModels> {}
     unsafe impl Sync for SendModel<crate::canary::models::CanaryModels> {}
+    // SAFETY: the voz backend again holds three `Retained<MLModel>` handles
+    // (thread-safe to predict on per Apple's documentation) and otherwise
+    // only plain owned data — `Vocab`, the embedding table, and the parsed
+    // `meta.json` — with no interior mutability, so shared `&self` access
+    // cannot race. Written out again rather than folded into a blanket
+    // impl, for the reason this module's doc comment gives.
+    unsafe impl Send for SendModel<crate::voz::models::VozModels> {}
+    unsafe impl Sync for SendModel<crate::voz::models::VozModels> {}
 }
 
 #[cfg(target_os = "macos")]
@@ -595,7 +708,21 @@ mod not_macos {
             ))
         }
 
+        pub(crate) fn load_function(
+            _mlmodelc_dir: &Path,
+            _units: ComputeUnits,
+            _function: &str,
+        ) -> Result<Self, EngineError> {
+            Err(EngineError::LoadFailed(
+                "CoreML not available on this platform".into(),
+            ))
+        }
+
         pub(crate) fn input_shape(&self, _name: &str) -> Option<Vec<usize>> {
+            None
+        }
+
+        pub(crate) fn output_shape(&self, _name: &str) -> Option<Vec<usize>> {
             None
         }
     }
@@ -620,6 +747,12 @@ mod not_macos {
         }
 
         pub(crate) fn i32(_shape: &[usize], _data: &[i32]) -> Result<Self, EngineError> {
+            Err(EngineError::CoreMl(
+                "CoreML not available on this platform".into(),
+            ))
+        }
+
+        pub(crate) fn f16(_shape: &[usize], _data: &[f32]) -> Result<Self, EngineError> {
             Err(EngineError::CoreMl(
                 "CoreML not available on this platform".into(),
             ))
@@ -667,6 +800,8 @@ mod not_macos {
     unsafe impl Sync for SendModel<crate::parakeet::models::ParakeetModels> {}
     unsafe impl Send for SendModel<crate::canary::models::CanaryModels> {}
     unsafe impl Sync for SendModel<crate::canary::models::CanaryModels> {}
+    unsafe impl Send for SendModel<crate::voz::models::VozModels> {}
+    unsafe impl Sync for SendModel<crate::voz::models::VozModels> {}
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -730,6 +865,30 @@ mod tests {
     fn a_dense_array_reports_dense_strides() {
         let arr = MlArray::f32(&[1, 3, 4], &[0.0f32; 12]).expect("build array");
         assert_eq!(arr.strides(), vec![12, 4, 1]);
+    }
+
+    /// A Float16 input round-trips through half precision: values exactly
+    /// representable as halves come back unchanged, others are rounded.
+    /// Model-free.
+    #[test]
+    fn an_f16_array_stores_half_precision_values() {
+        let arr = MlArray::f16(&[1, 1, 1, 3], &[1.5, -2.0, 0.1]).expect("build array");
+        let mut out = Vec::new();
+        arr.gather_f32_into(&[0, 1, 2], &mut out).expect("gather");
+        assert_eq!(&out[..2], [1.5, -2.0]);
+        let rounded = half::f16::from_f32(0.1).to_f32();
+        assert_eq!(out[2].to_bits(), rounded.to_bits());
+        assert_ne!(out[2].to_bits(), 0.1f32.to_bits(), "0.1 is not a half");
+    }
+
+    /// An input array's mismatched length is a typed error, not a partial
+    /// write. Model-free.
+    #[test]
+    fn an_f16_array_of_the_wrong_length_is_rejected() {
+        assert!(matches!(
+            MlArray::f16(&[2, 2], &[0.0; 3]),
+            Err(EngineError::CoreMl(_))
+        ));
     }
 
     /// A gather over an array's dense offsets reproduces its contents, and

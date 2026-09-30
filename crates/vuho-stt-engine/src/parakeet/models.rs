@@ -267,13 +267,9 @@ impl crate::window_inference::WindowInference for ParakeetModels {
         self.vocab.detokenize(tokens)
     }
 
-    /// Positions are real encoder frame indices, so both bounds derive
-    /// from the window overlap.
+    /// Positions are real encoder frame indices.
     fn merge_bounds(&self) -> MergeBounds {
-        MergeBounds {
-            search: crate::stream::windower::OVERLAP_FRAMES,
-            tolerance: crate::stream::windower::OVERLAP_FRAMES / 2,
-        }
+        MergeBounds::measured_positions()
     }
 }
 

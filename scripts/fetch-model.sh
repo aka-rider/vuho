@@ -10,6 +10,9 @@
 #   ./scripts/fetch-model.sh parakeet-tdt-0.6b-v3  # one STT model, by id
 #   ./scripts/fetch-model.sh silero              # download only Silero VAD
 #
+# Exits non-zero when a fetched model has no models.lock.json entry yet (see
+# "Bootstrapping a brand-new model" below).
+#
 # Prerequisites:
 #   - `huggingface-cli` (from `pip install huggingface_hub`) — preferred
 #   - Falls back to `curl` when the CLI is unavailable, OR when it is
@@ -33,6 +36,15 @@
 # partial tree was fetched with a zero exit code and nothing noticed.
 # models.lock.json ships in the repo (it is not optional/best-effort), so
 # its absence is itself a hard failure, not a skipped check.
+#
+# Bootstrapping a brand-new model: `lock-model.sh` hashes files that are
+# already on disk, so a model with no lock entry yet can only get its files
+# from this script. For such a model the fetch proceeds, the hash check is
+# skipped (there is nothing to check against), and the script finishes by
+# naming the model UNLOCKED and exiting non-zero — a CI or packaging caller
+# can never mistake it for a verified fetch. Run `./scripts/lock-model.sh
+# <id>`, commit the lock, and the next fetch is a verified no-op. A model
+# that IS in the lock is verified exactly as before.
 #
 # Resumability / corruption safety: every download (huggingface-cli AND the
 # curl fallback, both the single-file and recursive-directory paths) writes
@@ -60,6 +72,7 @@ MODELS_DIR="$ROOT_DIR/models"
 MANIFEST="$ROOT_DIR/models.manifest.json"
 LOCK_FILE="$ROOT_DIR/models.lock.json"
 VUHO_SKIP_HASH_VERIFY="${VUHO_SKIP_HASH_VERIFY:-0}"
+UNLOCKED_MODEL_IDS=()
 
 # curl retry policy for both the plain-file and recursive-listing fetch paths.
 readonly CURL_RETRY_COUNT=3
@@ -251,7 +264,8 @@ fetch_stt_model() {
 
 # Cross-check a fetched STT tree against models.lock.json: every
 # locked file must be present locally at its locked size and (unless
-# VUHO_SKIP_HASH_VERIFY=1) sha256. This is the safety net for the bug
+# VUHO_SKIP_HASH_VERIFY=1) sha256. A model with no lock entry at all is not
+# verified: it is recorded in UNLOCKED_MODEL_IDS for main() to report. This is the safety net for the bug
 # documented at the top of this file — a script bug (or a future upstream
 # repo change) that silently drops or truncates files now fails loudly
 # instead of shipping a model that loads but produces wrong or crashing
@@ -267,13 +281,19 @@ assert_stt_model_complete() {
     local lock_out
     lock_out=$(manifest_vars "$LOCK_FILE" "
 locked = manifest['models'].get('$model_id')
-if locked is None:
-    raise SystemExit('$model_id is not in the lock — run ./scripts/lock-model.sh $model_id')
-emit_array('LOCK_PATHS', [f['path'] for f in locked['files']])
-emit_array('LOCK_SIZES', [str(f['size']) for f in locked['files']])
-emit_array('LOCK_SHA256S', [f['sha256'] for f in locked['files']])
+emit('LOCK_ENTRY', 'absent' if locked is None else 'present')
+files = [] if locked is None else locked['files']
+emit_array('LOCK_PATHS', [f['path'] for f in files])
+emit_array('LOCK_SIZES', [str(f['size']) for f in files])
+emit_array('LOCK_SHA256S', [f['sha256'] for f in files])
 ") || die "failed to read $LOCK_FILE (see traceback above)"
     eval "$lock_out"
+
+    if [[ "$LOCK_ENTRY" == "absent" ]]; then
+        UNLOCKED_MODEL_IDS+=("$model_id")
+        log "WARNING: $model_id has no entry in $LOCK_FILE — its files are on disk but NOT verified."
+        return 0
+    fi
 
     local missing=() mismatched=()
     local i path expected_size actual_size expected_sha actual_sha dest
@@ -387,7 +407,20 @@ main() {
             ;;
     esac
 
+    report_unlocked_models
     log "Done."
+}
+
+# Fetching an unlocked model succeeds at the file level but must fail as a
+# verified fetch, so the exit status carries that to CI and packaging.
+report_unlocked_models() {
+    (( ${#UNLOCKED_MODEL_IDS[@]} > 0 )) || return 0
+    local model_id
+    for model_id in "${UNLOCKED_MODEL_IDS[@]}"; do
+        log "UNLOCKED: $model_id was fetched but is NOT in $LOCK_FILE, so nothing was verified."
+        log "          Run ./scripts/lock-model.sh $model_id and commit the lock before trusting or shipping it."
+    done
+    exit 1
 }
 
 main "$@"

@@ -1,7 +1,7 @@
 //! STT engines via native `CoreML`, behind one `TranscriptionEngine` trait
 //! with batch and streaming paths.
 //!
-//! Two backends share everything but the decode loop, meeting at the
+//! Three backends share everything but the decode loop, meeting at the
 //! `WindowInference` seam (ADR-022) so `StreamingEngine<M>` owns the window
 //! planning, the seam merge, and the session lifecycle exactly once:
 //!
@@ -13,6 +13,9 @@
 //!   Projection bundles, greedy attention encoder-decoder over a fixed 15 s
 //!   window. Every component loads CPU-only — measured, not assumed; see
 //!   `canary::models::Components::load`.
+//! - **Voz** (`VozEngine`): Parakeet-TDT 0.6B v3 re-exported as three
+//!   fp16 bundles — mel, encoder, and a decoder with the joint fused in —
+//!   greedy TDT decoding over a fixed 15 s window. Needs macOS 15.
 //!
 //! VAD uses the embedded Silero v5 from `voice_activity_detector`
 //! (crate cannot load external weights — the fetched `models/silero-vad/`
@@ -42,6 +45,10 @@ mod parakeet;
 // (CONSTITUTION rule 26).
 pub mod canary;
 
+// Voz model components: the same Parakeet-TDT weights, re-exported as three
+// fused fp16 bundles. `pub` for `manifest_model_id` alone, like `canary`.
+pub mod voz;
+
 // The backend-independent engine half: batch windowing + session lifecycle.
 mod streaming_engine;
 
@@ -60,6 +67,7 @@ mod stream;
 // Engine handles, one thin wrapper per backend.
 mod canary_engine;
 mod engine;
+mod voz_engine;
 
 // Shared WAV-fixture test helpers (jfk.wav loading + generic WAV parsing) —
 // the one place this workspace's WAV parsing lives (CONSTITUTION rule 26),
@@ -304,6 +312,8 @@ pub(crate) mod asset_role {
     pub(crate) const JOINT: &str = "joint";
     pub(crate) const PROJECTION: &str = "projection";
     pub(crate) const VOCAB: &str = "vocab";
+    pub(crate) const EMBEDDING: &str = "embedding";
+    pub(crate) const META: &str = "meta";
 }
 
 /// Path to `model_id`'s `role` asset inside `model_dir` — the one place a
@@ -419,6 +429,7 @@ pub trait TranscriptionEngine {
 
 pub use canary_engine::CanaryEngine;
 pub use engine::ParakeetEngine;
+pub use voz_engine::VozEngine;
 
 /// List the names of available audio input devices.
 ///

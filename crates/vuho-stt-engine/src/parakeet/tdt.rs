@@ -7,15 +7,13 @@
 //! Pure module: no `CoreML` dependency — the `StepModel` trait is the
 //! seam for injecting a real `CoreML` impl or a test fake.
 
-use crate::token::TokenAt;
+use crate::token::{TokenAt, MAX_EMISSIONS_PER_POSITION};
 use crate::EngineError;
 
 use super::decoder_state::DecoderState;
 
 /// Blank token id (also used as SOS).
 pub(crate) const BLANK: u32 = 8192;
-/// Maximum symbols emitted per frame before forcing t+1.
-const MAX_SYMBOLS_PER_FRAME: usize = 10;
 /// Maximum tokens emitted per 15s window (degenerate-chunk guard).
 const MAX_TOKENS_PER_WINDOW: usize = 150;
 /// Encoder feature dimension.
@@ -148,7 +146,7 @@ pub fn tdt_greedy(
         if dur > 0 {
             t += dur as usize;
             emitted_at_t = 0;
-        } else if tok == BLANK || emitted_at_t >= MAX_SYMBOLS_PER_FRAME {
+        } else if tok == BLANK || emitted_at_t >= MAX_EMISSIONS_PER_POSITION {
             // Zero-duration blank, or a non-blank run that hit the
             // per-frame emission cap: force the frame to advance so a
             // degenerate joint output can never loop forever.
@@ -166,7 +164,10 @@ pub fn tdt_greedy(
 }
 
 /// Argmax over a slice, returning the index of the maximum value.
-fn argmax_f32(slice: &[f32]) -> u32 {
+///
+/// Shared with the voz backend's decode loop, which scores the same token
+/// and duration heads (CONSTITUTION rule 26).
+pub(crate) fn argmax_f32(slice: &[f32]) -> u32 {
     slice
         .iter()
         .enumerate()

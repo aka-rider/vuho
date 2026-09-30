@@ -13,6 +13,36 @@ use std::path::Path;
 use crate::token::TokenAt;
 use crate::EngineError;
 
+/// The two on-disk shapes of a vocabulary file — see [`Vocab::load`].
+#[derive(serde::Deserialize)]
+#[serde(untagged)]
+enum VocabFile {
+    ById(Vec<String>),
+    Keyed(HashMap<String, String>),
+}
+
+impl VocabFile {
+    /// The id-indexed token table: a gap in a keyed file is `None`, and a
+    /// key that is not a `u32` id is ignored.
+    fn into_tokens(self) -> Vec<Option<String>> {
+        match self {
+            Self::ById(pieces) => pieces.into_iter().map(Some).collect(),
+            Self::Keyed(map) => {
+                let ids: Vec<(usize, String)> = map
+                    .into_iter()
+                    .filter_map(|(id, piece)| Some((id.parse::<u32>().ok()? as usize, piece)))
+                    .collect();
+                let len = ids.iter().map(|(id, _)| id + 1).max().unwrap_or(0);
+                let mut tokens = vec![None; len];
+                for (id, piece) in ids {
+                    tokens[id] = Some(piece);
+                }
+                tokens
+            }
+        }
+    }
+}
+
 /// Vocabulary: indexed by token id. `None` at an id means "no token with
 /// this id in the JSON file" (a gap, or a backend's reserved id that the
 /// file deliberately omits — see [`Vocab::load`]'s `reserved_id`).
@@ -27,8 +57,10 @@ pub(crate) struct Vocab {
 impl Vocab {
     /// Load the JSON vocabulary from `path`.
     ///
-    /// The JSON maps token ids (as strings) to token strings, e.g.
-    /// `{"0":"<unk>","1":"<|nospeech|>","2":"▁hello",...}`.
+    /// Two shapes are accepted, both meaning "token id → token string":
+    /// an object keyed by id as a string, e.g.
+    /// `{"0":"<unk>","1":"<|nospeech|>","2":"▁hello",...}`, or an array
+    /// whose index is the id, e.g. `["<unk>","<|nospeech|>","▁hello",...]`.
     ///
     /// `reserved_id` is an id the backend's decoder can emit but the
     /// vocabulary file omits (Parakeet-TDT's blank); the table is sized to
@@ -44,26 +76,24 @@ impl Vocab {
         let data = std::fs::read_to_string(path).map_err(|e| {
             EngineError::LoadFailed(format!("failed to read vocab {}: {e}", path.display()))
         })?;
-        let map: HashMap<String, String> = serde_json::from_str(&data)
+        Self::from_json_str(&data, reserved_id)
+    }
+
+    /// Build the vocabulary from JSON text in either shape [`Self::load`]
+    /// accepts, sized to cover `reserved_id`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `EngineError::LoadFailed` if `json` is neither shape.
+    pub(crate) fn from_json_str(json: &str, reserved_id: Option<u32>) -> Result<Self, EngineError> {
+        let file: VocabFile = serde_json::from_str(json)
             .map_err(|e| EngineError::LoadFailed(format!("failed to parse vocab JSON: {e}")))?;
 
-        let reserved = reserved_id.unwrap_or(0);
-        let max_id = map
-            .keys()
-            .filter_map(|k| k.parse::<u32>().ok())
-            .max()
-            .unwrap_or(reserved);
-        let len = (max_id.max(reserved) + 1) as usize;
-
-        let mut tokens = vec![None; len];
-        for (id_str, token) in &map {
-            if let Ok(id) = id_str.parse::<u32>() {
-                if let Some(slot) = tokens.get_mut(id as usize) {
-                    *slot = Some(token.clone());
-                }
-            }
+        let mut tokens = file.into_tokens();
+        let covered = reserved_id.map_or(0, |id| id as usize + 1);
+        if tokens.len() < covered {
+            tokens.resize(covered, None);
         }
-
         let has_byte_fallback = tokens.iter().flatten().any(|t| is_byte_fallback(t));
 
         Ok(Self {
@@ -332,5 +362,38 @@ mod tests {
         let vocab = make_vocab(&[Some("▁hi")]);
         assert_eq!(vocab.piece_info(BLANK), None);
         assert_eq!(vocab.piece_info(99), None);
+    }
+
+    fn vocab_from(json: &str, reserved_id: Option<u32>) -> Vocab {
+        Vocab::from_json_str(json, reserved_id).expect("valid vocab fixture")
+    }
+
+    /// The id-keyed object shape loads with gaps as `None`, sized to cover
+    /// the reserved id.
+    #[test]
+    fn load_reads_an_id_keyed_object() {
+        let vocab = vocab_from(r#"{"0":"<unk>","2":"▁hi"}"#, Some(4));
+        assert_eq!(vocab.piece_info(2), Some((true, "▁hi")));
+        assert_eq!(vocab.piece_info(1), None, "a gap has no entry");
+        assert_eq!(vocab.piece_info(4), None, "the reserved id has no entry");
+        assert_eq!(vocab.tokens.len(), 5);
+    }
+
+    /// The array shape uses the index as the id — the same table the
+    /// object shape would give.
+    #[test]
+    fn load_reads_an_id_indexed_array() {
+        let vocab = vocab_from(r#"["<unk>","▁hi","ic"]"#, Some(3));
+        assert_eq!(vocab.piece_info(1), Some((true, "▁hi")));
+        assert_eq!(vocab.piece_info(2), Some((false, "ic")));
+        assert_eq!(vocab.piece_info(3), None, "the reserved id has no entry");
+        assert_eq!(vocab.tokens.len(), 4);
+        assert_eq!(vocab.detokenize(&[tok(1), tok(2), tok(3)]), "hiic");
+    }
+
+    #[test]
+    fn load_rejects_a_file_that_is_neither_shape() {
+        let err = Vocab::from_json_str("42", None).expect_err("a bare number is not a vocabulary");
+        assert!(matches!(err, EngineError::LoadFailed(_)));
     }
 }

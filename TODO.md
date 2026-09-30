@@ -31,3 +31,17 @@
   `CGEventTap`-based `Esc` (parallel to the existing hotkey tap in
   `vuho-os-integration/src/hotkey.rs`) that calls `panel::hide` directly instead of relying on
   gpui's key-window-scoped action dispatch. Not built — out of scope for that revision.
+- `scripts/fetch-model.sh`'s `hf_list_files_recursive` swallows the `curl` error (`|| true`), so a
+  failed HF tree listing reports only "failed to list <dir> via the HF tree API" and hides the
+  real HTTP status (rate limit, 5xx, offline). It also calls the tree API even when every file of
+  that directory is already on disk, so an "idempotent" re-fetch fails offline or under rate
+  limiting for no reason. Observed once as a transient "failed to list
+  ParakeetDecoder.mlmodelc via the HF tree API" that passed on retry. Fix: keep `curl`'s status
+  and stderr in the error message, and skip the listing when the lock already names every file
+  and each is present at its locked size. Found during ADR-023; left alone to keep that change
+  scoped.
+- `ParakeetModels::load` and `CanaryModels::load` log a failed warm-up inference and carry on, so
+  the failure only surfaces at the first real session. voz's `VozModels::load` now turns a failed
+  warm-up into `EngineError::LoadFailed` (fail at load, not at first session); the other two
+  backends should follow it so a broken model is refused when it is selected. Found while
+  repairing the voz backend; left alone to keep that change scoped.

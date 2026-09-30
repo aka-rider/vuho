@@ -1147,43 +1147,33 @@ mod tests {
         );
     }
 
-    /// Canary's streaming contract, and the measurement that decides
-    /// whether it is viable for live dictation (WP6.S11 f).
+    /// What streaming jfk.wav through `run_session` produced.
+    struct StreamedJfk {
+        saw_partial: bool,
+        full_text: String,
+        stop_to_result: Duration,
+    }
+
+    /// Stream jfk.wav through `run_session` against `models`, at the
+    /// production partial cadence with no wall-clock pacing, and time
+    /// **stop → final result** — the number the user actually feels on
+    /// releasing the hotkey (WP6.S11 f).
     ///
-    /// The number the user actually feels on releasing the hotkey is the
-    /// **stop → final result** latency: the end-aligned final-window
-    /// inference plus the session thread's wind-down. No cadence knob can
-    /// hide it, so it is measured here — from setting the stop flag to
-    /// `join()` returning — rather than assumed. Runs at the production
-    /// partial cadence, feeds jfk.wav with no wall-clock pacing, and still
-    /// asserts real behaviour (a partial before the final text, and the
-    /// quote in it) so the measurement rides on a genuine regression test.
-    #[test]
-    fn canary_streams_jfk_wav_and_reports_its_stop_to_result_latency() {
+    /// That latency is the end-aligned final-window inference plus the
+    /// session thread's wind-down. No cadence knob can hide it, so it is
+    /// measured — from setting the stop flag to `join()` returning — rather
+    /// than assumed.
+    fn stream_jfk<M: WindowInference + 'static>(
+        models: crate::coreml::SendModel<M>,
+        samples: Vec<f32>,
+    ) -> StreamedJfk
+    where
+        crate::coreml::SendModel<M>: Send,
+    {
         /// Upper bound on the wait for a first partial before stopping
         /// anyway — bounds the worst case to "fails promptly" rather than
         /// "hangs forever" if the streaming contract really is broken.
         const SAW_PARTIAL_TIMEOUT: Duration = Duration::from_secs(300);
-
-        let Some(samples) = crate::test_support::load_jfk_wav_f32() else {
-            eprintln!("skipping: JFK_WAV/jfk.wav not found in this environment");
-            return;
-        };
-        let Some(model_id) = crate::canary::manifest_model_id() else {
-            eprintln!("skipping: the manifest declares no Canary model");
-            return;
-        };
-        let Ok(folder) = crate::resolve_model_folder(model_id) else {
-            eprintln!("skipping: no Canary model folder resolved in this environment");
-            return;
-        };
-        let models = match crate::canary::models::CanaryModels::load(model_id, &folder) {
-            Ok(m) => crate::coreml::SendModel(m),
-            Err(e) => {
-                eprintln!("skipping: Canary model load failed: {e}");
-                return;
-            }
-        };
 
         let (chunk_tx, chunk_rx) = crossbeam_channel::unbounded::<Vec<f32>>();
         let (events_tx, events_rx) = crossbeam_channel::unbounded::<DictationEvent>();
@@ -1227,19 +1217,82 @@ mod tests {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .expect("the feeder always records when it stopped")
             .elapsed();
-
-        println!("canary: stop -> final result took {stop_to_result:?}");
-        log::info!("canary: stop -> final result took {stop_to_result:?}");
-
-        assert!(
+        StreamedJfk {
             saw_partial,
+            full_text: result.full_text,
+            stop_to_result,
+        }
+    }
+
+    /// Load a backend through `load` and stream jfk.wav through it, asserting
+    /// real behaviour (a partial before the final text, and the quote in it)
+    /// and reporting the stop latency. Skips cleanly when the sample, the
+    /// backend's manifest entry, or its model folder is absent.
+    fn stream_jfk_through<M: WindowInference + 'static>(
+        label: &str,
+        manifest_model_id: Option<&'static str>,
+        load: impl FnOnce(&str, &std::path::Path) -> Result<M, crate::EngineError>,
+    ) where
+        crate::coreml::SendModel<M>: Send,
+    {
+        let Some(samples) = crate::test_support::load_jfk_wav_f32() else {
+            eprintln!("skipping: JFK_WAV/jfk.wav not found in this environment");
+            return;
+        };
+        let Some(model_id) = manifest_model_id else {
+            eprintln!("skipping: the manifest declares no {label} model");
+            return;
+        };
+        let Ok(folder) = crate::resolve_model_folder(model_id) else {
+            eprintln!("skipping: no {label} model folder resolved in this environment");
+            return;
+        };
+        let models = match load(model_id, &folder) {
+            Ok(m) => crate::coreml::SendModel(m),
+            Err(e) => {
+                eprintln!("skipping: {label} model load failed: {e}");
+                return;
+            }
+        };
+
+        let streamed = stream_jfk(models, samples);
+        println!(
+            "{label}: stop -> final result took {:?}",
+            streamed.stop_to_result
+        );
+        log::info!(
+            "{label}: stop -> final result took {:?}",
+            streamed.stop_to_result
+        );
+        assert!(
+            streamed.saw_partial,
             "expected at least one PartialTranscript before the final result"
         );
-        let lower = result.full_text.to_lowercase();
         assert!(
-            lower.contains("ask not what your country can do for you"),
+            streamed
+                .full_text
+                .to_lowercase()
+                .contains("ask not what your country can do for you"),
             "expected the JFK quote in the final transcript, got: {}",
-            result.full_text
+            streamed.full_text
+        );
+    }
+
+    #[test]
+    fn canary_streams_jfk_wav_and_reports_its_stop_to_result_latency() {
+        stream_jfk_through(
+            "canary",
+            crate::canary::manifest_model_id(),
+            crate::canary::models::CanaryModels::load,
+        );
+    }
+
+    #[test]
+    fn voz_streams_jfk_wav_and_reports_its_stop_to_result_latency() {
+        stream_jfk_through(
+            "voz",
+            crate::voz::manifest_model_id(),
+            crate::voz::models::VozModels::load,
         );
     }
 

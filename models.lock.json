@@ -199,6 +199,93 @@
           "sha256": "7ec60e05f1b24480736ec0eed40900f4626bce1fa9a60fd700ec7e2a59198735"
         }
       ]
+    },
+    "voz": {
+      "dir_name": "voz",
+      "revision": "e11906fe59d1ce9882eb8e82ed59f78bdc8e6153",
+      "total_bytes": 485338884,
+      "files": [
+        {
+          "path": "decoder.mlmodelc/analytics/coremldata.bin",
+          "size": 243,
+          "sha256": "3762b19c579897b6d9aab879decf3e36f8e0f2d3301693e0266d63c9664b37cb"
+        },
+        {
+          "path": "decoder.mlmodelc/coremldata.bin",
+          "size": 1093,
+          "sha256": "2d7a5210e91e4e3b25c547db4b76ea14bf769db9f71e7659c027008041e38d2d"
+        },
+        {
+          "path": "decoder.mlmodelc/metadata.json",
+          "size": 18528,
+          "sha256": "798639c54e4eb71bcfa5dbc15b62c0a341c37b265d1a9c879c28a40b06549875"
+        },
+        {
+          "path": "decoder.mlmodelc/model.mil",
+          "size": 99410,
+          "sha256": "1f331acb4a4bb999c792db0a3725d790c046311ab9941ddbe0ee7e3418ae1e14"
+        },
+        {
+          "path": "decoder.mlmodelc/weights/weight.bin",
+          "size": 12277132,
+          "sha256": "8c3cf2f8aa1452c2f4f6a7aa9c6ee9e555dc91864c860011d80006a98f420016"
+        },
+        {
+          "path": "embedding.f16",
+          "size": 10487040,
+          "sha256": "3173388aaf6b5b4ae292d8777940bb8fb5c7c02e30adf708b9dde4d909c2000f"
+        },
+        {
+          "path": "encoder.mlmodelc/analytics/coremldata.bin",
+          "size": 243,
+          "sha256": "e2f20d7eb7bc7dcb085440c3650a7d11c01ccb8a971192ed3c9d36544ab9b916"
+        },
+        {
+          "path": "encoder.mlmodelc/coremldata.bin",
+          "size": 430,
+          "sha256": "3363e9efb3d8b2655999f188a48e38624c9e05991a1f9e37b26185e604fd35c1"
+        },
+        {
+          "path": "encoder.mlmodelc/model.mil",
+          "size": 821126,
+          "sha256": "a215a17e2f38f6562eff9904789c06d688876dcd8c42c90fd87f07e6f6f4bb6b"
+        },
+        {
+          "path": "encoder.mlmodelc/weights/weight.bin",
+          "size": 460717376,
+          "sha256": "afdc12527e014af6a92f8ca9f62884cd31e5e4ad9835e8bf54f5cf7605259179"
+        },
+        {
+          "path": "mel.mlmodelc/analytics/coremldata.bin",
+          "size": 243,
+          "sha256": "5cb4b6ce10d946dc22c42392e377f803bc073e5c9ff34c518fa409b1ce50752b"
+        },
+        {
+          "path": "mel.mlmodelc/coremldata.bin",
+          "size": 405,
+          "sha256": "eb8a9e618653213e82ba16c6b0e19080da541dfa9893c995d8e635d5539d4546"
+        },
+        {
+          "path": "mel.mlmodelc/model.mil",
+          "size": 9730,
+          "sha256": "d5c94a8babb909e8f1c3c6bdf06ff1a951852f28f8515b673fb6327429ced310"
+        },
+        {
+          "path": "mel.mlmodelc/weights/weight.bin",
+          "size": 826688,
+          "sha256": "34f8a1bcf01e6a6ae053efe012cd189e0c38e9dca65660f199740ce9a0958f95"
+        },
+        {
+          "path": "meta.json",
+          "size": 543,
+          "sha256": "c838bdebd61a6c8658dbb824a1eae02e039dc6cb1d7702c0d8c667c993e5ee76"
+        },
+        {
+          "path": "vocab.json",
+          "size": 78654,
+          "sha256": "3eb2f73e8853dce5156c2ed97c0b1bb84eb4ebd201eb1761d15977fc1ea31490"
+        }
+      ]
     }
   }
 }
