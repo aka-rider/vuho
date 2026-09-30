@@ -2,6 +2,8 @@
 //! `streaming_smoke` below), since it needs an interactive microphone grant
 //! and a signed binary declaring `NSMicrophoneUsageDescription`.
 
+#![cfg(target_os = "macos")]
+
 use vuho_stt_engine::{ParakeetEngine, TranscriptionEngine};
 
 // The former `start_stream_without_init_returns_error` test is gone: an

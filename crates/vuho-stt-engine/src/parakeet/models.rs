@@ -2,7 +2,7 @@
 //!
 //! Loads the four `CoreML` model bundles (Preprocessor, Encoder, Decoder,
 //! Joint), runs a full window through the pipeline, and implements
-//! [`StepModel`] for the TDT greedy decoder.
+//! [`TdtStep`] for the TDT greedy decoder.
 
 use std::path::Path;
 use std::sync::Mutex;
@@ -14,14 +14,12 @@ use crate::vocab::Vocab;
 use crate::EngineError;
 
 use super::decoder_state::DecoderState;
-use super::tdt::StepModel;
+use super::tdt::{TdtStep, BLANK, LOGITS_LEN};
 
 /// Encoder output feature dimension.
 const ENCODER_DIM: usize = 1024;
 /// LSTM hidden/cell state size: `(num_layers=2, batch=1, hidden_dim=640)`.
 const H_C_SIZE: usize = 2 * 640;
-/// `RNNTJoint` raw logits width: 8193 token logits (8192 vocab + blank) + 5 duration bins.
-const JOINT_LOGITS_LEN: usize = 8198;
 
 /// Loaded Parakeet-TDT models.
 pub(crate) struct ParakeetModels {
@@ -119,7 +117,7 @@ impl ParakeetModels {
         let joint = CoreMlModel::load(&path(crate::asset_role::JOINT)?, ComputeUnits::CpuOnly)?;
 
         log::info!("parakeet: loading vocabulary");
-        let vocab = Vocab::load(&path(crate::asset_role::VOCAB)?, Some(super::tdt::BLANK))?;
+        let vocab = Vocab::load(&path(crate::asset_role::VOCAB)?, Some(BLANK))?;
 
         let models = Self {
             preprocessor,
@@ -133,8 +131,7 @@ impl ParakeetModels {
         log::info!("parakeet: warmup inference on a zeroed window (triggers ANE plan compilation)");
         let started = std::time::Instant::now();
         let zeros = vec![0.0f32; crate::stream::windower::WINDOW_SAMPLES];
-        let mut warmup_state = DecoderState::new();
-        if let Err(e) = models.infer_window(&zeros, 0, 0, &mut warmup_state) {
+        if let Err(e) = models.infer_window(&zeros, 0) {
             log::warn!("parakeet: warmup inference failed (continuing — a real session will surface the error): {e}");
         }
         log::info!("parakeet: warmup completed in {:?}", started.elapsed());
@@ -146,9 +143,9 @@ impl ParakeetModels {
     /// Encoder → TDT greedy decode.
     ///
     /// `samples` must be ≤ `WINDOW_SAMPLES` (zero-padded internally to the
-    /// model's fixed 240 000-sample input). `initial_t` and
-    /// `global_frame_offset` are carried from the sliding window state
-    /// machine. `state` threads across windows (see [`super::tdt::tdt_greedy`]).
+    /// model's fixed 240 000-sample input). `global_frame_offset` is carried
+    /// from the sliding window state machine. The decoder state is fresh per
+    /// window (see [`super::tdt::tdt_greedy`]).
     ///
     /// Returns emitted tokens.
     ///
@@ -161,24 +158,22 @@ impl ParakeetModels {
     pub(crate) fn infer_window(
         &self,
         samples: &[f32],
-        initial_t: usize,
         global_frame_offset: usize,
-        state: &mut DecoderState,
     ) -> Result<Vec<TokenAt>, EngineError> {
         let (encoder_output, encoder_frame_count) = self.run_encoder(samples)?;
         let step = StepImpl {
             decoder: &self.decoder,
             joint: &self.joint,
         };
+        let mut state = step.start()?;
         let (emitted, _next_t) = super::tdt::tdt_greedy(
             &encoder_output,
             encoder_frame_count,
-            initial_t,
+            0,
             global_frame_offset,
-            state,
+            &mut state,
             &step,
         )?;
-        // next_t is meaningful only to tdt_greedy's own unit tests
         Ok(emitted)
     }
 
@@ -246,7 +241,7 @@ impl ParakeetModels {
 impl crate::window_inference::WindowInference for ParakeetModels {
     /// Parakeet-TDT decodes without a language prompt, so `language` is
     /// unused. Every window decodes from a fresh `DecoderState` at
-    /// `initial_t = 0` — carrying decoder state across independently
+    /// frame 0 — carrying decoder state across independently
     /// encoded windows is what caused the blank-lock content drop
     /// (ADR-015; see `stream::session`'s module doc).
     fn infer_window(
@@ -255,8 +250,7 @@ impl crate::window_inference::WindowInference for ParakeetModels {
         global_frame_offset: usize,
         _language: &str,
     ) -> Result<Vec<TokenAt>, EngineError> {
-        let mut state = DecoderState::new();
-        Self::infer_window(self, samples, 0, global_frame_offset, &mut state)
+        Self::infer_window(self, samples, global_frame_offset)
     }
 
     fn piece_info(&self, id: u32) -> Option<(bool, &str)> {
@@ -289,16 +283,18 @@ fn f32_to_usize(value: f32) -> usize {
     value as usize
 }
 
-/// `CoreML`-backed [`StepModel`] implementation: one `ParakeetDecoder` call
-/// per non-blank emission, one `RNNTJoint` call per encoder frame visited.
+/// `CoreML`-backed [`TdtStep`] implementation: one `ParakeetDecoder` call
+/// per accepted token (plus one to start), one `RNNTJoint` call per encoder
+/// frame scored.
 struct StepImpl<'a> {
     decoder: &'a CoreMlModel,
     joint: &'a CoreMlModel,
 }
 
-impl StepModel for StepImpl<'_> {
-    fn decode(&self, token: i32, state: &mut DecoderState) -> Result<(), EngineError> {
-        let targets = MlArray::i32(&[1, 1], &[token])?;
+impl StepImpl<'_> {
+    fn decode(&self, token: u32, state: &mut DecoderState) -> Result<(), EngineError> {
+        #[allow(clippy::cast_possible_wrap)] // token ids are ≤ 8192
+        let targets = MlArray::i32(&[1, 1], &[token as i32])?;
         let target_lengths = MlArray::i32(&[1], &[1])?;
         let h_in = MlArray::f32(&[2, 1, 640], &state.h)?;
         let c_in = MlArray::f32(&[2, 1, 640], &state.c)?;
@@ -318,18 +314,28 @@ impl StepModel for StepImpl<'_> {
 
         state.h = h_out;
         state.c = c_out;
-        state.dec_out = Some(dec_out);
+        state.dec_out = dec_out;
         Ok(())
     }
+}
 
-    fn joint(
+impl TdtStep for StepImpl<'_> {
+    type State = DecoderState;
+
+    fn start(&self) -> Result<DecoderState, EngineError> {
+        let mut state = DecoderState::zeroed();
+        self.decode(BLANK, &mut state)?;
+        Ok(state)
+    }
+
+    fn score(
         &self,
         enc_frame: &[f32],
-        dec_out: &[f32],
-        out: &mut Vec<f32>,
+        state: &mut DecoderState,
+        logits: &mut Vec<f32>,
     ) -> Result<(), EngineError> {
         let enc_outputs = MlArray::f32(&[1, 1, ENCODER_DIM], enc_frame)?;
-        let dec_outputs = MlArray::f32(&[1, 1, 640], dec_out)?;
+        let dec_outputs = MlArray::f32(&[1, 1, 640], &state.dec_out)?;
 
         // RNNTJoint.mlmodelc's real MIL signature (verified against
         // model.mil, not the plan's simplified I/O table) takes exactly
@@ -341,16 +347,20 @@ impl StepModel for StepImpl<'_> {
             ("decoder_outputs", dec_outputs),
         ])?;
 
-        // Write into the caller-owned `out` buffer (WP9) instead of
-        // allocating a fresh Vec per frame — `tdt_greedy` reuses `out`
-        // across every frame in the decode loop.
-        prediction.array("logits")?.to_f32_vec_into(out)?;
-        if out.len() != JOINT_LOGITS_LEN {
+        // Write into the caller-owned `logits` buffer (WP9) instead of
+        // allocating a fresh Vec per frame — `tdt_greedy` reuses it across
+        // every frame in the decode loop.
+        prediction.array("logits")?.to_f32_vec_into(logits)?;
+        if logits.len() != LOGITS_LEN {
             return Err(EngineError::CoreMl(format!(
-                "RNNTJoint returned {} logits, expected {JOINT_LOGITS_LEN}",
-                out.len()
+                "RNNTJoint returned {} logits, expected {LOGITS_LEN}",
+                logits.len()
             )));
         }
         Ok(())
+    }
+
+    fn accept(&self, token: u32, state: &mut DecoderState) -> Result<(), EngineError> {
+        self.decode(token, state)
     }
 }

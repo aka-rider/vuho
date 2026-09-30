@@ -5,9 +5,11 @@
 //! prompt with no per-token acoustic alignment and no KV cache: each step
 //! resubmits the whole `[1, S]` token tensor. It therefore supplies
 //! *synthetic* token positions (a fixed stride) rather than measured
-//! encoder frames — see [`models::CanaryModels`]'s `WindowInference` impl.
+//! encoder frames — see `models::CanaryModels`'s `WindowInference` impl.
 
+#[cfg(target_os = "macos")]
 pub(crate) mod aed;
+#[cfg(target_os = "macos")]
 pub(crate) mod models;
 pub mod prompt;
 

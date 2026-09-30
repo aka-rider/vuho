@@ -21,9 +21,6 @@ pub const OUTPUT_SAMPLE_RATE: u32 = 16_000;
 /// Errors from audio capture / device enumeration.
 #[derive(thiserror::Error, Debug, Clone)]
 pub enum AudioError {
-    /// The user (or a prior TCC decision) denied microphone access.
-    #[error("microphone permission denied")]
-    PermissionDenied,
     /// The configured (or default) input device could not be resolved.
     #[error("audio device unavailable: {0}")]
     DeviceUnavailable(String),

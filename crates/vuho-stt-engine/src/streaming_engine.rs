@@ -6,18 +6,15 @@
 //! than three copies of the same lifecycle (CONSTITUTION rule 26). The backend only
 //! supplies one-window decoding, a vocabulary, and its merge bounds.
 //!
-//! `where SendModel<M>: Send + Sync` appears on the impl block by
-//! necessity, not by style: `coreml::SendModel`'s `unsafe impl`s are
-//! deliberately written per concrete type and a blanket `impl<T>` is
-//! refused there, so a generic wrapper cannot derive thread-safety — it
-//! has to demand the concrete impl the backend's own module provides.
+//! A backend must be `Send + Sync` to be shared with the session thread.
+//! `CoreML` handles are not on their own, which is why the macOS backends
+//! are wrapped in `coreml::SendModel` before they get here.
 
 use std::sync::{Arc, Mutex};
 
 use crossbeam_channel::Receiver;
 use vuho_domain::{DictationEvent, TranscriptionResult};
 
-use crate::coreml::SendModel;
 use crate::stream::accumulator::Accumulator;
 use crate::stream::session::{run_session, PARTIAL_INTERVAL};
 use crate::stream::{merge, windower};
@@ -54,20 +51,17 @@ struct SessionHandle {
 
 /// A loaded backend plus at most one live streaming session.
 pub(crate) struct StreamingEngine<M> {
-    models: Arc<SendModel<M>>,
+    models: Arc<M>,
     /// At most one live streaming session (CONSTITUTION rule 1: a single
     /// `Option`, not a pair of fields that can disagree about whether a
     /// stream is active).
     session: Mutex<Option<SessionHandle>>,
 }
 
-impl<M: WindowInference + 'static> StreamingEngine<M>
-where
-    SendModel<M>: Send + Sync,
-{
+impl<M: WindowInference + Send + Sync + 'static> StreamingEngine<M> {
     pub(crate) fn new(models: M) -> Self {
         Self {
-            models: Arc::new(SendModel(models)),
+            models: Arc::new(models),
             session: Mutex::new(None),
         }
     }
@@ -100,7 +94,7 @@ where
         samples: &[f32],
         language: Option<&str>,
     ) -> Result<TranscriptionResult, EngineError> {
-        let models = &self.models.0;
+        let models = &*self.models;
         let session_language = resolve_language(language);
         let mut acc = Accumulator::new();
 
@@ -148,7 +142,7 @@ where
     }
 
     /// Stop any live session so its capture thread and `CoreML` calls don't
-    /// outlive the engine — then drop the last `Arc<SendModel<M>>`
+    /// outlive the engine — then drop the last `Arc<M>`
     /// reference (no explicit teardown call exists on the `CoreML` side;
     /// releasing every reference is teardown).
     pub(crate) fn unload(&self) {
@@ -172,15 +166,13 @@ where
         input_device: Option<&str>,
     ) -> Result<Receiver<DictationEvent>, EngineError> {
         self.ensure_no_active_session()?;
-        Self::ensure_mic_not_denied()?;
+        #[cfg(target_os = "macos")]
+        crate::mic_permission::ensure_not_denied()?;
 
         let capture_cfg = vuho_audio::CaptureConfig {
             device_name: input_device.map(str::to_string),
         };
-        let (capture, chunk_rx) = vuho_audio::start_capture(&capture_cfg).map_err(|e| match e {
-            vuho_audio::AudioError::PermissionDenied => EngineError::MicPermissionDenied,
-            other => EngineError::Audio(other),
-        })?;
+        let (capture, chunk_rx) = vuho_audio::start_capture(&capture_cfg)?;
 
         let (events_tx, events_rx) = crossbeam_channel::unbounded();
         let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -220,16 +212,11 @@ where
         std::thread::Builder::new()
             .name("vuho-stt-session".into())
             .spawn(move || {
-                // Rebind first: Rust 2021 disjoint closure capture would
-                // otherwise capture only the `.0` field below, losing
-                // `SendModel`'s `unsafe impl Send` (it applies to the whole
-                // newtype, not its field).
-                let models = models;
                 run_session(
                     &chunks,
                     &events,
                     &stop,
-                    &models.0,
+                    &*models,
                     capture,
                     &language,
                     PARTIAL_INTERVAL,
@@ -247,23 +234,6 @@ where
             return Err(EngineError::StreamAlreadyActive);
         }
         Ok(())
-    }
-
-    /// Synchronous precheck: a known-denied/restricted status fails
-    /// immediately, without spawning a capture thread that would only fail
-    /// moments later. `NotDetermined` proceeds — macOS raises the TCC dialog
-    /// itself on the first real capture attempt inside
-    /// `vuho_audio::start_capture` (see `vuho-ui`'s
-    /// `request_mic_permission_on_startup` doc comment).
-    fn ensure_mic_not_denied() -> Result<(), EngineError> {
-        match vuho_audio::mic_authorization_status() {
-            vuho_audio::MicAuthStatus::Denied | vuho_audio::MicAuthStatus::Restricted => {
-                Err(EngineError::MicPermissionDenied)
-            }
-            vuho_audio::MicAuthStatus::Authorized | vuho_audio::MicAuthStatus::NotDetermined => {
-                Ok(())
-            }
-        }
     }
 
     /// Stop the active streaming session and return the final transcription.

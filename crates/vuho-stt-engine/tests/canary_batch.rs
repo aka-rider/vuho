@@ -8,6 +8,8 @@
 //! The model id is found by *backend*, never by name, so no model id is
 //! written down outside `models.manifest.json` (ADR-019).
 
+#![cfg(target_os = "macos")]
+
 use std::collections::HashMap;
 use std::path::PathBuf;
 

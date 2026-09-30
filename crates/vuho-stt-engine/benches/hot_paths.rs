@@ -2,7 +2,7 @@
 //! `vuho-stt-engine`'s decode/merge/window pipeline (WP9). Every benched
 //! function is reached through `vuho_stt_engine::bench_support` (see that
 //! module's doc comment for why a shim layer is needed at all):
-//! `tdt_greedy` with a `FixedStepModel` fixture (no real `CoreML` call),
+//! `tdt_greedy` with a `fixed_step_model` fixture (no real `CoreML` call),
 //! `merge::merge` + `segment_words` (indirectly, via `merge`) on synthetic
 //! overlapping token runs, and `windower::plan`.
 //!
@@ -16,8 +16,7 @@
 
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
 use vuho_stt_engine::bench_support::{
-    fixed_step_model, merge, plan, tdt_greedy, token_at, DecoderState, MergeBounds, TokenAt,
-    OVERLAP_FRAMES,
+    fixed_step_model, merge, plan, tdt_greedy, token_at, MergeBounds, TokenAt, OVERLAP_FRAMES,
 };
 
 /// Encoder feature dimension (matches `parakeet::models::ENCODER_DIM` —
@@ -51,7 +50,7 @@ const PARAKEET_MERGE_BOUNDS: MergeBounds = MergeBounds {
 const SYNTHETIC_VOCAB_SIZE: usize = 37;
 
 /// A synthetic encoder output: `frames` frames of `ENCODER_DIM` zeros —
-/// `tdt_greedy` never reads its content when driven by `FixedStepModel`
+/// `tdt_greedy` never reads its content when driven by `fixed_step_model`
 /// (which returns a fixed token/duration regardless of the frame), so an
 /// all-zero buffer of the right length exercises the loop/emission-cap
 /// logic identically to a real encoder output would, for benching
@@ -113,13 +112,12 @@ fn bench_tdt_greedy(c: &mut Criterion) {
             // token emission.
             let model = fixed_step_model(8192, 0);
             b.iter(|| {
-                let mut state = DecoderState::new();
                 let result = tdt_greedy(
                     black_box(&enc),
                     black_box(enc_len),
                     black_box(0),
                     black_box(0),
-                    &mut state,
+                    &mut (),
                     &model,
                 );
                 black_box(result)

@@ -12,12 +12,13 @@ use vuho_domain::{DictationEvent, TranscriptionResult};
 
 use crate::canary::models::CanaryModels;
 use crate::canary::prompt;
+use crate::coreml::SendModel;
 use crate::streaming_engine::{resolve_language, StreamingEngine};
 use crate::EngineError;
 
 /// The Canary-1B-v2 STT engine.
 pub struct CanaryEngine {
-    inner: StreamingEngine<CanaryModels>,
+    inner: StreamingEngine<SendModel<CanaryModels>>,
     /// The manifest display name, for the unsupported-language error raised
     /// before any model call happens.
     display_name: String,
@@ -41,7 +42,7 @@ impl CanaryEngine {
             .model(model_id)
             .map_or_else(|| model_id.to_owned(), |m| m.display_name.clone());
         Ok(Self {
-            inner: StreamingEngine::new(CanaryModels::load(model_id, &model_folder)?),
+            inner: StreamingEngine::new(SendModel(CanaryModels::load(model_id, &model_folder)?)),
             display_name,
         })
     }
