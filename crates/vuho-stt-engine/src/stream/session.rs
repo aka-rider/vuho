@@ -740,7 +740,7 @@ mod tests {
     }
 
     fn load_models() -> Option<crate::parakeet::models::ParakeetModels> {
-        let model_id = vuho_model_paths::manifest().stt.default_model.as_str();
+        let model_id = vuho_model_paths::manifest().stt.default_model();
         let folder = crate::resolve_model_folder(model_id).ok()?;
         match crate::parakeet::models::ParakeetModels::load(model_id, &folder) {
             Ok(m) => Some(m),

@@ -79,6 +79,10 @@ fn main() {
         Backend::VozTdt => {
             Box::new(VozEngine::load(&model_id, model_folder).expect("Voz engine load"))
         }
+        Backend::ParakeetTdtOnnx => {
+            eprintln!("ERROR: {model_id} is a Linux model; this build has no engine for it");
+            std::process::exit(1);
+        }
     };
     println!("Models loaded.");
     println!();
@@ -124,7 +128,7 @@ fn main() {
 fn selected_model_id() -> String {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.as_slice() {
-        [] => vuho_model_paths::manifest().stt.default_model.clone(),
+        [] => vuho_model_paths::manifest().stt.default_model().to_owned(),
         [flag, id] if flag == "--model" => id.clone(),
         _ => {
             eprintln!("ERROR: usage: test-stt-ffi [--model <model-id>]");
@@ -141,7 +145,7 @@ fn selected_model_id() -> String {
 /// time that means nothing (CONSTITUTION rule 2).
 fn segment_label(backend: Backend, seg: &vuho_domain::TranscriptSegment, index: usize) -> String {
     match backend {
-        Backend::ParakeetTdt | Backend::VozTdt => {
+        Backend::ParakeetTdt | Backend::ParakeetTdtOnnx | Backend::VozTdt => {
             #[allow(clippy::cast_precision_loss)]
             // display-only duration; ms timestamps never approach 2^52
             let (start_s, end_s) = (seg.start_ms as f64 / 1000.0, seg.end_ms as f64 / 1000.0);

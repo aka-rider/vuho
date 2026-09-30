@@ -41,3 +41,4 @@ pub use availability::{availability, availability_all, ModelAvailability};
 pub use delete::delete;
 pub use download::download;
 pub use error::FetchError;
+pub use os_support::Support;

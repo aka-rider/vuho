@@ -312,7 +312,7 @@ emit_array('LOCK_SHA256S', [f['sha256'] for f in files])
         fi
         if [[ "$VUHO_SKIP_HASH_VERIFY" != "1" ]]; then
             expected_sha="${LOCK_SHA256S[$i]}"
-            actual_sha=$(shasum -a 256 "$dest" | awk '{print $1}')
+            actual_sha=$(sha256_of "$dest")
             if [[ "$actual_sha" != "$expected_sha" ]]; then
                 mismatched+=("$path (sha256 expected $expected_sha, got $actual_sha)")
             fi
