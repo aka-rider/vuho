@@ -7,7 +7,8 @@
 ## Context
 
 Vuho is a local-first, fully-private WisprFlow-style dictation app for Apple Silicon macOS
-(ANE + Metal). **This document's early ADRs (001, 003, 005, 010) describe the original
+(ANE + Metal) and, since ADR-024, a second platform, Linux (Sway/Wayland first), whose STT
+engine exists today and whose desktop integration does not yet. **This document's early ADRs (001, 003, 005, 010) describe the original
 architecture: Rust `TranscriptionEngine` → `libloading` → a Swift dylib → WhisperKit → CoreML.**
 That architecture was built, then torn out and replaced with a pure-Rust stack — `cpal`
 audio capture, a hand-rolled Parakeet-TDT decoder over native CoreML (`objc2-core-ml`), no
@@ -103,7 +104,8 @@ quality risk, reimplementing the one hard thing WhisperKit already solves.
 
 ### ADR-002 — macOS OS-integration lives in Rust via `objc2`, not Swift, not `arboard`
 
-**Status:** Accepted.
+**Status:** Accepted. *(Amended by ADR-024: this is the macOS integration only. Linux will get its own
+integration, not yet built, behind the same compile-time fork; nothing here changes for macOS.)*
 
 **Decision:** Global hotkey, text injection (NSPasteboard + CGEvent Cmd→V), and TIS
 keyboard-language detection are implemented in Rust using the `objc2` family
@@ -144,7 +146,9 @@ the pipeline.
 
 **Decision:** Introduce exactly one port — the `TranscriptionEngine` trait — because STT engines
 are genuinely plural. Audio, text injection, global hotkey, and language detection stay concrete
-macOS structs (single platform, single implementation). No full hexagonal port layer. YAGNI:
+macOS structs (single platform, single implementation). *(Amended by ADR-024: a second platform
+is not a second port. Those concerns stay concrete per platform behind one compile-time fork per
+crate, not behind traits.)* No full hexagonal port layer. YAGNI:
 abstraction is earned by real variation, not symmetry.
 
 **Consequences:**
@@ -415,7 +419,9 @@ moot for the same reason.
 ### ADR-014 — Native CoreML via `objc2-core-ml` for ASR; `ort` retained solely for VAD
 
 **Status:** Accepted. Supersedes ADR-001 (engine-side mic ownership), ADR-003 (WhisperKit
-adapter naming), ADR-005 (Swift build/FFI mechanics).
+adapter naming), ADR-005 (Swift build/FFI mechanics). *(Amended by ADR-024: CoreML is the macOS
+backend only; on Linux `ort` also runs the Parakeet ASR model, so "solely for VAD" holds on macOS
+alone.)*
 
 **Decision:** Speech recognition runs entirely in-process via native CoreML
 (`objc2-core-ml`), loading `.mlmodelc` bundles directly with
@@ -534,8 +540,9 @@ advance per window (`ADVANCE = WINDOW_SAMPLES − OVERLAP_SAMPLES`). The final w
 multiple, mirroring FluidAudio's last-chunk warmup behavior, when the remaining audio doesn't
 fill a full advance step.
 
-Decoder LSTM state is **fresh per window** (`DecoderState::new()` for every window and for
-every partial re-inference of the open window). This deliberately **rejects** the original
+Decoder LSTM state is **fresh per window** (a zeroed state via `DecoderState::zeroed()` on
+macOS, or the ONNX backend's zeroed `h`/`c`, for every window and for every partial re-inference of
+the open window). This deliberately **rejects** the original
 plan's carry-across-windows algorithm: FluidAudio's own `ChunkProcessor` decodes chunks in
 parallel tasks with fresh state per chunk — cross-window continuity comes entirely from the
 2 s **audio** overlap plus seam merging, never from carrying LSTM state. Carrying state was
@@ -554,6 +561,17 @@ the physical overlap region anchors the splice. `merge` returns `MergeOutcome
 decode's boundary word, because the committed copy can carry an artifact (e.g. a stray
 terminal period from a window that ended mid-phrase) that the fresh decode, with more trailing
 context, does not.
+
+> **Amended by ADR-024 — the decode loop takes a `TdtStep`, not a `StepModel`.** The old
+> `StepModel { decode, joint }` assumed a separate prediction network and joint. The Linux ONNX
+> export fuses them into one graph, so the loop is now generic over `TdtStep { type State; start;
+> score; accept }`: `score` yields the joint's output for the next frame and never advances the
+> prediction network; `accept` advances it and is called on non-blank emissions only (blank
+> frames call `score` alone, preserving "the LSTM steps only on non-blank emissions"). CoreML
+> primes the decoder with BLANK in `start`, runs the joint in `score` and the decoder in `accept`,
+> which is the same call sequence as before; ONNX runs the fused graph in `score`, parks the new
+> `h`/`c`, and commits them in `accept`. `DecoderState` (`{h, c, dec_out}`, `zeroed()`, no
+> `new()`/`last_token`, `dec_out` not optional) is `pub(crate)` and macOS-only.
 
 **Partial-transcript mapping (design decision, wiring is the in-progress part):**
 `DictationEvent::PartialTranscript { current_text, unconfirmed_text }` is produced once by the
@@ -579,7 +597,7 @@ single `SessionHandle` owner, sets the stop flag, joins, and returns the final
 `TranscriptionResult` (end-aligned final window over the tail). The loop: accumulates 16 kHz
 chunks, VAD-gates re-inference (silence costs zero ANE work), emits `Activity` every ~50 ms
 from capture RMS, re-infers the open window at an adaptive ≥1 s cadence from a fresh
-`DecoderState`, promotes fresh→committed on a ≥800 ms VAD endpoint without advancing the
+(zeroed) decoder state, promotes fresh→committed on a ≥800 ms VAD endpoint without advancing the
 window, and commits/advances at the 240 000-sample window boundary. The session loop is a
 free function over an `AudioSource` seam and a chunk `Receiver`, so a non-ignored, model-gated
 test drives it with `jfk.wav` in 100 ms chunks and asserts a `PartialTranscript` precedes the
@@ -821,6 +839,7 @@ not per call).
 > `stt` no longer describes one model. It carries `default_model`, the two env-var names, and a
 > `models` map keyed by model id (`parakeet-tdt-0.6b-v3`, `canary-1b-v2`), each entry holding
 > `display_name`, `backend`, `repo`, `revision`, `dir_name`, `min_macos`, and `assets`.
+> *(`min_macos` was replaced by `requires` in ADR-024, see below.)*
 > `models.lock.json` mirrors that shape (`schema_version: 2`, `models` keyed by the same ids),
 > and `vuho-model-paths`'s invariant tests assert the two id sets are identical and that
 > `default_model` names a model that exists.
@@ -846,6 +865,17 @@ not per call).
 > **`silero` deliberately keeps its `components` array.** It is provisioned by
 > `scripts/fetch-model.sh` only, has no Rust asset-role consumer, and no backend ever resolves a
 > role against it — a role map there would be ceremony with no chokepoint behind it.
+
+> **Amended by ADR-024 — the manifest is platform-aware.** Each model carries `requires`
+> (`{"os":"macos","min_version":"15.0"}` or `{"os":"linux"}`) in place of `min_macos`, parsed into
+> `vuho_model_paths::Requires`/`MacosVersion` at deserialize, so a malformed floor fails when the
+> manifest loads. `default_model` is an object keyed by OS (`macos`: `parakeet-tdt-0.6b-v3`,
+> `linux`: `parakeet-tdt-0.6b-v3-onnx`) and `SttManifest::default_model()` returns the host's.
+> `Os` and `HOST_OS` are the one OS-identity chokepoint for the data crates. The user-data models
+> directory on Linux is `$XDG_DATA_HOME/vuho/models`, else `~/.local/share/vuho/models`; the
+> `.app` bundle candidate exists on macOS only. `vuho-model-fetch` reports
+> `Support { Supported, NeedsMacos(version), OtherOs(os) }` instead of `supported_on_this_os:
+> bool`.
 
 ### ADR-020 — The model is a user resource, provisioned once, verified against a repo-pinned lock
 
@@ -1163,7 +1193,9 @@ the one-source-of-truth outcome CONSTITUTION rule 26 asks for.
 
 **Status:** Accepted. Amends ADR-014 (a second `SendModel` impl pair), ADR-015 (`MergeBounds`
 replaces the single `overlap_frames` parameter), ADR-019 (`assets` roles), and ADR-020
-(per-model `availability`/`download`, plus `delete`).
+(per-model `availability`/`download`, plus `delete`). *(Amended by ADR-024: the seam gained a
+fourth, Linux-only implementor, and `StreamingEngine<M>` now requires `M: WindowInference + Send +
+Sync` and holds an `Arc<M>`.)*
 
 **Problem:** Parakeet-TDT is one model with one contract. Its four `.mlmodelc` components, its
 token positions, and its vocabulary were reachable from `stream::session`,
@@ -1214,6 +1246,22 @@ whose positions restart or rescale between decodes therefore discards an entire 
 > fallback now reconciles that word with `committed`'s last word instead (`merge_without_word_run`),
 > for every backend. Positions, `search` and the "drop at or before `boundary_pos`" rule are
 > unchanged.
+>
+> **Amended by ADR-024 — a second reconciliation, `extends_cut_word`.** The int8 ONNX decode of
+> jfk×3 showed the mirror case: the window edge cut a word and the decoder guessed an ending
+> ("ask" heard as "asked"), so `committed`'s last word strictly *extends* the `fresh` word at the
+> same position. The candidate is the first `fresh` word starting at, or one frame before,
+> `committed`'s last word (`replace_guessed_extension`); when `committed`'s last word strictly
+> extends it, within `tolerance`, `fresh`'s copy replaces `committed`'s guess from that word onward
+> (`keep_committed` shrinks to before that word, the fresh words from there are appended). Review
+> caught the first version, which took *any* fresh prefix within `tolerance`: a fresh "I" eight
+> frames before a committed "it" would have cut "it" and replayed every word between. It is checked
+> before the prefix rule above, is symmetric to it, applies to every backend, and is pinned by four
+> model-free specifications in `stream::merge`
+> (`a_fresh_word_replaces_committeds_guessed_extension_of_a_word_the_edge_cut`,
+> `a_fresh_word_far_from_committeds_last_word_does_not_replace_it`,
+> `a_fresh_prefix_of_committeds_last_word_starting_earlier_does_not_replay_the_words_between`,
+> `a_fresh_word_starting_one_frame_before_committeds_guess_still_replaces_it`).
 
 > **Corrected — the original claim here was false, and Canary shipped on it.** This ADR first
 > said a backend with no acoustic alignment "supplies a fixed synthetic stride instead of a
@@ -1647,6 +1695,117 @@ frames — the obvious reading of its name, and the one that breaks the encoder;
 carries the attention mask. A second vocabulary loader for the array shape — one loader, two
 shapes.
 
+### ADR-024 — Linux is a second platform: one `target_os` fork per crate, ONNX Runtime backend for Parakeet
+
+**Status:** Accepted (2026-09-30). Amends ADR-002 and ADR-004 (what "macOS structs" means once there
+are two platforms), ADR-014 (`ort` now also runs ASR), ADR-015 (the decode step abstraction and a
+second seam rule), ADR-019 (platform-aware manifest) and ADR-022 (a fourth `WindowInference`
+implementor).
+
+**Context:** Vuho's owner also runs Linux (Sway on Wayland) and wants the same dictation loop
+there. Nothing in the domain is macOS-specific — audio capture (`cpal`), VAD, postprocess,
+settings, windowing and the seam merge already were portable in code but not in build: the engine
+crate hard-depended on CoreML and a `not_macos` stub in `coreml.rs` papered over the gap, and the
+manifest spoke of `min_macos` only. CoreML does not exist on Linux, so the Parakeet-TDT weights
+need another runtime, and the UI, hotkey, paste and keyboard-layout code (GPUI over Metal,
+`CGEventTap`, `NSPasteboard`, TIS) need Linux counterparts that are a separate, larger
+workstream.
+
+**Decision:**
+
+1. **Sway/Wayland first; no GTK.** The first Linux target is a Sway session, using Wayland
+   protocols directly. GNOME is not a target.
+2. **One compile-time fork per crate, no stubs.** Code that exists on one OS only is gated with
+   `#[cfg(target_os = …)]` at the module or item level and does not exist on the other OS.
+   `vuho-stt-engine` has its fork in `lib.rs` (plus `canary/mod.rs` and `parakeet/mod.rs`, which mix
+   CoreML and OS-neutral code): the CoreML backends, `mic_permission` (the AVFoundation probe;
+   Linux has no permission concept, capture either works or fails in `start_capture`) and
+   `EngineError::CoreMl` are macOS-only; `EngineError::Onnx` and the ONNX engine are Linux-only;
+   `EngineError::ModelForOtherOs` exists everywhere. The `not_macos` stub in `coreml.rs`, the
+   never-constructed `AudioError::PermissionDenied` and the off-macOS warning in `build.rs` are
+   deleted. Data crates do not use `cfg` for OS questions; they ask `vuho_model_paths::{Os,
+   HOST_OS}`.
+3. **One chokepoint where a manifest backend meets the OS.** `HostBackend` has per-OS variants
+   (macOS `ParakeetTdt`, `CanaryAed`, `VozTdt`; Linux `ParakeetTdtOnnx`).
+   `host_backend(&SttModel) -> Option<HostBackend>` is the only function that maps the manifest's
+   `Backend` to the host, and `load_engine(model_id, folder) -> Box<dyn TranscriptionEngine +
+   Send>` is the only constructor callers use (`wiring::load_engine_and_session` and
+   `test-stt-ffi`). `wiring::selected_model_id` falls back to the host's default, with a warning,
+   for an unknown model or one built for the other OS. A test asserts `host_backend(m).is_some() ==
+   (m.requires.os() == HOST_OS)` for every manifest model, so the manifest's `requires` and the
+   engine's `cfg` gates cannot drift.
+4. **Manifest (see ADR-019's amendment).** `requires` replaces `min_macos`; `default_model` is
+   per OS; the Linux default is `parakeet-tdt-0.6b-v3-onnx` (`istupakov/parakeet-tdt-0.6b-v3-onnx`
+   at `8f23f0c03c8761650bdb5b40aaf3e40d2c15f1ce`, CC-BY-4.0, int8, four files, 670,619,706 bytes,
+   locked). The Settings list shows every model, with "Linux only"/"macOS only" on the other OS's
+   rows, so the macOS UI lists the ONNX row as "Linux only".
+5. **ONNX Runtime 1.22 via `ort = "=2.0.0-rc.10"`, CPU only.** The exact pin is forced:
+   `voice_activity_detector` already depends on that `ort`, and `ort-sys` is a `links` crate, so
+   only one version can exist in the dependency graph; a second `ort` for ASR is not possible.
+   Intra-op threads = physical cores. `onnx.rs` wraps a session (named tensors in, owned tensors out,
+   declared signatures validated at load, mismatch = `LoadFailed` naming the tensor), one `Mutex`
+   per `ort::Session` because `run` takes `&mut self`, which makes the models `Send + Sync`
+   without `unsafe`. The CoreML `SendModel` keeps its per-type `unsafe impl`s and delegates
+   `WindowInference`. `StreamingEngine<M: WindowInference + Send + Sync>` holds an `Arc<M>` so one
+   model serves the session thread and the engine handle.
+6. **The decode loop takes a `TdtStep`** (ADR-015's amendment). The ONNX export fuses the
+   prediction net and joint into one graph (`decoder_joint`: `encoder_outputs [1,1024,1]`,
+   `targets` i32 `[1,1]`, `target_length` i32 `[1]`, `input_states_1/2 [2,1,640]` → `outputs
+   [1,1,1,8198]` = 8193 tokens incl. blank 8192 + 5 duration bins, plus `output_states_1/2`), so a
+   loop that calls "decode" then "joint" cannot express it. `score` never advances the state,
+   `accept` does, and blank frames call `score` only. The other two ONNX graphs: `nemo128.onnx`
+   (`waveforms` f32 `[B,N]` + `waveforms_lens` i64 → `features [B,128,T]`) and the encoder
+   (`audio_signal` + `length` i64 → `outputs [B,1024,T']`, channels first, transposed to
+   frames×1024, + `encoded_lengths`). Audio is fed at its real length: the preprocessor
+   normalizes over valid frames only, so zero-padding to 15 s would change the features.
+   `vocab.txt` (`piece id` per line, 8193 lines) maps `▁` to the leading-space convention of the
+   CoreML JSON vocab. A failed warm-up inference is fatal (`LoadFailed`), like voz.
+7. **Toolchain.** `devbox.json` provides Rust (rustup into a project-local `.devbox/`, version
+   pinned to 1.98.1 by `rust-toolchain.toml`) and the native libraries (ALSA, OpenSSL, Wayland,
+   xkbcommon, Vulkan, fontconfig, python3); Linux commands run as `devbox run -- cargo …`. CI has
+   an `ubuntu-24.04` job running `cargo fmt --check`, `clippy -D warnings` and tests over
+   `LINUX_CRATES`: `vuho-domain`, `vuho-postprocess`, `vuho-model-paths`, `vuho-settings`,
+   `vuho-model-fetch`, `vuho-audio`, `vuho-stt-engine`, `test-stt-ffi`. `vuho-ui`,
+   `vuho-os-integration` and `vuho-dictation` remain macOS-only.
+
+**Measured** (this development machine: NixOS, aarch64, 8 cores, CPU only): `OnnxParakeetModels::load`
+≈ 1.0–1.4 s release (3.7–4.5 s debug); one full 15 s window ≈ 255–262 ms release (0.4–1.0 s
+debug); jfk.wav (11 s) ≈ 185–217 ms release; jfk×3 (33 s) ≈ 729 ms release.
+`cargo run --release -p test-stt-ffi` prints `PASS`. Not measured: any x86_64 machine, a real
+microphone session, a cold model cache.
+
+**Int8 accuracy, and the seam rule it exposed.** The jfk×3 transcript is content-correct at every
+seam, but the third repetition loses punctuation and one seam capitalizes "Ask" — a window-tail
+artifact of the int8 decode, not fixed. The same test exposed a real merge defect: the window edge
+cut "ask" and the decoder guessed "asked", leaving a stray ending in the committed text. That is the
+`extends_cut_word` rule added to `merge_without_word_run` (ADR-023's amendment note), which applies
+to every backend.
+
+**Consequences:**
+- Adding a backend is one `HostBackend` variant, one arm in `host_backend`, one in `load_engine`;
+  forgetting one is a compile error on the OS that has it.
+- macOS builds are unchanged in behaviour; the `TdtStep` refactor keeps CoreML's call sequence.
+  It could only be verified by macOS tests the Linux author could not run, so the first macOS build
+  after this change must run `cargo test`, `cargo test -p vuho-ui --features demo` and the
+  `test-stt-ffi` gate for all three CoreML models.
+- Two ORT-era facts to keep in mind: `ort` is now a dependency of ASR, not only VAD; and the
+  pin means upgrading `voice_activity_detector` and `ort` is one coordinated change.
+
+**Deferred** (none of it exists; `TODO.md` tracks each): the Linux UI, as a `gpui` from Zed's git
+tree with a wlr layer-shell overlay (crates.io `gpui 0.2.2` has no layer-shell); `vuho --toggle`, a
+CLI that triggers the running instance (Sway binds it to a key; there is no global-hotkey
+protocol to tap on Wayland); paste via `wl-clipboard-rs` plus a `zwp_virtual_keyboard_v1` synthesized
+chord, chosen by the focused window's `app_id` (terminals want Ctrl+Shift+V, the rest Ctrl+V);
+keyboard-layout detection through Sway IPC; a `ksni` tray; Canary and voz on Linux (CoreML-only
+assets today); GNOME; an `evdev` CapsLock trigger; a Silero VAD that calls `ort` directly instead
+of through `voice_activity_detector`.
+
+**Rejected alternatives:** GTK for the UI — Sway/Wayland first, and GPUI is already the UI. Stubs for
+the other OS's types — they let code compile that cannot work, which CONSTITUTION's fail-early
+rule forbids. Making the OS fork a trait (ADR-004) — platform variation is fixed at build time, so
+a trait adds a runtime seam with no second implementor on the same build. Converting the CoreML
+models for ONNX ourselves — `istupakov`'s export of the same weights exists and is pinned.
+
 ---
 
 ---
@@ -1661,13 +1820,14 @@ added, ADR-020; no Swift package, ADR-014):**
   `TranscriptSegment`/`TranscriptionResult`; `ModelStatus` (ADR-020).
 - `vuho-audio` *(reinstated, ADR-013)* — `cpal` capture thread owning the `!Send` `Stream`, `rtrb`
   ring buffer, `rubato` resample to 16 kHz mono, device enumeration, `AVCaptureDevice` mic
-  permission (`objc2-av-foundation`). No `vuho-*` dependencies — a leaf crate the engine consumes.
-- `vuho-stt-engine` — `TranscriptionEngine` **trait** + three backends behind one
-  `WindowInference` seam (ADR-022, ADR-023): `ParakeetEngine` (four Parakeet-TDT `.mlmodelc`
+  permission (`objc2-av-foundation`, macOS only; ALSA via `cpal` on Linux). No `vuho-*` dependencies — a leaf crate the engine consumes.
+- `vuho-stt-engine` — `TranscriptionEngine` **trait** + four backends behind one
+  `WindowInference` seam (ADR-022, ADR-023, ADR-024), constructed only through `load_engine`;
+  the first three below are macOS-only, the fourth Linux-only: `ParakeetEngine` (four Parakeet-TDT `.mlmodelc`
   components, greedy TDT decode, native CoreML per ADR-014), `CanaryEngine` (four Canary-1B-v2
   components, greedy attention encoder-decoder, no KV cache) and `VozEngine` (Desert Ant Labs'
   fp16 re-export of Parakeet-TDT: three components, a fused decoder scoring eight frames per
-  call, macOS 15+). `StreamingEngine<M>` holds the
+  call, macOS 15+) and `OnnxParakeetEngine` (Parakeet-TDT int8 through ONNX Runtime, CPU, ADR-024). `StreamingEngine<M>` holds the
   shared batch windowing and streaming session lifecycle, so each engine is a thin wrapper.
   Also owns the Silero VAD wrapper (`vad.rs`, `voice_activity_detector`).
 - `vuho-dictation` — session state machine: `Toggle`/`Start`/`Stop` → `start_or_stop`; wires
@@ -1683,9 +1843,9 @@ added, ADR-020; no Swift package, ADR-014):**
   ever a literal in this crate), atomic load/save to `~/.config/vuho/settings.json`.
 - `vuho-model-paths` *(new, ADR-019)* — std-only chokepoint crate: embeds `models.manifest.json`
   at compile time, exposes typed manifest accessors and the single `resolve_model_folder`
-  env-var → bundle → workspace-dev → user-data (ADR-020) resolution chain, plus the embedded
-  `models.lock.json` accessors and the shared `atomic_write` helper. No macOS-specific
-  dependencies.
+  env-var → bundle (macOS only) → workspace-dev → user-data (ADR-020) resolution chain, plus the
+  embedded `models.lock.json` accessors, the shared `atomic_write` helper, and the
+  `Os`/`HOST_OS`/`Requires` OS-identity types (ADR-024). No macOS-specific dependencies.
 - `vuho-model-fetch` *(new, ADR-020)* — the **only** crate in the workspace permitted to perform
   network I/O: `availability(model_id) -> ModelAvailability` / `availability_all()` (the
   sidecar-and-lock verification chokepoint, scoped to the user-data candidate only),
@@ -1695,7 +1855,7 @@ added, ADR-020; no Swift package, ADR-014):**
   fully verifies it → writes the sidecar **inside** `<dir>.partial`, only once verification has
   passed → atomically renames `<dir>.partial` to `<dir>`, promoting the verified bytes and their
   sidecar together). Depends on `vuho-model-paths` and `vuho-domain`.
-- `vuho-ui` — GPUI: a single non-activating, always-mouse-interactive panel (`panel::PanelRoot`,
+- `vuho-ui` — *(macOS only until ADR-024's deferred Linux UI lands)* GPUI: a single non-activating, always-mouse-interactive panel (`panel::PanelRoot`,
   ADR-021) painted one way — a tabbed Overlay/Settings window whose height follows the active tab;
   the Settings tab holds the mic + hotkey-preset dropdowns, save-on-change, live hotkey rebind, and
   the ADR-016/ADR-020 permission + model provisioning rows; produces the `vuho` binary. Status-bar
@@ -1758,6 +1918,7 @@ except where amended above.
 
 ## Verification
 
+- **Linux batch gate (ADR-024):** `devbox run -- cargo run --release -p test-stt-ffi` with the `parakeet-tdt-0.6b-v3-onnx` model provisioned prints `PASS`; `tests/onnx_batch.rs` covers jfk.wav and the jfk×3 seam check. CI's `ubuntu-24.04` job runs fmt, clippy `-D warnings` and tests for the Linux-ready crates (no model, so model-gated tests skip).
 - **Batch regression (CI-able, no mic; shipped):** `cargo run -p test-stt-ffi` — file-based
   `transcribe` on `jfk.wav` asserts the JFK quote. The deterministic gate; `-- --model
   canary-1b-v2` and `-- --model voz` (ADR-022/ADR-023) run it against the other backends.

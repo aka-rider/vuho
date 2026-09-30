@@ -5,6 +5,8 @@ Parakeet TDT-0.6b-v3 Speech Recognition Model. Original model by NVIDIA Corporat
 
 Parakeet TDT-0.6b-v3 CoreML Conversion. Converted to CoreML format by FluidInference, also licensed under Creative Commons Attribution 4.0 International (CC-BY-4.0). Source: https://huggingface.co/FluidInference/parakeet-tdt-0.6b-v3-coreml
 
+Parakeet TDT-0.6b-v3 ONNX Conversion (Linux). Converted to ONNX format (int8) by istupakov, licensed under Creative Commons Attribution 4.0 International (CC-BY-4.0); the original model is by NVIDIA Corporation (see above). Source: https://huggingface.co/istupakov/parakeet-tdt-0.6b-v3-onnx
+
 Canary-1B-v2 Speech Recognition Model. Original model by NVIDIA Corporation, licensed under Creative Commons Attribution 4.0 International (CC-BY-4.0). Source: https://huggingface.co/nvidia/canary-1b-v2
 
 Canary-1B-v2 CoreML Conversion. Converted to CoreML format by FluidInference, also licensed under Creative Commons Attribution 4.0 International (CC-BY-4.0). Source: https://huggingface.co/FluidInference/canary-1b-v2-coreml

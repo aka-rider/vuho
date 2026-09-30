@@ -45,3 +45,17 @@
   warm-up into `EngineError::LoadFailed` (fail at load, not at first session); the other two
   backends should follow it so a broken model is refused when it is selected. Found while
   repairing the voz backend; left alone to keep that change scoped.
+- **Linux UI and desktop integration (ADR-024, all deferred):**
+  - Linux UI: a `gpui` from Zed's git tree with a wlr layer-shell overlay (crates.io `gpui 0.2.2` has none); `vuho-ui` is macOS-only until then.
+  - `vuho --toggle`: a CLI that triggers the running instance, bound to a key in Sway (Wayland has no global-hotkey tap).
+  - Paste on Linux: `wl-clipboard-rs` plus a `zwp_virtual_keyboard_v1` chord chosen by the focused window's `app_id` (Ctrl+Shift+V in terminals, Ctrl+V elsewhere).
+  - Keyboard-layout (language) detection on Linux through Sway IPC.
+  - `ksni` tray icon for Linux.
+  - Canary and voz on Linux (their assets are CoreML-only).
+  - GNOME support (Sway/Wayland is the first target).
+  - `evdev` CapsLock trigger on Linux.
+  - Silero VAD calling `ort` directly instead of through `voice_activity_detector`, which forces the exact `ort = "=2.0.0-rc.10"` pin.
+- Linux real-microphone smoke test: the equivalent of macOS's `#[ignore]`d `streaming_smoke`; only file-driven tests exercise the ONNX streaming session today.
+- `crates/vuho-stt-engine/src/parakeet/models.rs` keeps a private `ENCODER_DIM` duplicate of `tdt::ENCODER_DIM`. One-line cleanup (use the shared constant); left because that file only compiles on macOS and the Linux author could not verify the change.
+- `CLAUDE.md` says the first unlocked `./scripts/fetch-model.sh <id>` prints `UNLOCKED` and exits non-zero, but the Linux run for the ONNX model exited 0. Pre-existing discrepancy between the docs and the script; verify on macOS which is right, then fix the script or the docs (CLAUDE.md now flags it as unverified).
+- ONNX int8 jfk×3 loses punctuation on the third repetition and capitalizes one seam as "Ask" (a window-tail artifact of the int8 decode); content is correct. Not investigated whether it is the model or the seam merge.
