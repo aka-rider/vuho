@@ -11,7 +11,6 @@
 //! [`SendModel`] newtype carries `Send + Sync` because predictions built on
 //! it are serialized on one thread by the callers in `parakeet/models.rs`.
 
-#[cfg(target_os = "macos")]
 mod imp {
     use std::ffi::c_void;
     use std::path::Path;
@@ -29,6 +28,9 @@ mod imp {
         NSString, NSURL,
     };
 
+    use crate::stream::merge::MergeBounds;
+    use crate::token::TokenAt;
+    use crate::window_inference::WindowInference;
     use crate::EngineError;
 
     /// Compute-unit selection for model loading.
@@ -633,11 +635,36 @@ mod imp {
     /// A blanket impl would let ANY future `T` (including one holding
     /// non-thread-safe non-`CoreML` state) become `Send`/`Sync` for free
     /// just by being wrapped here, silently widening this crate's one unsafe-impl
-    /// invariant to types it was never audited against. The cost of that
-    /// refusal is that a generic wrapper over a backend cannot derive
-    /// thread-safety and must carry `where SendModel<M>: Send + Sync`
-    /// explicitly (see `streaming_engine`); that is the intended cost.
+    /// invariant to types it was never audited against.
+    ///
+    /// It implements [`WindowInference`] by delegation, so a wrapped backend
+    /// goes straight into the shared, `Send + Sync`-bounded
+    /// `StreamingEngine`.
     pub(crate) struct SendModel<T>(pub T);
+
+    impl<T: WindowInference> WindowInference for SendModel<T> {
+        fn infer_window(
+            &self,
+            samples: &[f32],
+            global_frame_offset: usize,
+            language: &str,
+        ) -> Result<Vec<TokenAt>, EngineError> {
+            self.0.infer_window(samples, global_frame_offset, language)
+        }
+
+        fn piece_info(&self, id: u32) -> Option<(bool, &str)> {
+            self.0.piece_info(id)
+        }
+
+        fn detokenize(&self, tokens: &[TokenAt]) -> String {
+            self.0.detokenize(tokens)
+        }
+
+        fn merge_bounds(&self) -> MergeBounds {
+            self.0.merge_bounds()
+        }
+    }
+
     // SAFETY: Apple documents `MLModel` prediction as thread-safe, so the
     // four `Retained<MLModel>` handles (`objc2`'s `Retained` is `!Send` /
     // `!Sync` by default regardless of the underlying object's actual
@@ -672,142 +699,9 @@ mod imp {
     unsafe impl Sync for SendModel<crate::voz::models::VozModels> {}
 }
 
-#[cfg(target_os = "macos")]
 pub(crate) use imp::*;
 
-#[cfg(not(target_os = "macos"))]
-mod not_macos {
-    use std::path::Path;
-
-    use crate::EngineError;
-
-    #[derive(Debug, Clone, Copy)]
-    pub(crate) enum ComputeUnits {
-        CpuOnly,
-        CpuAndNeuralEngine,
-    }
-
-    pub(crate) struct CoreMlModel;
-
-    impl CoreMlModel {
-        pub(crate) fn load(
-            _mlmodelc_dir: &Path,
-            _units: ComputeUnits,
-        ) -> Result<Self, EngineError> {
-            Err(EngineError::LoadFailed(
-                "CoreML not available on this platform".into(),
-            ))
-        }
-
-        pub(crate) fn predict(
-            &self,
-            _inputs: &[(&str, MlArray)],
-        ) -> Result<Prediction, EngineError> {
-            Err(EngineError::CoreMl(
-                "CoreML not available on this platform".into(),
-            ))
-        }
-
-        pub(crate) fn load_function(
-            _mlmodelc_dir: &Path,
-            _units: ComputeUnits,
-            _function: &str,
-        ) -> Result<Self, EngineError> {
-            Err(EngineError::LoadFailed(
-                "CoreML not available on this platform".into(),
-            ))
-        }
-
-        pub(crate) fn input_shape(&self, _name: &str) -> Option<Vec<usize>> {
-            None
-        }
-
-        pub(crate) fn output_shape(&self, _name: &str) -> Option<Vec<usize>> {
-            None
-        }
-    }
-
-    pub(crate) struct Prediction;
-
-    impl Prediction {
-        pub(crate) fn array(&self, _name: &str) -> Result<MlArray, EngineError> {
-            Err(EngineError::CoreMl(
-                "CoreML not available on this platform".into(),
-            ))
-        }
-    }
-
-    pub(crate) struct MlArray;
-
-    impl MlArray {
-        pub(crate) fn f32(_shape: &[usize], _data: &[f32]) -> Result<Self, EngineError> {
-            Err(EngineError::CoreMl(
-                "CoreML not available on this platform".into(),
-            ))
-        }
-
-        pub(crate) fn i32(_shape: &[usize], _data: &[i32]) -> Result<Self, EngineError> {
-            Err(EngineError::CoreMl(
-                "CoreML not available on this platform".into(),
-            ))
-        }
-
-        pub(crate) fn f16(_shape: &[usize], _data: &[f32]) -> Result<Self, EngineError> {
-            Err(EngineError::CoreMl(
-                "CoreML not available on this platform".into(),
-            ))
-        }
-
-        pub(crate) fn to_f32_vec(&self) -> Result<Vec<f32>, EngineError> {
-            Err(EngineError::CoreMl(
-                "CoreML not available on this platform".into(),
-            ))
-        }
-
-        pub(crate) fn to_f32_vec_into(&self, _out: &mut Vec<f32>) -> Result<(), EngineError> {
-            Err(EngineError::CoreMl(
-                "CoreML not available on this platform".into(),
-            ))
-        }
-
-        pub(crate) fn shape(&self) -> Vec<usize> {
-            vec![]
-        }
-
-        pub(crate) fn strides(&self) -> Vec<usize> {
-            vec![]
-        }
-
-        pub(crate) fn gather_f32_into(
-            &self,
-            _offsets: &[usize],
-            _out: &mut Vec<f32>,
-        ) -> Result<(), EngineError> {
-            Err(EngineError::CoreMl(
-                "CoreML not available on this platform".into(),
-            ))
-        }
-    }
-
-    /// Non-macOS stub — narrowed the same way as the real `imp::SendModel`
-    /// (see its doc comment) even though every method here just returns an
-    /// error: consistency, not a live safety requirement on this platform.
-    pub(crate) struct SendModel<T>(pub T);
-    // SAFETY: this platform's backends hold only stub types that never
-    // touch any non-Send/Sync FFI state (every method is a stub returning
-    // `EngineError::CoreMl`).
-    unsafe impl Send for SendModel<crate::parakeet::models::ParakeetModels> {}
-    unsafe impl Sync for SendModel<crate::parakeet::models::ParakeetModels> {}
-    unsafe impl Send for SendModel<crate::canary::models::CanaryModels> {}
-    unsafe impl Sync for SendModel<crate::canary::models::CanaryModels> {}
-    unsafe impl Send for SendModel<crate::voz::models::VozModels> {}
-    unsafe impl Sync for SendModel<crate::voz::models::VozModels> {}
-}
-
-#[cfg(not(target_os = "macos"))]
-pub(crate) use not_macos::*;
-
-#[cfg(all(test, target_os = "macos"))]
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::EngineError;

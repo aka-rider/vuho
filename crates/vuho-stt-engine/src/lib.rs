@@ -20,15 +20,18 @@
 //! VAD uses the embedded Silero v5 from `voice_activity_detector`
 //! (crate cannot load external weights — the fetched `models/silero-vad/`
 //! exists for a future direct-`ort` v6 swap).
+//!
+//! The `CoreML` backends, and everything that only they reach, exist on
+//! macOS only; the backend-independent half (windowing, merge, session
+//! lifecycle, vocabulary, the TDT decode loop) builds everywhere.
+
+// TEMP: no backend exists off macOS yet, so the shared half has no caller
+// there. The expectation turns into a compile error the moment one lands.
+#![cfg_attr(not(target_os = "macos"), expect(dead_code))]
 
 use std::path::{Path, PathBuf};
 
 use vuho_domain::TranscriptionResult;
-
-/// Re-exported so callers that already depend on `vuho-stt-engine` (but not
-/// directly on `vuho-audio`) can match on the full microphone TCC status
-/// (CONSTITUTION rule 26 — one source of truth for the enum's definition).
-pub use vuho_audio::MicAuthStatus;
 
 pub mod vad;
 
@@ -36,7 +39,14 @@ pub mod vad;
 #[cfg(target_os = "macos")]
 mod coreml;
 
-// Parakeet-TDT model components.
+// Microphone TCC permission (macOS only): no other platform has the concept.
+#[cfg(target_os = "macos")]
+mod mic_permission;
+#[cfg(target_os = "macos")]
+pub use mic_permission::{mic_permission_status, request_mic_permission, MicAuthStatus};
+
+// Parakeet-TDT: the decode loop is shared, its `CoreML` components are
+// macOS-only (see `parakeet::mod`).
 mod parakeet;
 
 // Canary-1B-v2 model components. `pub` for its `prompt` module alone: the
@@ -47,6 +57,7 @@ pub mod canary;
 
 // Voz model components: the same Parakeet-TDT weights, re-exported as three
 // fused fp16 bundles. `pub` for `manifest_model_id` alone, like `canary`.
+#[cfg(target_os = "macos")]
 pub mod voz;
 
 // The backend-independent engine half: batch windowing + session lifecycle.
@@ -65,8 +76,11 @@ pub(crate) mod window_inference;
 mod stream;
 
 // Engine handles, one thin wrapper per backend.
+#[cfg(target_os = "macos")]
 mod canary_engine;
+#[cfg(target_os = "macos")]
 mod engine;
+#[cfg(target_os = "macos")]
 mod voz_engine;
 
 // Shared WAV-fixture test helpers (jfk.wav loading + generic WAV parsing) —
@@ -81,8 +95,8 @@ pub mod test_support;
 
 // Re-exports of pure, model-free internals for `benches/hot_paths.rs`. A
 // criterion bench target is compiled as a separate crate, so it only sees
-// this crate's `pub` surface — `tdt_greedy`, `StepModel`, `TokenAt`,
-// `frame_ms`, `DecoderState`, `merge`, `MergeBounds`, `MergeOutcome`,
+// this crate's `pub` surface — `tdt_greedy`, `TdtStep`, `TokenAt`,
+// `frame_ms`, `merge`, `MergeBounds`, `MergeOutcome`,
 // `windower::plan`, and `windower::OVERLAP_FRAMES` are marked `pub` (not
 // `pub(crate)`) at their own declaration sites specifically so this module can re-export them (a
 // `pub use` cannot widen a `pub(crate)` item's visibility — only forward an
@@ -96,11 +110,11 @@ pub mod bench_support {
     //! `tests/canary_batch.rs`) — the one sanctioned way they reach a
     //! crate-internal item, instead of restating its value as a literal
     //! (CONSTITUTION rule 27). Nothing here touches `CoreML` — every benched
-    //! function is model-free (a synthetic `StepModel`/token stream stands
+    //! function is model-free (a synthetic `TdtStep`/token stream stands
     //! in for the real engine), matching the plan's "model-free,
     //! deterministic" bench requirement.
-    pub use crate::parakeet::decoder_state::DecoderState;
-    pub use crate::parakeet::tdt::{tdt_greedy, StepModel};
+    pub use crate::parakeet::tdt::{tdt_greedy, TdtStep};
+    use crate::parakeet::tdt::{LOGITS_LEN, TOKEN_LOGITS};
     pub use crate::stream::merge::{merge, MergeBounds, MergeOutcome};
     pub use crate::stream::windower::{plan, OVERLAP_FRAMES, WINDOW_SAMPLES};
     pub use crate::token::{frame_ms, TokenAt};
@@ -113,52 +127,51 @@ pub mod bench_support {
         TokenAt { id, pos }
     }
 
-    /// A `StepModel` that always emits a fixed `token` at a fixed
-    /// `duration`, regardless of frame or decoder state — the same fixture
-    /// `parakeet::tdt`'s own unit tests use (`FixedStepModel`), exposed here
-    /// so `benches/hot_paths.rs` can drive `tdt_greedy` without a real
+    /// Fill `logits` with one frame's scores in which `token` and
+    /// `duration` win the argmax over the token and duration heads — the
+    /// one scripted-output builder the model-free fixtures share.
+    pub(crate) fn write_scripted_logits(token: u32, duration: u32, logits: &mut Vec<f32>) {
+        logits.clear();
+        logits.resize(LOGITS_LEN, f32::NEG_INFINITY);
+        logits[token as usize] = 0.0;
+        logits[TOKEN_LOGITS + duration as usize] = 0.0;
+    }
+
+    /// A `TdtStep` that always emits a fixed `token` at a fixed `duration`,
+    /// regardless of frame or state, so `benches/hot_paths.rs` and
+    /// `parakeet::tdt`'s unit tests can drive `tdt_greedy` without a real
     /// model.
-    struct FixedStepModel {
+    struct FixedStep {
         token: u32,
         duration: u32,
     }
 
-    impl StepModel for FixedStepModel {
-        fn decode(&self, _token: i32, state: &mut DecoderState) -> Result<(), EngineError> {
-            state.dec_out = Some(vec![0.0; 640]);
+    impl TdtStep for FixedStep {
+        type State = ();
+
+        fn start(&self) -> Result<Self::State, EngineError> {
             Ok(())
         }
 
-        fn joint(
+        fn score(
             &self,
             _enc_frame: &[f32],
-            _dec_out: &[f32],
-            out: &mut Vec<f32>,
+            _state: &mut Self::State,
+            logits: &mut Vec<f32>,
         ) -> Result<(), EngineError> {
-            out.clear();
-            out.resize(8198, f32::NEG_INFINITY);
-            out[self.token as usize] = 0.0;
-            for (i, bin) in out[8193..8198].iter_mut().enumerate() {
-                #[allow(clippy::cast_possible_truncation)] // i is always 0..5
-                let i = i as u32;
-                *bin = if i == self.duration {
-                    0.0
-                } else {
-                    f32::NEG_INFINITY
-                };
-            }
+            write_scripted_logits(self.token, self.duration, logits);
+            Ok(())
+        }
+
+        fn accept(&self, _token: u32, _state: &mut Self::State) -> Result<(), EngineError> {
             Ok(())
         }
     }
 
-    /// Build a `StepModel` fixture for the bench (see `FixedStepModel`, private).
-    ///
-    /// Returns `impl StepModel` (a concrete, `Sized` type), not
-    /// `Box<dyn StepModel>` — `tdt_greedy` takes `&impl StepModel`, which
-    /// requires `Sized`; a trait object reference doesn't satisfy that.
+    /// Build a `TdtStep` fixture with no state (see `FixedStep`, private).
     #[must_use]
-    pub fn fixed_step_model(token: u32, duration: u32) -> impl StepModel {
-        FixedStepModel { token, duration }
+    pub fn fixed_step_model(token: u32, duration: u32) -> impl TdtStep<State = ()> {
+        FixedStep { token, duration }
     }
 }
 
@@ -192,15 +205,15 @@ pub enum EngineError {
     /// handling. Distinct from [`Self::Transcribe`], which is reserved for
     /// failures in this crate's own transcription-algorithm code (the
     /// sliding-window/merge pipeline), not in a `CoreML` call itself.
+    #[cfg(target_os = "macos")]
     #[error("CoreML error: {0}")]
     CoreMl(String),
     /// A batch or streaming transcription call failed for a reason that
-    /// isn't a `CoreML` call itself (see [`Self::CoreMl`]) — e.g. output
-    /// shape/length invariants the decode algorithm expects but a model
-    /// didn't satisfy.
+    /// isn't an inference-runtime call itself — e.g. output shape/length
+    /// invariants the decode algorithm expects but a model didn't satisfy.
     #[error("transcription failed: {0}")]
     Transcribe(String),
-    /// The microphone permission (TCC) was denied.
+    /// The microphone permission (TCC) was denied. Raised on macOS only.
     #[error("microphone permission denied")]
     MicPermissionDenied,
     /// `stop_stream` was called with no streaming session active.
@@ -208,9 +221,9 @@ pub enum EngineError {
     NoActiveStream,
     /// `start_stream` was called while a streaming session was already
     /// active. Previously this was documented as "undefined behavior" on
-    /// the [`TranscriptionEngine`] trait; the real implementation
-    /// ([`ParakeetEngine`]) has always returned this typed error on
-    /// double-start, so the doc now matches the code.
+    /// the [`TranscriptionEngine`] trait; every real implementation has
+    /// always returned this typed error on double-start, so the doc now
+    /// matches the code.
     #[error("a streaming session is already active")]
     StreamAlreadyActive,
     /// The streaming session's background thread panicked instead of
@@ -235,9 +248,7 @@ pub enum EngineError {
     /// The OS failed to spawn the streaming session's background thread.
     #[error("failed to spawn streaming session thread: {0}")]
     SpawnFailed(String),
-    /// Starting audio capture for a streaming session failed (any
-    /// [`vuho_audio::AudioError`] other than `PermissionDenied`, which maps
-    /// to [`Self::MicPermissionDenied`] instead).
+    /// Starting audio capture for a streaming session failed.
     #[error("audio capture error: {0}")]
     Audio(#[from] vuho_audio::AudioError),
 }
@@ -367,7 +378,7 @@ pub fn validate_model_layout(model_id: &str, model_dir: &Path) -> Result<(), Eng
 /// loaded** — construction is the only place that cost is paid.
 ///
 /// There is deliberately no `init`/`load_models` here: an implementor hands
-/// out instances only once they are ready (see [`ParakeetEngine::load`]), so
+/// out instances only once they are ready (see `ParakeetEngine::load`), so
 /// no caller can hold an engine in a half-built state or trigger a multi-minute
 /// model load from a hot path.
 pub trait TranscriptionEngine {
@@ -375,9 +386,9 @@ pub trait TranscriptionEngine {
     ///
     /// # Errors
     ///
-    /// Returns `EngineError::CoreMl` if a `CoreML` call fails, or
-    /// `EngineError::Transcribe` if the decode algorithm's own invariants
-    /// (e.g. an output length it requires) are violated.
+    /// Returns the backend's inference error (`EngineError::CoreMl` on
+    /// macOS), or `EngineError::Transcribe` if the decode algorithm's own
+    /// invariants (e.g. an output length it requires) are violated.
     fn transcribe(
         &self,
         samples: &[f32],
@@ -427,8 +438,11 @@ pub trait TranscriptionEngine {
 
 // ── ParakeetEngine (the real engine) ───────────────────────────────────
 
+#[cfg(target_os = "macos")]
 pub use canary_engine::CanaryEngine;
+#[cfg(target_os = "macos")]
 pub use engine::ParakeetEngine;
+#[cfg(target_os = "macos")]
 pub use voz_engine::VozEngine;
 
 /// List the names of available audio input devices.
@@ -441,54 +455,6 @@ pub fn list_input_devices() -> Result<Vec<String>, EngineError> {
     Ok(vuho_audio::list_input_device_names()?)
 }
 
-/// Check the current microphone permission status, prompting if it has
-/// never been asked.
-///
-/// If the status is not yet determined, this also triggers the system TCC
-/// dialog (`request_mic_access_async`) so the caller doesn't need a second,
-/// separate call to prompt — but the dialog is asynchronous and this
-/// function does not wait for the user's answer, so a `NotDetermined`
-/// result here always returns `false` even if the user is about to grant
-/// access; re-check on the next session start.
-///
-/// This is infallible (no TCC query used here can fail in a way this crate
-/// distinguishes) — collapsed from a vestigial `Result<bool, EngineError>`
-/// that no caller ever matched an `Err` arm on.
-///
-/// # Returns
-///
-/// `true` if the user has already granted microphone access, `false` if
-/// denied, restricted, or not yet determined.
-#[must_use]
-pub fn request_mic_permission() -> bool {
-    use vuho_audio::MicAuthStatus;
-    match vuho_audio::mic_authorization_status() {
-        MicAuthStatus::Authorized => true,
-        MicAuthStatus::NotDetermined => {
-            vuho_audio::request_mic_access_async();
-            false
-        }
-        MicAuthStatus::Denied | MicAuthStatus::Restricted => false,
-    }
-}
-
-/// Pure (non-prompting) microphone permission status.
-///
-/// Unlike [`request_mic_permission`], this never triggers the native TCC
-/// dialog even when the status is `NotDetermined` — used by the startup
-/// preflight permission gate (ADR-016), which must be side-effect-free on
-/// its initial check, matching the Accessibility/Input Monitoring checks it
-/// runs alongside. The gate distinguishes `NotDetermined` (promptable) from
-/// `Denied`/`Restricted` (only fixable via System Settings), which a
-/// collapsed bool cannot express — which is why this crate exposes exactly
-/// two mic accessors (this one and [`request_mic_permission`]), not three:
-/// a third bool-only projection of this same status used to exist and had
-/// zero callers.
-#[must_use]
-pub fn mic_permission_status() -> MicAuthStatus {
-    vuho_audio::mic_authorization_status()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -496,6 +462,7 @@ mod tests {
 
     /// `load` is the only constructor, so a bad model folder yields no engine
     /// at all rather than one that fails later, mid-session.
+    #[cfg(target_os = "macos")]
     #[test]
     fn engine_load_fails_for_a_missing_model_folder() {
         assert!(

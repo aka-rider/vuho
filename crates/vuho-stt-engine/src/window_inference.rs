@@ -3,10 +3,11 @@
 //!
 //! Deliberately **not** `Send + Sync`: `CoreML`'s `MLModel` handles are
 //! neither, which is why `coreml::SendModel` exists as a per-concrete-type
-//! wrapper. A supertrait here would not compile at the implementors, and
-//! is unnecessary — a backend crosses a thread boundary as
-//! `Arc<SendModel<M>>`, and the `&dyn WindowInference` is only ever formed
-//! inside the session thread that already owns it.
+//! wrapper (itself a `WindowInference` by delegation). A supertrait here
+//! would not compile at the implementors, and is unnecessary —
+//! `StreamingEngine` demands `Send + Sync` of the backend it shares with
+//! its session thread, and the `&dyn WindowInference` is only ever formed
+//! inside that thread.
 
 use crate::stream::merge::MergeBounds;
 use crate::token::TokenAt;
@@ -24,8 +25,9 @@ pub(crate) trait WindowInference {
     ///
     /// # Errors
     ///
-    /// Returns `EngineError::CoreMl` if a `CoreML` call fails, or
-    /// `EngineError::Transcribe` if a decode invariant is violated.
+    /// Returns the backend's inference error (`EngineError::CoreMl` on
+    /// macOS), or `EngineError::Transcribe` if a decode invariant is
+    /// violated.
     fn infer_window(
         &self,
         samples: &[f32],

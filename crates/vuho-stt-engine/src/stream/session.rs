@@ -739,6 +739,7 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "macos")]
     fn load_models() -> Option<crate::parakeet::models::ParakeetModels> {
         let model_id = vuho_model_paths::manifest().stt.default_model();
         let folder = crate::resolve_model_folder(model_id).ok()?;
@@ -751,6 +752,7 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "macos")]
     fn tok(id: u32, pos: usize) -> TokenAt {
         TokenAt { id, pos }
     }
@@ -760,6 +762,7 @@ mod tests {
     /// — real "whole word" tokens to build a deterministic merge/promotion
     /// scenario against, without hardcoding ids the shipped vocab file
     /// happens to use today.
+    #[cfg(target_os = "macos")]
     fn find_word_initial_ids(models: &dyn WindowInference, count: usize) -> Vec<u32> {
         (0..8192u32)
             .filter(|&id| {
@@ -792,6 +795,7 @@ mod tests {
     /// on that code with exactly that duplicated sequence, and passes with
     /// `[A, B, C, D]` after the fix.
     #[test]
+    #[cfg(target_os = "macos")]
     fn promotion_applies_the_full_merge_outcome_not_just_append() {
         let Some(models) = load_models() else { return };
 
@@ -856,7 +860,7 @@ mod tests {
     #[test]
     fn report_inference_failure_sends_a_recoverable_error_naming_the_context() {
         let (events_tx, events_rx) = crossbeam_channel::unbounded::<DictationEvent>();
-        let err = EngineError::CoreMl("synthetic failure for D3 regression test".to_string());
+        let err = EngineError::Transcribe("synthetic failure for D3 regression test".to_string());
 
         report_inference_failure(&events_tx, "window commit", &err);
 
@@ -894,6 +898,7 @@ mod tests {
     /// call would either violate a `debug_assert!` on (debug builds) or
     /// silently truncate the excess audio on (release builds).
     #[test]
+    #[cfg(target_os = "macos")]
     fn oversized_chunk_commits_every_full_window_and_leaves_a_sane_tail() {
         let Some(models) = load_models() else { return };
 
@@ -938,6 +943,33 @@ mod tests {
         );
     }
 
+    /// A backend that hears nothing: the session tests that never reach a
+    /// decode need no real model.
+    struct SilentModel;
+
+    impl WindowInference for SilentModel {
+        fn infer_window(
+            &self,
+            _samples: &[f32],
+            _global_frame_offset: usize,
+            _language: &str,
+        ) -> Result<Vec<TokenAt>, EngineError> {
+            Ok(Vec::new())
+        }
+
+        fn piece_info(&self, _id: u32) -> Option<(bool, &str)> {
+            None
+        }
+
+        fn detokenize(&self, _tokens: &[TokenAt]) -> String {
+            String::new()
+        }
+
+        fn merge_bounds(&self) -> merge::MergeBounds {
+            merge::MergeBounds::measured_positions()
+        }
+    }
+
     /// An unexpected chunk-channel disconnect (capture thread died — no
     /// `stop` requested) must surface the *specific* `AudioError` the
     /// capture thread recorded (via `AudioSource::take_error`), not the
@@ -954,8 +986,7 @@ mod tests {
     /// unexpected-disconnect branch of `handle_disconnected`.
     #[test]
     fn unexpected_disconnect_surfaces_the_recorded_audio_error() {
-        let Some(models) = load_models() else { return };
-        let models = crate::coreml::SendModel(models);
+        let models = SilentModel;
 
         let (chunk_tx, chunk_rx) = crossbeam_channel::unbounded::<Vec<f32>>();
         drop(chunk_tx); // No sends, no clones held — immediate disconnect.
@@ -973,12 +1004,11 @@ mod tests {
         let stop = Arc::new(AtomicBool::new(false));
 
         let session = std::thread::spawn(move || {
-            let models = models;
             run_session(
                 &chunk_rx,
                 &events_tx,
                 &stop,
-                &models.0,
+                &models,
                 audio_source,
                 "en",
                 Duration::ZERO,
@@ -1010,6 +1040,7 @@ mod tests {
     /// padded window however little of it is real audio, so the cost per
     /// call is ~constant and fewer, larger chunks keeps the test's wall
     /// time down.
+    #[cfg(target_os = "macos")]
     const FEED_CHUNK_SAMPLES: usize = 16_000;
 
     /// Send `samples` to a running session in [`FEED_CHUNK_SAMPLES`] chunks,
@@ -1030,6 +1061,7 @@ mod tests {
     /// (CONSTITUTION rule 32). `timeout` bounds only the failure case, so a
     /// genuinely broken streaming contract fails promptly instead of
     /// hanging.
+    #[cfg(target_os = "macos")]
     fn spawn_chunk_feeder(
         samples: Vec<f32>,
         chunk_tx: crossbeam_channel::Sender<Vec<f32>>,
@@ -1071,6 +1103,7 @@ mod tests {
     /// The stop is ordered by the first partial arriving — see
     /// [`spawn_chunk_feeder`].
     #[test]
+    #[cfg(target_os = "macos")]
     fn streams_jfk_wav_in_chunks_and_produces_partial_then_final() {
         /// Upper bound on how long the feeder waits for the first partial
         /// before giving up and flipping `stop` anyway — bounds the test's
@@ -1148,6 +1181,7 @@ mod tests {
     }
 
     /// What streaming jfk.wav through `run_session` produced.
+    #[cfg(target_os = "macos")]
     struct StreamedJfk {
         saw_partial: bool,
         full_text: String,
@@ -1163,13 +1197,11 @@ mod tests {
     /// session thread's wind-down. No cadence knob can hide it, so it is
     /// measured — from setting the stop flag to `join()` returning — rather
     /// than assumed.
-    fn stream_jfk<M: WindowInference + 'static>(
-        models: crate::coreml::SendModel<M>,
+    #[cfg(target_os = "macos")]
+    fn stream_jfk<M: WindowInference + Send + 'static>(
+        models: M,
         samples: Vec<f32>,
-    ) -> StreamedJfk
-    where
-        crate::coreml::SendModel<M>: Send,
-    {
+    ) -> StreamedJfk {
         /// Upper bound on the wait for a first partial before stopping
         /// anyway — bounds the worst case to "fails promptly" rather than
         /// "hangs forever" if the streaming contract really is broken.
@@ -1191,12 +1223,11 @@ mod tests {
 
         let stop_for_session = Arc::clone(&stop);
         let session = std::thread::spawn(move || {
-            let models = models;
             run_session(
                 &chunk_rx,
                 &events_tx,
                 &stop_for_session,
-                &models.0,
+                &models,
                 audio_source,
                 "en",
                 PARTIAL_INTERVAL,
@@ -1228,6 +1259,7 @@ mod tests {
     /// real behaviour (a partial before the final text, and the quote in it)
     /// and reporting the stop latency. Skips cleanly when the sample, the
     /// backend's manifest entry, or its model folder is absent.
+    #[cfg(target_os = "macos")]
     fn stream_jfk_through<M: WindowInference + 'static>(
         label: &str,
         manifest_model_id: Option<&'static str>,
@@ -1279,6 +1311,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "macos")]
     fn canary_streams_jfk_wav_and_reports_its_stop_to_result_latency() {
         stream_jfk_through(
             "canary",
@@ -1288,6 +1321,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "macos")]
     fn voz_streams_jfk_wav_and_reports_its_stop_to_result_latency() {
         stream_jfk_through(
             "voz",

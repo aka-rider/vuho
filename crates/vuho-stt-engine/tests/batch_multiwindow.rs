@@ -11,6 +11,8 @@
 //! in the workspace that logic lives (CONSTITUTION rule 26), also used by
 //! `test-stt-ffi` and this crate's own model-gated unit tests.
 
+#![cfg(target_os = "macos")]
+
 use vuho_stt_engine::test_support::{jfk_wav_path, load_wav_16k_mono_f32};
 use vuho_stt_engine::{ParakeetEngine, TranscriptionEngine};
 

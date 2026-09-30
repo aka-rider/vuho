@@ -11,12 +11,13 @@ use std::path::PathBuf;
 use crossbeam_channel::Receiver;
 use vuho_domain::{DictationEvent, TranscriptionResult};
 
+use crate::coreml::SendModel;
 use crate::streaming_engine::StreamingEngine;
 use crate::voz::models::VozModels;
 use crate::EngineError;
 
 /// The voz STT engine.
-pub struct VozEngine(StreamingEngine<VozModels>);
+pub struct VozEngine(StreamingEngine<SendModel<VozModels>>);
 
 impl VozEngine {
     /// Load the voz engine for `model_id` from a resolved model folder.
@@ -35,10 +36,10 @@ impl VozEngine {
     /// does — it composes with `resolve_model_folder`'s result at call sites.
     #[allow(clippy::needless_pass_by_value)]
     pub fn load(model_id: &str, model_folder: PathBuf) -> Result<Self, EngineError> {
-        Ok(Self(StreamingEngine::new(VozModels::load(
+        Ok(Self(StreamingEngine::new(SendModel(VozModels::load(
             model_id,
             &model_folder,
-        )?)))
+        )?))))
     }
 }
 

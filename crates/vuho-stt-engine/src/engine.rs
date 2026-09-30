@@ -10,12 +10,13 @@ use std::path::PathBuf;
 use crossbeam_channel::Receiver;
 use vuho_domain::{DictationEvent, TranscriptionResult};
 
+use crate::coreml::SendModel;
 use crate::parakeet::models::ParakeetModels;
 use crate::streaming_engine::StreamingEngine;
 use crate::EngineError;
 
 /// The Parakeet-TDT STT engine, loaded once at app startup.
-pub struct ParakeetEngine(StreamingEngine<ParakeetModels>);
+pub struct ParakeetEngine(StreamingEngine<SendModel<ParakeetModels>>);
 
 impl ParakeetEngine {
     /// Load the Parakeet-TDT engine for `model_id` from a resolved model
@@ -38,10 +39,10 @@ impl ParakeetEngine {
     /// at call sites (`vuho-ui`'s `spawn_warmup_and_bridge`, `test-stt-ffi`).
     #[allow(clippy::needless_pass_by_value)]
     pub fn load(model_id: &str, model_folder: PathBuf) -> Result<Self, EngineError> {
-        Ok(Self(StreamingEngine::new(ParakeetModels::load(
+        Ok(Self(StreamingEngine::new(SendModel(ParakeetModels::load(
             model_id,
             &model_folder,
-        )?)))
+        )?))))
     }
 }
 
